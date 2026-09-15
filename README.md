@@ -8,8 +8,7 @@ Feedback welcome. I'm a student, this is a side project, and I'd genuinely like 
 
 - Matches a transformer baseline within 0.07 validation loss (ppl 55 vs 52) on the same data and training
 - Uses a flat 1.2MB memory state instead of a cache that grows with every token
-- Can memorize a document, answer questions about it, then erase it — the knowledge is gone
-- Trains on a free Kaggle T4 in about 15 GPU hours
+- Can memorize a document, answer questions about it, then erase it.
 
 ## The demo
 
@@ -38,6 +37,6 @@ Python 3.10+, CUDA GPU. `pip install -r requirements.txt`
 - It ties but doesn't beat the transformer on quality
 - Trains about 25% slower at short context
 - Only tested up to 512 token context
-- The model itself is small (100M params, ~500M tokens of training data — a fraction of what production models see)
+- The model itself is small (100M params, ~500M tokens of training data)
 
 Model Huggingface : https://huggingface.co/rikkathree/vsa-lm
