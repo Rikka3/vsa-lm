@@ -16,7 +16,7 @@ Both models: 100M params, same data (500M tokens FineWeb-Edu), same training ste
 | average | 3.944 | 4.013 | +0.069 |
 | perplexity | 51.6 | 55.3 | |
 
-Tie. The gap is 0.069 — small enough that it's within the noise range for this setup. One caveat: the VSA model saw roughly one-third less unique training data due to a resume bug (fixed now), so this number is conservative.
+Tie. The gap is 0.069 which is small enough that it's within the noise range for this setup. One caveat, the VSA model saw roughly one-third less unique training data due to a resume bug (fixed now), so this number is conservative.
 
 ## Memory usage (the actual point)
 
