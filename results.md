@@ -64,7 +64,6 @@ A secret phrase buried in filler text:
 
 ## Training notes
 
-- Both models plateaued around step 25,000 — out of data, not out of capacity
+- Both models plateaued around step 25,000 due to being out of data.
 - VSA decay rates (γ): early layers learned longer memory (0.876 → 0.926), late layers kept short-horizon heads (min 0.777)
 - Previous run with smaller memory heads (32 instead of 64) collapsed — γ dropped to 0.73, meaning layers gave up on memory. The 64-dim fix resolved this.
-- Total GPU cost: about 30 hours across both models on free Kaggle
