@@ -35,7 +35,7 @@ The VSA state grows at 6 KB per token vs 24.6 KB per token. The 6 memory layers 
 | Training | 1.71 s/step | 1.28 s/step |
 | Training VRAM | 2.2 GB | 1.2 GB |
 
-The VSA trains about 25% slower. This is the cost of the custom Triton kernels vs PyTorch's optimized softmax. At longer contexts this reverses — VSA attention scales linearly, softmax scales quadratically — but we only trained at 512.
+The VSA trains about 25% slower. This is the cost of the custom Triton kernels vs PyTorch's optimized softmax. At longer contexts this reverses VSA attention scales linearly, softmax scales quadratically but we only trained at 512.
 
 ## Memory editing demo
 
@@ -49,7 +49,7 @@ Question: "The secret code for the vault is"
 | Doc erased | - The first floor of the building is the first |
 | No doc ever | The secret code for the vault is the same as... |
 
-The exact string is recalled when the doc is in memory. After erasure, it's gone. A second document (about Project Atlas) stayed perfectly intact after the first was erased — the erasure is surgical.
+The exact string is recalled when the doc is in memory. After erasure, it's gone. A second document (about Project Atlas) stayed perfectly intact after the first was erased the erasure is surgical.
 
 ## Recall capacity
 
@@ -67,4 +67,4 @@ A secret phrase buried in filler text:
 - Both models plateaued around step 25,000 due to being out of data.
 - VSA decay rates (γ): early layers learned longer memory (0.876 → 0.926), late layers kept short-horizon heads (min 0.777)
 
-- Previous run with smaller memory heads (32 instead of 64) collapsed — γ dropped to 0.73, meaning layers gave up on memory. The 64-dim fix resolved this.
+- Previous run with smaller memory heads (32 instead of 64) collapsed and γ dropped to 0.73, meaning layers gave up on memory. The 64-dim fix resolved this.
