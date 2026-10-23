@@ -2,6 +2,8 @@
 
 I wanted to find out whether I could replace most of a language model's attention layers with VSA, then recover the lost quality without needing another full training run from scratch.
 
+Model Page : https://huggingface.co/rikkathree/vsa-lm/tree/main
+
 For this experiment, I started with my trained 100M-parameter softmax language model, which had seen 500M FineWeb-Edu tokens. I transplanted its weights into a hybrid model where **6 of the 8 attention layers use VSA**. VSA uses a fixed-size memory state with the update `M <- gamma*M + k⊗v`, so that state does not grow with the context length.
 
 After one standard training budget of recovery training, the hybrid reached **0.996x the donor's perplexity** on my 64k-token evaluation. That's effectively at donor level within the noise of this evaluation, while six attention layers use fixed-state memory.
@@ -136,6 +138,7 @@ The main lesson is simple: once a probe saturates, it can still reveal regressio
 - I skipped 9 of 29,395 steps because the gradient norm was non-finite. The usual skip logic handled them.
 - I used a fresh certification seed, and locked the gates before the A4b training run began. The certification artifacts are in Hugging Face at `rikkathree/vsa-lm`, in `a4b_cert_results` (JSON report and console transcript).
 - The scratch-hybrid result of 106.99 on spot-A is the **7/1 (vsa8) arm**, which is the only scratch hybrid I trained for the full budget. I did not run a like-for-like 6/2 scratch experiment, so the 19.26-point gap is an upper bound rather than a matched comparison.
+https://huggingface.co/rikkathree/vsa-lm/tree/main
 - I still need the final validation perplexity for the all-VSA (`vsa0`) arm.
 - The A4b artifacts are in Hugging Face at `rikkathree/vsa-lm`, in `a4b_heal_results`. They include the `a4b_latest.pth` checkpoint, baseline JSON, validation and log CSVs, summary, and token cache.
 
