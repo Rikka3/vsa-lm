@@ -2,6 +2,8 @@
 
 Will try to post direct CSV files soon but for now...
 
+Both phase 2 results and A4B testing results and model posted.
+
 ## Quality comparison
 
 Both models: 100M params, same data (500M tokens FineWeb-Edu), same training steps, same hardware (Kaggle T4). Evaluated on 5 slices of held-out text.
