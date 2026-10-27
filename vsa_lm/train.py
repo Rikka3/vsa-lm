@@ -1,4 +1,4 @@
-"""Training entry point: checkpoint management, loop, final reporting."""
+"""Training entry point: hardware auto-profiler, checkpoint management, loop, reporting."""
 from __future__ import annotations
 
 import csv
@@ -18,10 +18,68 @@ from .evaluate import evaluate_ppl, five_spot_report
 from .model import VSALanguageModel
 
 TRAIN_CONFIG = dict(
-    batch_size=32, lr=3e-4, weight_decay=0.1, warmup_steps=1000,
-    ce_chunk=8, grad_clip=1.0, grad_skip=50.0,
-    val_every=1000, log_every=100, print_every=500, ckpt_every=1000,
+    batch_size=32,          # effective batch size (preserved across all GPUs via grad accumulation)
+    lr=3e-4,
+    vsa_lr_mult=5.0,        # faster learning rate for O(1) VSA parameters (pos_code, log_gamma)
+    weight_decay=0.1,
+    warmup_steps=1000,
+    ce_chunk=4,
+    grad_clip=1.0,
+    val_every=1000,
+    log_every=100,
+    print_every=500,
+    ckpt_every=1000,
 )
+
+
+def auto_fit_hardware(target_batch_size: int, max_len: int, n_params: int) -> dict:
+    """Inspect available GPU VRAM and pick micro_batch_size, grad_accum,
+    activation checkpointing, and dtype so training fits on 8GB..96GB GPUs."""
+    if not torch.cuda.is_available():
+        return dict(
+            vram_gb=0.0, gpu_name="CPU", micro_bs=max(1, min(4, target_batch_size)),
+            grad_accum=max(1, target_batch_size // 4), grad_ckpt=False,
+            amp_dtype=torch.float32, use_scaler=False, use_8bit_optim=False,
+        )
+
+    props = torch.cuda.get_device_properties(0)
+    vram_gb = props.total_memory / (1024 ** 3)
+    gpu_name = props.name
+    bf16_ok = torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
+    use_scaler = (amp_dtype == torch.float16)
+
+    # Estimate model scale factor (1.0 for ~100M params, ~10.0 for ~1B params)
+    scale = max(1.0, n_params / 120_000_000.0) * max(1.0, max_len / 512.0)
+
+    if vram_gb >= 40.0 / scale:
+        micro_bs = target_batch_size
+        grad_ckpt = False
+        use_8bit = False
+    elif vram_gb >= 20.0 / scale:
+        micro_bs = max(1, target_batch_size // 2)
+        grad_ckpt = (scale > 2.0)
+        use_8bit = True
+    elif vram_gb >= 12.0 / scale:
+        micro_bs = max(1, target_batch_size // 4)
+        grad_ckpt = True
+        use_8bit = True
+    else:
+        # Ultra-low VRAM (e.g. 8GB laptop GPU or 1B model on 15GB T4)
+        micro_bs = max(1, target_batch_size // 8)
+        grad_ckpt = True
+        use_8bit = True
+
+    # Ensure micro_bs divides target_batch_size cleanly
+    while target_batch_size % micro_bs != 0 and micro_bs > 1:
+        micro_bs -= 1
+    grad_accum = target_batch_size // micro_bs
+
+    return dict(
+        vram_gb=vram_gb, gpu_name=gpu_name, micro_bs=micro_bs,
+        grad_accum=grad_accum, grad_ckpt=grad_ckpt, amp_dtype=amp_dtype,
+        use_scaler=use_scaler, use_8bit_optim=use_8bit,
+    )
 
 
 def _find_checkpoint(run: str, working: str):
@@ -49,11 +107,48 @@ def _find_checkpoint(run: str, working: str):
     return best
 
 
-def main(run: str = "vsa", max_len: int = 512):
-    """Train (or resume, or no-op-finish) one arm. Returns (model, tokens)."""
-    import bitsandbytes as bnb
+def _build_optimizer(model, lr: float, wd: float, vsa_lr_mult: float, use_8bit: bool):
+    """Two-speed AdamW: standard LR on projections/MLP, boosted LR on VSA pos_code/log_gamma."""
+    decay_p, no_decay_p, vsa_p = [], [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "pos_code" in n or "log_gamma" in n:
+            vsa_p.append(p)
+        elif p.ndim < 2 or n.startswith("embed"):
+            no_decay_p.append(p)
+        else:
+            decay_p.append(p)
+
+    groups = [
+        {"params": decay_p, "weight_decay": wd, "lr_scale": 1.0},
+        {"params": no_decay_p, "weight_decay": 0.0, "lr_scale": 1.0},
+        {"params": vsa_p, "weight_decay": 0.0, "lr_scale": vsa_lr_mult},
+    ]
+
+    if use_8bit:
+        try:
+            import bitsandbytes as bnb
+            return bnb.optim.AdamW8bit(groups, lr=lr, betas=(0.9, 0.95)), "AdamW8bit"
+        except ImportError:
+            pass
+    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95)), "AdamW"
+
+
+def _forward_model(model, x: torch.Tensor, grad_ckpt: bool) -> torch.Tensor:
+    """Forward pass with optional per-block activation checkpointing to save VRAM."""
+    h = model.embed(x)
+    for block in model.blocks:
+        if grad_ckpt and model.training:
+            h = torch.utils.checkpoint.checkpoint(block, h, use_reentrant=False)
+        else:
+            h = block(h)
+    return model.norm_f(h)
+
+
+def main(run: str = "vsa", max_len: int = 512, working: str | None = None):
+    """Train (or resume) one arm with automatic hardware fitting. Returns (model, tokens)."""
     import tiktoken
-    import torch.optim as optim
     from tqdm import tqdm
 
     torch.manual_seed(0)
@@ -65,26 +160,29 @@ def main(run: str = "vsa", max_len: int = 512):
 
     cfg = TRAIN_CONFIG
     hybrid_every = 4 if run == "vsa" else 1
-    working = "/kaggle/working"
+    if working is None:
+        working = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.getcwd()
 
     model = VSALanguageModel(max_T=max_len, chunk_size=32,
                              hybrid_every=hybrid_every).cuda()
-    print(f"Model ({run}): {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
+    n_params = sum(p.numel() for p in model.parameters())
+    hw = auto_fit_hardware(cfg["batch_size"], max_len, n_params)
+
+    print(f"Model ({run}): {n_params/1e6:.2f}M parameters")
+    print(f"[auto-hw] GPU: {hw['gpu_name']} ({hw['vram_gb']:.1f} GB VRAM) -> "
+          f"micro_bs={hw['micro_bs']} x grad_accum={hw['grad_accum']} "
+          f"(effective bs={cfg['batch_size']}), grad_ckpt={hw['grad_ckpt']}, "
+          f"dtype={hw['amp_dtype']}")
 
     tokens = load_tokens()
     val_start = len(tokens) - 1_000_000
     batches, total_steps = build_loader(tokens, cfg["batch_size"], max_len)
 
-    decay_p, no_decay_p = [], []
-    for n, p in model.named_parameters():
-        if p.ndim < 2 or n.startswith("embed") or "pos_code" in n or "log_gamma" in n:
-            no_decay_p.append(p)
-        else:
-            decay_p.append(p)
-    optimizer = bnb.optim.AdamW8bit(
-        [{"params": decay_p, "weight_decay": cfg["weight_decay"]},
-         {"params": no_decay_p, "weight_decay": 0.0}],
-        lr=cfg["lr"], betas=(0.9, 0.95))
+    optimizer, opt_name = _build_optimizer(
+        model, cfg["lr"], cfg["weight_decay"], cfg["vsa_lr_mult"], hw["use_8bit_optim"]
+    )
+    print(f"[auto-hw] Optimizer: {opt_name} (backbone lr={cfg['lr']:.1e}, "
+          f"VSA lr={cfg['lr']*cfg['vsa_lr_mult']:.1e})")
 
     ckpt_path = os.path.join(working, f"{run}_latest.pth")
     start_step = 0
@@ -101,16 +199,18 @@ def main(run: str = "vsa", max_len: int = 512):
         start_step = ckpt.get("step", 0)
         print(f"Resumed at step {start_step}.")
 
-    for group in optimizer.param_groups:
-        group.setdefault("initial_lr", group["lr"])
-
-    def lr_lambda(step):
+    def lr_mult(step):
         if step < cfg["warmup_steps"]:
             return step / max(1, cfg["warmup_steps"])
         prog = (step - cfg["warmup_steps"]) / max(1, total_steps - cfg["warmup_steps"])
-        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+        return 0.05 + 0.475 * (1.0 + math.cos(math.pi * min(1.0, prog)))
 
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=start_step - 1)
+    def set_step_lr(step):
+        m = lr_mult(step)
+        for g in optimizer.param_groups:
+            g["lr"] = cfg["lr"] * m * g.get("lr_scale", 1.0)
+
+    set_step_lr(start_step)
 
     log_path = os.path.join(working, f"{run}_log.csv")
     val_log_path = os.path.join(working, f"{run}_val.csv")
@@ -121,8 +221,10 @@ def main(run: str = "vsa", max_len: int = 512):
                 csv.writer(f).writerow(header)
 
     def save(path, step):
+        tmp = path + ".tmp"
         torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                    "step": step, "config": model.config}, path)
+                    "step": step, "config": model.config}, tmp)
+        os.replace(tmp, path)
 
     enc = tiktoken.get_encoding("gpt2")
     decoder = VSARecurrentDecoder(model)
@@ -130,62 +232,81 @@ def main(run: str = "vsa", max_len: int = 512):
 
     model.train()
     step = start_step
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=hw["use_scaler"])
     t_last = time.perf_counter()
     ema_dt = None
+    micro_bs = hw["micro_bs"]
 
     pbar = tqdm(batches, desc=run, initial=start_step, total=total_steps)
     for x, y in pbar:
-        x, y = x.cuda(non_blocking=True), y.cuda(non_blocking=True)
-        with torch.autocast("cuda", torch.float16):
-            hidden = model(x)
-            total_loss = 0.0
-            for i in range(0, hidden.shape[0], cfg["ce_chunk"]):
-                hc = hidden[i:i + cfg["ce_chunk"]]
-                yc = y[i:i + hc.shape[0]]
+        optimizer.zero_grad(set_to_none=True)
+        loss_val = 0.0
+        step_ok = True
 
-                def _ce(h, tgt):
-                    logits = model.lm_head(h).float()
-                    return F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                           tgt.reshape(-1), reduction="sum")
+        for m_idx in range(0, x.shape[0], micro_bs):
+            xm = x[m_idx:m_idx + micro_bs].cuda(non_blocking=True)
+            ym = y[m_idx:m_idx + micro_bs].cuda(non_blocking=True)
+            w = xm.shape[0] / x.shape[0]
 
-                total_loss = total_loss + torch.utils.checkpoint.checkpoint(
-                    _ce, hc, yc, use_reentrant=False)
-            loss = total_loss / (hidden.shape[0] * hidden.shape[1])
+            with torch.autocast("cuda", hw["amp_dtype"]):
+                hidden = _forward_model(model, xm, hw["grad_ckpt"])
+                total_loss = 0.0
+                for i in range(0, hidden.shape[0], cfg["ce_chunk"]):
+                    hc = hidden[i:i + cfg["ce_chunk"]]
+                    yc = ym[i:i + hc.shape[0]]
 
-        if not torch.isfinite(loss):
-            print(f"\nstep {step}: non-finite loss — skipping batch", flush=True)
+                    def _ce(h, tgt):
+                        logits = model.lm_head(h).float()
+                        return F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                               tgt.reshape(-1), reduction="sum")
+
+                    total_loss = total_loss + torch.utils.checkpoint.checkpoint(
+                        _ce, hc, yc, use_reentrant=False)
+                mb_loss = (total_loss / (hidden.shape[0] * hidden.shape[1])) * w
+
+            if not torch.isfinite(mb_loss):
+                print(f"\nstep {step}: non-finite loss — skipping batch", flush=True)
+                step_ok = False
+                break
+
+            scaler.scale(mb_loss).backward()
+            loss_val += mb_loss.item()
+
+        if not step_ok:
             optimizer.zero_grad(set_to_none=True)
+            step += 1
+            set_step_lr(step)
             continue
 
-        scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
         if not torch.isfinite(total_norm):
-            print(f"\nstep {step}: grad norm {total_norm} — skipping update", flush=True)
+            print(f"\nstep {step}: non-finite grad norm — skipping update", flush=True)
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
         else:
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
+
+        step += 1
+        set_step_lr(step)
 
         now = time.perf_counter()
         dt = now - t_last
         t_last = now
         ema_dt = dt if ema_dt is None else 0.95 * ema_dt + 0.05 * dt
-        step += 1
-        pbar.set_postfix(loss=f"{loss.item():.3f}", norm=f"{total_norm.item():.2f}",
+        pbar.set_postfix(loss=f"{loss_val:.3f}", norm=f"{total_norm.item():.2f}",
                          spd=f"{ema_dt:.2f}s/it")
 
         if step % cfg["log_every"] == 0:
             with open(log_path, "a", newline="") as f:
-                csv.writer(f).writerow([step, f"{loss.item():.4f}", f"{total_norm.item():.3f}"])
+                csv.writer(f).writerow([step, f"{loss_val:.4f}", f"{total_norm.item():.3f}"])
 
         if step % cfg["print_every"] == 0:
-            print(f"\n--- Step {step} ---  loss {loss.item():.3f}  "
-                  f"norm {total_norm.item():.2f}  lr {scheduler.get_last_lr()[0]:.2e}")
+            cur_lr = optimizer.param_groups[0]["lr"]
+            print(f"\n--- Step {step} ---  loss {loss_val:.3f}  "
+                  f"norm {total_norm.item():.2f}  lr {cur_lr:.2e}")
             parts = []
             for i, blk in enumerate(model.blocks):
                 if hasattr(blk, "vsa"):
