@@ -161,7 +161,7 @@ def main(run: str = "vsa", max_len: int = 512):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-        if (not torch.isfinite(total_norm)) or total_norm.item() > cfg["grad_skip"]:
+        if not torch.isfinite(total_norm):
             print(f"\nstep {step}: grad norm {total_norm} — skipping update", flush=True)
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
