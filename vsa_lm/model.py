@@ -1,6 +1,7 @@
 """Model architecture: VSA layers, softmax layers, transformer blocks, LM head."""
 from __future__ import annotations
 
+import inspect
 import math
 
 import torch
@@ -24,36 +25,52 @@ def _rope(x: torch.Tensor, pos_start: int = 0, theta: float = 10000.0) -> torch.
     return out
 
 
-class TritonVSALayer(nn.Module):
-    """Fixed-state decayed linear attention with per-head learnable decay.
+def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Expand (B, HKV, T, HD) -> (B, H, T, HD) for Grouped-Query Attention."""
+    if n_rep == 1:
+        return x
+    B, HKV, T, HD = x.shape
+    return x[:, :, None, :, :].expand(B, HKV, n_rep, T, HD).reshape(B, HKV * n_rep, T, HD)
 
-    Upgrades (v2):
-      - gamma_max (default 0.995 for new models, 0.9999 legacy) prevents the
-        sigmoid saturation trap where (1 - gamma) -> 1e-4 freezes gradients.
-      - stabilize_pos (default True) bounds pos_code spikes and normalizes
-        per-position RMS so late context positions are never drowned out, and
-        gracefully extends past max_T with 1.0 (unlocking long-context decode).
-      - use_rope / use_head_norm (optional) add relative position + per-head
-        RMSNorm before output projection.
-    """
+
+class TritonVSALayer(nn.Module):
+    """Fixed-state decayed linear attention with per-head learnable decay,
+    bounded unit-RMS pos_code, output gate, and automatic GQA head un-tying."""
 
     def __init__(self, dim: int, num_heads: int, max_T: int, chunk_size: int = 32,
-                 gamma_max: float = 0.995, stabilize_pos: bool = True,
-                 use_rope: bool = False, use_head_norm: bool = False):
+                 num_kv_heads: int | None = None, gamma_max: float = 0.995,
+                 stabilize_pos: bool = True, use_rope: bool = False,
+                 rope_theta: float = 10000.0, use_head_norm: bool = False,
+                 vsa_untie_gqa: bool = True, **kwargs):
         super().__init__()
-        self.H, self.HD = num_heads, dim // num_heads
+        self.H = num_heads
+        self.HKV = num_kv_heads or num_heads
+        self.HD = dim // num_heads
+        self.G = self.H // self.HKV
         self.max_T = max_T
         self.chunk_size = chunk_size
         self.gamma_max = gamma_max
         self.stabilize_pos = stabilize_pos
         self.use_rope = use_rope
-        self.to_q = nn.Linear(dim, dim, bias=False)
-        self.to_k = nn.Linear(dim, dim, bias=False)
-        self.to_v = nn.Linear(dim, dim, bias=False)
-        self.to_g = nn.Linear(dim, dim, bias=False)
-        self.to_out = nn.Linear(dim, dim, bias=False)
+        self.rope_theta = rope_theta
+
+        self.to_q = nn.Linear(dim, self.H * self.HD, bias=False)
+        self.to_k = nn.Linear(dim, self.HKV * self.HD, bias=False)
+        self.to_v = nn.Linear(dim, self.HKV * self.HD, bias=False)
+        self.to_g = nn.Linear(dim, self.H * self.HD, bias=False)
+        self.to_out = nn.Linear(self.H * self.HD, dim, bias=False)
         self.head_norm = nn.RMSNorm(self.HD) if use_head_norm else None
-        # Initialize pos_code near 1.0 (multiplicative identity) + small noise
+
+        # If GQA is used (HKV < H), un-tie the KV heads so all H heads get
+        # independent (HD x HD) memory matrices instead of duplicate copies.
+        if self.G > 1 and vsa_untie_gqa:
+            eye = torch.eye(self.HD).unsqueeze(0).repeat(self.H, 1, 1)
+            self.k_head_mix = nn.Parameter(eye.clone())
+            self.v_head_mix = nn.Parameter(eye.clone())
+        else:
+            self.register_parameter("k_head_mix", None)
+            self.register_parameter("v_head_mix", None)
+
         self.pos_code = nn.Parameter(
             torch.ones(max_T, self.HD) + torch.randn(max_T, self.HD) * (0.1 / self.HD**0.5)
         )
@@ -72,10 +89,8 @@ class TritonVSALayer(nn.Module):
         T_use = min(T, self.pos_code.shape[0])
         pc = self.pos_code[:T_use].float()
         if self.stabilize_pos:
-            # 1. Equalize per-position row RMS to 1.0 (prevents late-context blindness)
             row_rms = pc.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
             pc = pc / row_rms
-            # 2. Smoothly clip extreme spikes > 3.0 RMS (prevents 27,426x explosion)
             over = pc.abs() > 3.0
             if over.any():
                 pc = torch.where(
@@ -84,48 +99,57 @@ class TritonVSALayer(nn.Module):
                     pc,
                 )
         if T > T_use:
-            # Past max_T: neutral 1.0 multiplicative code instead of crashing/wrapping
             pad = torch.ones(T - T_use, self.HD, device=pc.device, dtype=pc.dtype)
             pc = torch.cat([pc, pad], dim=0)
         return pc.view(1, 1, T, self.HD).to(dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
-        H, HD = self.H, self.HD
-        q = self.to_q(x).view(B, T, H, HD).transpose(1, 2)
-        k = self.to_k(x).view(B, T, H, HD).transpose(1, 2)
-        v = self.to_v(x).view(B, T, H, HD).transpose(1, 2)
-        g = torch.sigmoid(self.to_g(x).view(B, T, H, HD).transpose(1, 2))
+        q = self.to_q(x).view(B, T, self.H, self.HD).transpose(1, 2)
+        k = self.to_k(x).view(B, T, self.HKV, self.HD).transpose(1, 2)
+        v = self.to_v(x).view(B, T, self.HKV, self.HD).transpose(1, 2)
+        g = torch.sigmoid(self.to_g(x).view(B, T, self.H, self.HD).transpose(1, 2))
         if self.use_rope:
-            q, k = _rope(q), _rope(k)
+            q = _rope(q, theta=self.rope_theta)
+            k = _rope(k, theta=self.rope_theta)
         k = k * self.effective_pos_code(T, k.dtype)
-        y = VSAChunkFunction.apply(q, k, v, self.gamma(), self.chunk_size)
+        kx, vx = _repeat_kv(k, self.G), _repeat_kv(v, self.G)
+        if self.k_head_mix is not None:
+            kx = torch.einsum("bhtd,hde->bhte", kx, self.k_head_mix.to(kx.dtype))
+            vx = torch.einsum("bhtd,hde->bhte", vx, self.v_head_mix.to(vx.dtype))
+        y = VSAChunkFunction.apply(q, kx, vx, self.gamma(), self.chunk_size)
         if self.head_norm is not None:
             y = self.head_norm(y)
         return self.to_out((y * g).transpose(1, 2).reshape(B, T, D))
 
 
 class SoftmaxAttention(nn.Module):
-    """Standard causal softmax attention with RoPE and an output gate."""
+    """Standard causal softmax attention with RoPE, GQA support, and an output gate."""
 
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int | None = None,
+                 rope_theta: float = 10000.0, **kwargs):
         super().__init__()
-        self.H, self.HD = num_heads, dim // num_heads
-        self.to_q = nn.Linear(dim, dim, bias=False)
-        self.to_k = nn.Linear(dim, dim, bias=False)
-        self.to_v = nn.Linear(dim, dim, bias=False)
-        self.to_g = nn.Linear(dim, dim, bias=False)
-        self.to_out = nn.Linear(dim, dim, bias=False)
+        self.H = num_heads
+        self.HKV = num_kv_heads or num_heads
+        self.HD = dim // num_heads
+        self.G = self.H // self.HKV
+        self.rope_theta = rope_theta
+        self.to_q = nn.Linear(dim, self.H * self.HD, bias=False)
+        self.to_k = nn.Linear(dim, self.HKV * self.HD, bias=False)
+        self.to_v = nn.Linear(dim, self.HKV * self.HD, bias=False)
+        self.to_g = nn.Linear(dim, self.H * self.HD, bias=False)
+        self.to_out = nn.Linear(self.H * self.HD, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
-        H, HD = self.H, self.HD
-        q = self.to_q(x).view(B, T, H, HD).transpose(1, 2)
-        k = self.to_k(x).view(B, T, H, HD).transpose(1, 2)
-        v = self.to_v(x).view(B, T, H, HD).transpose(1, 2)
-        g = torch.sigmoid(self.to_g(x).view(B, T, H, HD).transpose(1, 2))
-        q, k = _rope(q), _rope(k)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        q = self.to_q(x).view(B, T, self.H, self.HD).transpose(1, 2)
+        k = self.to_k(x).view(B, T, self.HKV, self.HD).transpose(1, 2)
+        v = self.to_v(x).view(B, T, self.HKV, self.HD).transpose(1, 2)
+        g = torch.sigmoid(self.to_g(x).view(B, T, self.H, self.HD).transpose(1, 2))
+        q = _rope(q, theta=self.rope_theta)
+        k = _rope(k, theta=self.rope_theta)
+        kx, vx = _repeat_kv(k, self.G), _repeat_kv(v, self.G)
+        y = F.scaled_dot_product_attention(q, kx, vx, is_causal=True)
         return self.to_out((y * g).transpose(1, 2).reshape(B, T, D))
 
 
@@ -133,20 +157,25 @@ class VSABlock(nn.Module):
     """Pre-norm block: attention (VSA or softmax) + gated SwiGLU FFN."""
 
     def __init__(self, dim, num_heads, max_T, attn_type="vsa", chunk_size=32,
-                 gamma_max=0.995, stabilize_pos=True, use_rope=False,
-                 use_head_norm=False):
+                 num_kv_heads=None, intermediate=None, gamma_max=0.995,
+                 stabilize_pos=True, use_rope=False, rope_theta=10000.0,
+                 use_head_norm=False, vsa_untie_gqa=True, eps=1e-5, **kwargs):
         super().__init__()
-        self.norm1 = nn.RMSNorm(dim)
+        self.norm1 = nn.RMSNorm(dim, eps=eps)
         if attn_type == "vsa":
             self.vsa = TritonVSALayer(
                 dim, num_heads, max_T, chunk_size,
-                gamma_max=gamma_max, stabilize_pos=stabilize_pos,
-                use_rope=use_rope, use_head_norm=use_head_norm,
+                num_kv_heads=num_kv_heads, gamma_max=gamma_max,
+                stabilize_pos=stabilize_pos, use_rope=use_rope,
+                rope_theta=rope_theta, use_head_norm=use_head_norm,
+                vsa_untie_gqa=vsa_untie_gqa,
             )
         else:
-            self.softmax_attn = SoftmaxAttention(dim, num_heads)
-        self.norm2 = nn.RMSNorm(dim)
-        hidden = int(dim * 8 / 3)
+            self.softmax_attn = SoftmaxAttention(
+                dim, num_heads, num_kv_heads=num_kv_heads, rope_theta=rope_theta
+            )
+        self.norm2 = nn.RMSNorm(dim, eps=eps)
+        hidden = intermediate or int(dim * 8 / 3)
         self.ffn_up = nn.Linear(dim, hidden * 2, bias=False)
         self.ffn_down = nn.Linear(hidden, dim, bias=False)
 
@@ -159,19 +188,24 @@ class VSABlock(nn.Module):
 
 
 class VSALanguageModel(nn.Module):
-    """Decoder-only LM; `hybrid_every` softmax layers, rest fixed-state VSA."""
+    """Decoder-only LM; `hybrid_every` softmax layers, rest fixed-state VSA.
+    Accepts **kwargs so future config keys never break checkpoint loading."""
 
     def __init__(self, vocab_size=50257, dim=768, num_heads=12, num_layers=8,
-                 max_T=512, chunk_size=32, hybrid_every=0,
-                 gamma_max=0.995, stabilize_pos=True, use_rope=False,
-                 use_head_norm=False):
+                 max_T=512, chunk_size=32, hybrid_every=0, num_kv_heads=None,
+                 intermediate=None, gamma_max=0.995, stabilize_pos=True,
+                 use_rope=False, rope_theta=10000.0, use_head_norm=False,
+                 vsa_untie_gqa=True, eps=1e-5, **extra_cfg):
         super().__init__()
         self.config = dict(
             vocab_size=vocab_size, dim=dim, num_heads=num_heads,
+            num_kv_heads=num_kv_heads or num_heads,
+            intermediate=intermediate or int(dim * 8 / 3),
             num_layers=num_layers, max_T=max_T, chunk_size=chunk_size,
             hybrid_every=hybrid_every, gamma_max=gamma_max,
             stabilize_pos=stabilize_pos, use_rope=use_rope,
-            use_head_norm=use_head_norm,
+            rope_theta=rope_theta, use_head_norm=use_head_norm,
+            vsa_untie_gqa=vsa_untie_gqa, eps=eps, **extra_cfg,
         )
         self.embed = nn.Embedding(vocab_size, dim)
         self.embed.weight.data.normal_(mean=0.0, std=0.02)
@@ -180,17 +214,31 @@ class VSALanguageModel(nn.Module):
             t = "softmax" if (hybrid_every > 0 and (li + 1) % hybrid_every == 0) else "vsa"
             self.blocks.append(
                 VSABlock(dim, num_heads, max_T, t, chunk_size,
+                         num_kv_heads=num_kv_heads, intermediate=intermediate,
                          gamma_max=gamma_max, stabilize_pos=stabilize_pos,
-                         use_rope=use_rope, use_head_norm=use_head_norm)
+                         use_rope=use_rope, rope_theta=rope_theta,
+                         use_head_norm=use_head_norm,
+                         vsa_untie_gqa=vsa_untie_gqa, eps=eps)
             )
-        self.norm_f = nn.RMSNorm(dim)
+        self.norm_f = nn.RMSNorm(dim, eps=eps)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
-        scale = 0.02 / math.sqrt(2 * num_layers)   # residual-branch init
+        scale = 0.02 / math.sqrt(2 * num_layers)
         for blk in self.blocks:
             proj = blk.vsa.to_out if hasattr(blk, "vsa") else blk.softmax_attn.to_out
             proj.weight.data.normal_(0.0, scale)
             blk.ffn_down.weight.data.normal_(0.0, scale)
-        self.lm_head.weight = self.embed.weight    # tied embeddings
+        self.lm_head.weight = self.embed.weight
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> "VSALanguageModel":
+        """Safe constructor that never fails on unknown/legacy config keys."""
+        sig = inspect.signature(cls.__init__)
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD
+                         for p in sig.parameters.values())
+        if has_var_kw:
+            return cls(**cfg)
+        valid = {k: v for k, v in cfg.items() if k in sig.parameters}
+        return cls(**valid)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed(input_ids)
