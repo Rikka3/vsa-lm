@@ -5,14 +5,18 @@ import argparse
 import os
 import sys
 import torch
+import torch.utils.checkpoint
 
 
 def _run_fast_heal(heal_args: list[str]):
-    """Run the 1B anchored heal using vsa_lm.surgery's memory-optimal FusedChunkedCEKD
-    and bfloat16 teacher optimizations."""
+    """Run the 1B anchored heal using vsa_lm.surgery's memory-optimal FusedChunkedCEKD,
+    bfloat16 teacher, and automatic VRAM fitting (block checkpointing + micro_bs scaling)."""
     from .surgery import fast_fused_ce_kd
 
-    # Ensure workdir scripts (c1_surgery / c3_heal) are importable if present
+    low_vram_flag = "--low-vram" in heal_args
+    if low_vram_flag:
+        heal_args = [a for a in heal_args if a != "--low-vram"]
+
     for d in (os.getcwd(), "/marimo"):
         if os.path.isdir(d) and d not in sys.path:
             sys.path.insert(0, d)
@@ -20,11 +24,33 @@ def _run_fast_heal(heal_args: list[str]):
     import c1_surgery as c1
     import c3_heal as c3
 
-    # 1. Inject vsa_lm.surgery.fast_fused_ce_kd (saves ~30 GiB VRAM & avoids 2nd softmax pass)
+    # Detect GPU VRAM to decide whether to enable block-level activation checkpointing
+    vram_gb = 96.0
+    if torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+
+    use_block_ckpt = low_vram_flag or (vram_gb < 40.0)
+    if use_block_ckpt:
+        orig_blk_fwd = c1.LlamaBlock.forward
+
+        def _ckpt_blk_fwd(self, x):
+            if self.training and x.requires_grad:
+                return torch.utils.checkpoint.checkpoint(orig_blk_fwd, self, x, use_reentrant=False)
+            return orig_blk_fwd(self, x)
+
+        c1.LlamaBlock.forward = _ckpt_blk_fwd
+        if "--micro-bs" not in heal_args:
+            auto_mbs = "2" if vram_gb < 20.0 else "4"
+            heal_args = heal_args + ["--micro-bs", auto_mbs]
+        print(f"[vsa_lm.auto-hw] GPU VRAM={vram_gb:.1f} GiB -> enabled LlamaBlock activation "
+              f"checkpointing (~28 GiB VRAM saved!)", flush=True)
+
+    # Inject vsa_lm.surgery.fast_fused_ce_kd (saves ~10 GiB VRAM & speeds up vocab loss)
     def _wrapped_fused_ce_kd(model, h, y, donor, donor_h, kd, temp=1.0, chunk=2):
         if donor is not None and next(donor.parameters()).dtype == torch.float32 and h.is_cuda:
             donor.to(torch.bfloat16)
-            print("[vsa_lm.surgery] Converted frozen teacher to bfloat16 (saved 2.5 GiB VRAM, 2x faster teacher matmuls)", flush=True)
+            print("[vsa_lm.surgery] Converted frozen teacher to bfloat16 "
+                  "(saved 2.5 GiB VRAM, 2x faster teacher matmuls)", flush=True)
         loss = fast_fused_ce_kd(model, h, y, donor, donor_h, kd=kd, temp=temp, chunk=chunk)
         v = float(loss.detach())
         return loss, v, 0.0
@@ -40,7 +66,6 @@ def main(argv: list[str] | None = None):
     if argv is None:
         argv = sys.argv[1:]
 
-    # Forward unknown flags directly to _run_fast_heal when subcommand is 'heal'
     if argv and argv[0] == "heal":
         _run_fast_heal(argv[1:])
         return
