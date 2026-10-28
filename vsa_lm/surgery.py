@@ -1,7 +1,4 @@
 """Unified Donor Surgery & Anchored Healing Engine (1B+ Llama/GQA -> VSA-LM).
-
-Replaces the standalone c1_surgery.py, c2_heal.py, c3_heal.py, c3_surgical_fix.py,
-and c3_capacity_scan.py scripts with a single importable module.
 """
 from __future__ import annotations
 
