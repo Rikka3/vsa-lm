@@ -24,7 +24,6 @@ def _run_fast_heal(heal_args: list[str]):
     import c1_surgery as c1
     import c3_heal as c3
 
-    # Detect GPU VRAM to decide whether to enable block-level activation checkpointing
     vram_gb = 96.0
     if torch.cuda.is_available():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
@@ -45,7 +44,6 @@ def _run_fast_heal(heal_args: list[str]):
         print(f"[vsa_lm.auto-hw] GPU VRAM={vram_gb:.1f} GiB -> enabled LlamaBlock activation "
               f"checkpointing (~28 GiB VRAM saved!)", flush=True)
 
-    # Inject vsa_lm.surgery.fast_fused_ce_kd (saves ~10 GiB VRAM & speeds up vocab loss)
     def _wrapped_fused_ce_kd(model, h, y, donor, donor_h, kd, temp=1.0, chunk=2):
         if donor is not None and next(donor.parameters()).dtype == torch.float32 and h.is_cuda:
             donor.to(torch.bfloat16)
@@ -76,25 +74,44 @@ def main(argv: list[str] | None = None):
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # 1. `python -m vsa_lm train`
-    p_train = sub.add_parser("train", help="Train or resume a VSA-LM with auto-hardware fitting")
+    # 1. `python -m vsa_lm convert --donor <repo_or_dir> --out <ckpt.pth>`
+    p_conv = sub.add_parser("convert", help="Convert any Llama/Qwen/Mistral/SmolLM model into a VSA hybrid")
+    p_conv.add_argument("--donor", required=True, help="HuggingFace repo ID or local snapshot directory")
+    p_conv.add_argument("--out", default="vsa_student_init.pth", help="Output .pth checkpoint path")
+    p_conv.add_argument("--hybrid-every", type=int, default=4, help="Keep 1 Softmax layer every N layers (default: 4)")
+    p_conv.add_argument("--max-T", type=int, default=1024, help="Training sequence length (default: 1024)")
+    p_conv.add_argument("--gamma-cap", type=float, default=0.995, help="Max initial decay horizon (default: 0.995)")
+    p_conv.add_argument("--hf-token", default=None, help="Optional HuggingFace token for gated models")
+
+    # 2. `python -m vsa_lm heal [c3_heal args...]`
+    sub.add_parser("heal", help="Run memory-optimal anchored healing via vsa_lm.surgery")
+
+    # 3. `python -m vsa_lm train`
+    p_train = sub.add_parser("train", help="Train or resume a VSA-LM from scratch with auto-hardware fitting")
     p_train.add_argument("--run", default="vsa", choices=["vsa", "base"], help="Model arm")
     p_train.add_argument("--max-len", type=int, default=512, help="Sequence length")
     p_train.add_argument("--work", default=None, help="Working directory for checkpoints")
 
-    # 2. `python -m vsa_lm heal [c3_heal args...]`
-    sub.add_parser("heal", help="Run memory-optimal 1B anchored healing via vsa_lm.surgery")
-
-    # 3. `python -m vsa_lm scan --ckpt <path>`
+    # 4. `python -m vsa_lm scan --ckpt <path>`
     p_scan = sub.add_parser("scan", help="Run static capacity & horizon diagnostics on a checkpoint")
     p_scan.add_argument("--ckpt", required=True, help="Path to .pth checkpoint")
 
-    # 4. `python -m vsa_lm test`
+    # 5. `python -m vsa_lm test`
     sub.add_parser("test", help="Run the Triton kernel, gradient, decoder, and erasure parity suite")
 
     args = p.parse_args(argv)
 
-    if args.cmd == "train":
+    if args.cmd == "convert":
+        from .converter import convert_donor_model
+        convert_donor_model(
+            args.donor,
+            args.out,
+            hybrid_every=args.hybrid_every,
+            max_T=args.max_T,
+            gamma_cap=args.gamma_cap,
+            hf_token=args.hf_token,
+        )
+    elif args.cmd == "train":
         from .train import main as train_main
         train_main(run=args.run, max_len=args.max_len, working=args.work)
     elif args.cmd == "scan":
