@@ -8,14 +8,50 @@ import torch
 import torch.utils.checkpoint
 
 
-def _run_fast_heal(heal_args: list[str]):
-    """Run the 1B anchored heal using vsa_lm.surgery's memory-optimal FusedChunkedCEKD,
-    bfloat16 teacher, and automatic VRAM fitting (block checkpointing + micro_bs scaling)."""
-    from .surgery import fast_fused_ce_kd
+def _ should_use_legacy_c3(heal_args: list[str]) -> bool:
+    """Use c3_heal.py only if it exists locally and the checkpoint is a C3 Llama-3.2-1B run."""
+    c3_exists = any(os.path.isfile(os.path.join(d, "c3_heal.py")) for d in (os.getcwd(), "/marimo"))
+    if not c3_exists:
+        return False
+    if "--ckpt" in heal_args:
+        idx = heal_args.index("--ckpt")
+        if idx + 1 < len(heal_args) and os.path.isfile(heal_args[idx + 1]):
+            try:
+                ck = torch.load(heal_args[idx + 1], map_location="cpu", weights_only=False)
+                arch = (ck.get("config") or {}).get("donor_arch", "llama")
+                if arch != "llama" or (ck.get("config") or {}).get("qkv_bias", False):
+                    return False
+            except Exception:
+                pass
+    return True
 
-    low_vram_flag = "--low-vram" in heal_args
-    if low_vram_flag:
-        heal_args = [a for a in heal_args if a != "--low-vram"]
+
+def _run_fast_heal(heal_args: list[str]):
+    if not _should_use_legacy_c3(heal_args):
+        p = argparse.ArgumentParser(prog="vsa_lm heal")
+        p.add_argument("--ckpt", required=True, help="Path to converted VSA checkpoint")
+        p.add_argument("--donor", default=None, help="Optional HF donor repo ID")
+        p.add_argument("--work", default=".", help="Working directory")
+        p.add_argument("--out-prefix", default="vsa_healed", help="Output checkpoint prefix")
+        p.add_argument("--tokens", type=int, default=300_000_000, help="Healing token budget")
+        p.add_argument("--data-tokens", type=int, default=350_000_000, help="Token cache size")
+        p.add_argument("--bs", type=int, default=16)
+        p.add_argument("--lr", type=float, default=2e-5)
+        p.add_argument("--warmup", type=int, default=300)
+        p.add_argument("--kd", type=float, default=0.5)
+        p.add_argument("--eval-every", type=int, default=250)
+        p.add_argument("--save-every", type=int, default=500)
+        p.add_argument("--seed", type=int, default=7777)
+        p.add_argument("--hf-repo", default=None, help="Optional HF repo for periodic checkpoint backups")
+        args, _ = p.parse_known_args(heal_args)
+        from .converter import heal_universal_model
+        heal_universal_model(
+            args.ckpt, donor_id=args.donor, work=args.work, out_prefix=args.out_prefix,
+            tokens_budget=args.tokens, data_tokens=args.data_tokens, bs=args.bs,
+            lr=args.lr, warmup=args.warmup, kd=args.kd, eval_every=args.eval_every,
+            save_every=args.save_every, seed=args.seed, hf_repo=args.hf_repo,
+        )
+        return
 
     for d in (os.getcwd(), "/marimo"):
         if os.path.isdir(d) and d not in sys.path:
@@ -24,38 +60,31 @@ def _run_fast_heal(heal_args: list[str]):
     import c1_surgery as c1
     import c3_heal as c3
 
-    vram_gb = 96.0
-    if torch.cuda.is_available():
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-
-    use_block_ckpt = low_vram_flag or (vram_gb < 40.0)
-    if use_block_ckpt:
-        orig_blk_fwd = c1.LlamaBlock.forward
-
-        def _ckpt_blk_fwd(self, x):
-            if self.training and x.requires_grad:
-                return torch.utils.checkpoint.checkpoint(orig_blk_fwd, self, x, use_reentrant=False)
-            return orig_blk_fwd(self, x)
-
-        c1.LlamaBlock.forward = _ckpt_blk_fwd
-        if "--micro-bs" not in heal_args:
-            auto_mbs = "2" if vram_gb < 20.0 else "4"
-            heal_args = heal_args + ["--micro-bs", auto_mbs]
-        print(f"[vsa_lm.auto-hw] GPU VRAM={vram_gb:.1f} GiB -> enabled LlamaBlock activation "
-              f"checkpointing (~28 GiB VRAM saved!)", flush=True)
+    orig_fused_ce_kd = c1.fused_ce_kd
 
     def _wrapped_fused_ce_kd(model, h, y, donor, donor_h, kd, temp=1.0, chunk=2):
         if donor is not None and next(donor.parameters()).dtype == torch.float32 and h.is_cuda:
             donor.to(torch.bfloat16)
             print("[vsa_lm.surgery] Converted frozen teacher to bfloat16 "
                   "(saved 2.5 GiB VRAM, 2x faster teacher matmuls)", flush=True)
-        loss = fast_fused_ce_kd(model, h, y, donor, donor_h, kd=kd, temp=temp, chunk=chunk)
-        v = float(loss.detach())
-        return loss, v, 0.0
+        B = h.shape[0]
+        tot_loss = 0.0
+        for i in range(0, B, chunk):
+            hc = h[i:i + chunk]
+            yc = y[i:i + chunk]
+            dhc = donor_h[i:i + chunk] if donor_h is not None else None
+            w = hc.shape[0] / B
+
+            def _chunk_fn(h_part, y_part, dh_part):
+                l_part, _, _ = orig_fused_ce_kd(model, h_part, y_part, donor, dh_part, kd, temp, chunk=chunk)
+                return l_part
+
+            tot_loss = tot_loss + w * torch.utils.checkpoint.checkpoint(_chunk_fn, hc, yc, dhc, use_reentrant=False)
+        v = float(tot_loss.detach())
+        return tot_loss, v, 0.0
 
     c1.fused_ce_kd = _wrapped_fused_ce_kd
-    print("[vsa_lm] Activated FusedChunkedCEKD + bf16 teacher engine from vsa_lm.surgery!", flush=True)
-
+    print("[vsa_lm] Activated FP32 chunk-checkpointed CE+KD + bf16 teacher!", flush=True)
     sys.argv = ["c3_heal.py"] + heal_args
     c3.main()
 
@@ -74,7 +103,6 @@ def main(argv: list[str] | None = None):
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # 1. `python -m vsa_lm convert --donor <repo_or_dir> --out <ckpt.pth>`
     p_conv = sub.add_parser("convert", help="Convert any Llama/Qwen/Mistral/SmolLM model into a VSA hybrid")
     p_conv.add_argument("--donor", required=True, help="HuggingFace repo ID or local snapshot directory")
     p_conv.add_argument("--out", default="vsa_student_init.pth", help="Output .pth checkpoint path")
@@ -83,20 +111,16 @@ def main(argv: list[str] | None = None):
     p_conv.add_argument("--gamma-cap", type=float, default=0.995, help="Max initial decay horizon (default: 0.995)")
     p_conv.add_argument("--hf-token", default=None, help="Optional HuggingFace token for gated models")
 
-    # 2. `python -m vsa_lm heal [c3_heal args...]`
-    sub.add_parser("heal", help="Run memory-optimal anchored healing via vsa_lm.surgery")
+    sub.add_parser("heal", help="Run memory-optimal anchored healing on any converted VSA checkpoint")
 
-    # 3. `python -m vsa_lm train`
     p_train = sub.add_parser("train", help="Train or resume a VSA-LM from scratch with auto-hardware fitting")
     p_train.add_argument("--run", default="vsa", choices=["vsa", "base"], help="Model arm")
     p_train.add_argument("--max-len", type=int, default=512, help="Sequence length")
     p_train.add_argument("--work", default=None, help="Working directory for checkpoints")
 
-    # 4. `python -m vsa_lm scan --ckpt <path>`
     p_scan = sub.add_parser("scan", help="Run static capacity & horizon diagnostics on a checkpoint")
     p_scan.add_argument("--ckpt", required=True, help="Path to .pth checkpoint")
 
-    # 5. `python -m vsa_lm test`
     sub.add_parser("test", help="Run the Triton kernel, gradient, decoder, and erasure parity suite")
 
     args = p.parse_args(argv)
@@ -104,12 +128,8 @@ def main(argv: list[str] | None = None):
     if args.cmd == "convert":
         from .converter import convert_donor_model
         convert_donor_model(
-            args.donor,
-            args.out,
-            hybrid_every=args.hybrid_every,
-            max_T=args.max_T,
-            gamma_cap=args.gamma_cap,
-            hf_token=args.hf_token,
+            args.donor, args.out, hybrid_every=args.hybrid_every,
+            max_T=args.max_T, gamma_cap=args.gamma_cap, hf_token=args.hf_token,
         )
     elif args.cmd == "train":
         from .train import main as train_main
