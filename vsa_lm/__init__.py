@@ -4,6 +4,7 @@ from .decode import VSARecurrentDecoder
 from .functional import VSAChunkFunction, vsa_parallel_attention
 from .surgery import LlamaVSALM, scan_checkpoint
 from .converter import UniversalVSALM, convert_donor_model
+from .thinking import OpenMythosEngine, LatentThinkController
 from .train import auto_fit_hardware
 
 __all__ = [
@@ -11,6 +12,8 @@ __all__ = [
     "LlamaVSALM",
     "UniversalVSALM",
     "VSARecurrentDecoder",
+    "OpenMythosEngine",
+    "LatentThinkController",
     "VSAChunkFunction",
     "vsa_parallel_attention",
     "auto_fit_hardware",
