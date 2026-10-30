@@ -15,10 +15,12 @@ class VSAChunkFunction(torch.autograd.Function):
         q_flat = q.reshape(B*H, T, D).contiguous()
         k_flat = k.reshape(B*H, T, D).contiguous()
         v_flat = v.reshape(B*H, T, D).contiguous()
-        y_flat = torch.empty(B*H, T, D, device=q.device, dtype=torch.float32)
+        y_flat = torch.empty(B*H, T, D, device=q.device, dtype=q.dtype)
         num_chunks = T // chunk_size
+        # Store M_saved in fp32 when input is fp32 (for 1e-4 oracle tests), or bf16/fp32 during AMP
+        m_dtype = torch.bfloat16 if q.dtype == torch.bfloat16 else torch.float32
         M_saved = torch.empty(B*H, max(1, num_chunks - 1), D, D,
-                              device=q.device, dtype=torch.float32)
+                              device=q.device, dtype=m_dtype)
         grid = (B * H,)
         vsa_chunk_forward_kernel[grid](
             q_flat, k_flat, v_flat, y_flat, M_saved, gamma,
@@ -27,7 +29,7 @@ class VSAChunkFunction(torch.autograd.Function):
             B, H, T, D, BLOCK_SIZE=chunk_size, num_warps=4, num_stages=2)
         ctx.save_for_backward(q, k, v, gamma, M_saved)
         ctx.chunk_size = chunk_size
-        return y_flat.view(B, H, T, D).to(q.dtype)
+        return y_flat.view(B, H, T, D)
 
     @staticmethod
     def backward(ctx, dy):
