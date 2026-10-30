@@ -1,10 +1,4 @@
-"""Universal Donor-to-VSA Converter & Low-VRAM FastDistill Healer (vsa_lm.converter).
-
-Supports any Llama, Qwen, DeepSeek-R1-Distill, Mistral, or SmolLM model of
-any parameter size without needing external c1/c2/c3 scripts:
-  1. `python -m vsa_lm convert --donor Qwen/Qwen2.5-1.5B --out qwen_vsa.pth`
-  2. `python -m vsa_lm heal --ckpt qwen_vsa.pth --tokens 100000000`
-"""
+"""Universal Donor-to-VSA Converter & Low-VRAM FastDistill Healer (vsa_lm.converter)."""
 from __future__ import annotations
 
 import gc
@@ -440,10 +434,10 @@ def heal_universal_model(
     donor_id: str | None = None,
     work: str = ".",
     out_prefix: str = "vsa_healed",
-    tokens_budget: int = 100_000_000,
-    data_tokens: int = 120_000_000,
+    tokens_budget: int = 180_000_000,
+    data_tokens: int = 200_000_000,
     bs: int = 16,
-    lr: float = 1e-4,
+    lr: float = 1.5e-4,
     warmup: int = 200,
     kd: float = 0.5,
     eval_every: int = 250,
@@ -470,7 +464,9 @@ def heal_universal_model(
             p.data = p.data.float()
 
     T = int(stu_cfg["max_T"])
-    micro_bs = 4
+    vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
+    micro_bs = 8 if vram_gb >= 45.0 else 4
+    use_ckpt = (vram_gb < 32.0)
 
     donor_dir = fetch_any_donor(donor_repo)
     hf_sd = load_all_safetensors(donor_dir)
@@ -488,41 +484,50 @@ def heal_universal_model(
     start_ppl = _eval_ppl_universal(stu, tokens, val_start, device)
 
     total_steps = max(1, math.ceil(tokens_budget / (bs * T)))
-    stage1_steps = min(600, total_steps // 5) if start_step == 0 else 0
+    stage1_steps = min(500, total_steps // 6) if start_step == 0 else 0
 
     print("=" * 80)
     print(f"VSA-FASTDISTILL UNIVERSAL HEALER: {donor_repo} ({stu_cfg.get('donor_arch')})")
     print("=" * 80)
-    print(f"  Donor val_ppl  : {donor_ppl:.3f}  |  Student start val_ppl: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x donor)")
-    print(f"  Budget         : {tokens_budget/1e6:.1f}M tokens ({total_steps} steps, micro_bs={micro_bs})")
+    print(f"  Donor val_ppl  : {donor_ppl:.3f}  |  Student current val_ppl: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x donor)")
+    print(f"  Budget         : {tokens_budget/1e6:.1f}M tokens ({total_steps} steps, resume={start_step}, micro_bs={micro_bs})")
 
     vsa_conv, vsa_core, vsa_proj, mlp_params = [], [], [], []
     for n_, p_ in stu.named_parameters():
         if n_.startswith("embed_tokens") or n_.startswith("lm_head"):
             p_.requires_grad_(False)
         elif any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix")):
+            p_.requires_grad_(True)
             vsa_conv.append(p_)
         elif any(k in n_ for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale")):
+            p_.requires_grad_(True)
             vsa_core.append(p_)
         elif ".vsa." in n_:
+            p_.requires_grad_(True)
             vsa_proj.append(p_)
         else:
+            p_.requires_grad_(True)
             mlp_params.append(p_)
 
     trainable = vsa_conv + vsa_core + vsa_proj + mlp_params
     opt = torch.optim.AdamW([
-        {"params": vsa_conv,   "weight_decay": 0.01, "lr_scale": 10.0},
-        {"params": vsa_core,   "weight_decay": 0.0,  "lr_scale": 6.0},
+        {"params": vsa_conv,   "weight_decay": 0.01, "lr_scale": 8.0},
+        {"params": vsa_core,   "weight_decay": 0.0,  "lr_scale": 5.0},
         {"params": vsa_proj,   "weight_decay": 0.05, "lr_scale": 1.5},
-        {"params": mlp_params, "weight_decay": 0.05, "lr_scale": 1.0, "is_mlp": True},
+        {"params": mlp_params, "weight_decay": 0.05, "lr_scale": 0.5, "is_mlp": True},
     ], lr=lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
 
+    stable_end = int(total_steps * 0.65)
     def set_step_lr(s: int):
         if s < warmup:
             m = (s + 1) / max(1, warmup)
+        elif s < stable_end:
+            m = 1.0
         else:
-            prog = (s - warmup) / max(1, total_steps - warmup)
-            m = 0.05 + 0.475 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+            prog = (s - stable_end) / max(1, total_steps - stable_end)
+            m = 0.08 + 0.46 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+        if start_step > 0 and s >= start_step:
+            m *= min(1.0, (s - start_step + 1) / 100.0)
         for g in opt.param_groups:
             if g.get("is_mlp", False) and s < stage1_steps:
                 g["lr"] = 0.0
@@ -539,7 +544,6 @@ def heal_universal_model(
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
-    use_ckpt = (torch.cuda.get_device_properties(0).total_memory < 32 * 1024**3) if device.type == "cuda" else False
     stu.train()
     set_step_lr(start_step)
     t0 = time.perf_counter()
@@ -587,13 +591,17 @@ def heal_universal_model(
             mb_ce_kd = 0.0
 
             with torch.no_grad():
-                for i in range(B_m):
-                    slog = F.linear(h_student[i], w_lm_s).float()
+                for i in range(0, B_m, 2):
+                    hs_c = h_student[i:i+2]
+                    ht_c = h_teacher[i:i+2]
+                    ym_c = ym[i:i+2]
+
+                    slog = F.linear(hs_c, w_lm_s).float()
                     lsm_s = F.log_softmax(slog, dim=-1)
                     prob_s = lsm_s.exp()
-                    ce_i = -lsm_s.gather(1, ym[i][:, None]).sum()
+                    ce_i = -lsm_s.gather(-1, ym_c.unsqueeze(-1)).sum()
 
-                    rlog = F.linear(h_teacher[i], w_lm_t).float()
+                    rlog = F.linear(ht_c, w_lm_t).float()
                     rlsm = F.log_softmax(rlog, dim=-1)
                     prob_t = rlsm.exp()
                     kd_i = (prob_t * (rlsm - lsm_s)).sum()
@@ -603,9 +611,9 @@ def heal_universal_model(
 
                     g_logits = prob_s
                     g_logits.sub_(prob_t, alpha=kd)
-                    g_logits.scatter_add_(1, ym[i][:, None], torch.full((T_m, 1), -(1.0 - kd), device=device, dtype=torch.float32))
+                    g_logits.scatter_add_(-1, ym_c.unsqueeze(-1), torch.full_like(ym_c.unsqueeze(-1), -(1.0 - kd), dtype=torch.float32))
                     g_logits.mul_(w / N_m)
-                    dh[i] = (g_logits.to(h_student.dtype) @ w_lm_s)
+                    dh[i:i+2] = (g_logits.to(h_student.dtype) @ w_lm_s)
                     del slog, lsm_s, prob_s, prob_t, g_logits
 
             torch.autograd.backward(
@@ -620,17 +628,17 @@ def heal_universal_model(
         step_done = step + 1
         set_step_lr(step_done)
 
-        if step_done in (1, 5) or (step_done % 10 == 0 and step_done % eval_every != 0):
+        if step_done in (start_step + 1, start_step + 5) or (step_done % 25 == 0 and step_done % eval_every != 0):
             dt = (time.perf_counter() - t0) / max(1, step_done - start_step)
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
-            print(f"  [{out_prefix}] step {step_done:4d}/{total_steps}  loss {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
+            print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  loss {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
         if step_done % eval_every == 0 or step_done == total_steps:
             ppl = _eval_ppl_universal(stu, tokens, val_start, device)
             stu.train()
             dt = (time.perf_counter() - t0) / max(1, step_done - start_step)
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
-            print(f"  >>> [{out_prefix} EVAL] step {step_done:4d}/{total_steps}  loss {loss_val:.4f}  "
+            print(f"  >>> [{out_prefix} EVAL] step {step_done:5d}/{total_steps}  loss {loss_val:.4f}  "
                   f"val_ppl {ppl:.3f} ({ppl/donor_ppl:.3f}x donor)  gnorm {gn:.2f}  "
                   f"toks {step_done*bs*T/1e6:.1f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
