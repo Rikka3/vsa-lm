@@ -166,3 +166,30 @@ def vsa_chunk_backward_kernel(
         dM_acc = dM
 
     tl.store(dGAMMA + pid_bh, dg_acc)
+@triton.jit
+def vsa_recurrent_step_kernel(
+    Q_ptr, K_ptr, V_ptr, M_ptr, Out_ptr,
+    GAM_ptr, OMG_SCALE_ptr, VSELF_ptr,
+    H: tl.constexpr, D: tl.constexpr,
+):
+    """Fused O(1) VSA recurrent decode step in a single SRAM pass."""
+    pid = tl.program_id(0)
+    h_idx = pid % H
+
+    d_idx = tl.arange(0, D)
+    vec_off = pid * D + d_idx
+    mat_off = pid * D * D + d_idx[:, None] * D + d_idx[None, :]
+
+    q = tl.load(Q_ptr + vec_off).to(tl.float32)
+    k = tl.load(K_ptr + vec_off).to(tl.float32)
+    v = tl.load(V_ptr + vec_off).to(tl.float32)
+    gam = tl.load(GAM_ptr + h_idx).to(tl.float32)
+    omg_s = tl.load(OMG_SCALE_ptr + h_idx).to(tl.float32)
+    v_self = tl.load(VSELF_ptr + h_idx).to(tl.float32)
+
+    M = tl.load(M_ptr + mat_off).to(tl.float32)
+    M_new = gam * M + k[:, None] * v[None, :]
+    tl.store(M_ptr + mat_off, M_new.to(M_ptr.dtype.element_ty))
+
+    y = tl.sum(M_new * q[:, None], axis=0) * omg_s + v_self * v
+    tl.store(Out_ptr + vec_off, y.to(Out_ptr.dtype.element_ty))
