@@ -1,4 +1,4 @@
-"""Triton kernels for chunkwise VSA attention (TensorCore-accelerated forward scan & adjoint backward)."""
+"""Triton kernels for chunkwise VSA attention (TensorCore-accelerated forward scan, adjoint backward, and O(1) decode)."""
 import triton
 import triton.language as tl
 
@@ -44,7 +44,6 @@ def vsa_chunk_forward_kernel(
         k = tl.load(K + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
         v = tl.load(V + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
 
-        # Allow TF32 TensorCores on Ampere/Hopper/Blackwell while keeping fp32 accumulators
         y_carry = tl.dot(q, M) * (local_decay_q[:, None] * inv_sqrt_d)
         attn = tl.dot(q, tl.trans(k)) * inv_sqrt_d
         causal_mask = (diff >= 0) & (t_mask[:, None] & t_mask[None, :])
@@ -166,6 +165,8 @@ def vsa_chunk_backward_kernel(
         dM_acc = dM
 
     tl.store(dGAMMA + pid_bh, dg_acc)
+
+
 @triton.jit
 def vsa_recurrent_step_kernel(
     Q_ptr, K_ptr, V_ptr, M_ptr, Out_ptr,
