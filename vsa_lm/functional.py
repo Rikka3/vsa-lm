@@ -1,7 +1,7 @@
 """Autograd wrapper and fp32 reference implementations for VSA attention."""
 import torch
 
-from .kernels import vsa_chunk_forward_kernel, vsa_chunk_backward_kernel
+from .kernels import vsa_chunk_forward_kernel, vsa_chunk_backward_kernel, vsa_recurrent_step_kernel
 
 
 class VSAChunkFunction(torch.autograd.Function):
@@ -10,14 +10,15 @@ class VSAChunkFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, gamma, chunk_size):
         B, H, T, D = q.shape
-        if T % chunk_size or T < chunk_size:
-            raise ValueError(f"sequence length {T} must be a positive multiple of {chunk_size}")
+        # For D >= 128 (e.g. Qwen-1.5B / DeepSeek-1.5B), use chunk_size=16 so backward shared memory stays < 64 KB
+        eff_chunk = 16 if (D >= 128 and chunk_size >= 16 and T % 16 == 0) else chunk_size
+        if T % eff_chunk or T < eff_chunk:
+            raise ValueError(f"sequence length {T} must be a positive multiple of {eff_chunk}")
         q_flat = q.reshape(B*H, T, D).contiguous()
         k_flat = k.reshape(B*H, T, D).contiguous()
         v_flat = v.reshape(B*H, T, D).contiguous()
         y_flat = torch.empty(B*H, T, D, device=q.device, dtype=q.dtype)
-        num_chunks = T // chunk_size
-        # Store M_saved in fp32 when input is fp32 (for 1e-4 oracle tests), or bf16/fp32 during AMP
+        num_chunks = T // eff_chunk
         m_dtype = torch.bfloat16 if q.dtype == torch.bfloat16 else torch.float32
         M_saved = torch.empty(B*H, max(1, num_chunks - 1), D, D,
                               device=q.device, dtype=m_dtype)
@@ -26,9 +27,9 @@ class VSAChunkFunction(torch.autograd.Function):
             q_flat, k_flat, v_flat, y_flat, M_saved, gamma,
             q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
             M_saved.stride(0), M_saved.stride(1), M_saved.stride(2),
-            B, H, T, D, BLOCK_SIZE=chunk_size, num_warps=4, num_stages=2)
+            B, H, T, D, BLOCK_SIZE=eff_chunk, num_warps=4, num_stages=(1 if D >= 128 else 2))
         ctx.save_for_backward(q, k, v, gamma, M_saved)
-        ctx.chunk_size = chunk_size
+        ctx.chunk_size = eff_chunk
         return y_flat.view(B, H, T, D)
 
     @staticmethod
@@ -50,9 +51,21 @@ class VSAChunkFunction(torch.autograd.Function):
             dq_flat, dk_flat, dv_flat, dgamma_flat,
             q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
             M_saved.stride(0), M_saved.stride(1), M_saved.stride(2),
-            B, H, T, D, BLOCK_SIZE=chunk_size, num_warps=4, num_stages=2)
+            B, H, T, D, BLOCK_SIZE=chunk_size, num_warps=4, num_stages=(1 if D >= 128 else 2))
         dgamma = dgamma_flat.view(B, H).sum(0)
         return dq_flat.view(B, H, T, D), dk_flat.view(B, H, T, D), dv_flat.view(B, H, T, D), dgamma, None
+
+
+def fused_vsa_recurrent_step(q: torch.Tensor, kx: torch.Tensor, vx: torch.Tensor,
+                             M: torch.Tensor, gam: torch.Tensor, omg_scale: torch.Tensor,
+                             v_self: torch.Tensor) -> torch.Tensor:
+    """Launch the Fused Triton O(1) VSA recurrent decode step kernel."""
+    B, H, _, D = q.shape
+    out = torch.empty_like(q)
+    vsa_recurrent_step_kernel[(B * H,)](
+        q, kx, vx, M, out, gam, omg_scale, v_self, H=H, D=D, num_warps=4
+    )
+    return out
 
 
 def vsa_parallel_attention(q, k, v, gamma):
