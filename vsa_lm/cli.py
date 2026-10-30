@@ -33,11 +33,11 @@ def _run_fast_heal(heal_args: list[str]):
         p.add_argument("--donor", default=None, help="Optional HF donor repo ID")
         p.add_argument("--work", default=".", help="Working directory")
         p.add_argument("--out-prefix", default="vsa_healed", help="Output checkpoint prefix")
-        p.add_argument("--tokens", type=int, default=300_000_000, help="Healing token budget")
-        p.add_argument("--data-tokens", type=int, default=350_000_000, help="Token cache size")
+        p.add_argument("--tokens", type=int, default=100_000_000, help="Healing token budget")
+        p.add_argument("--data-tokens", type=int, default=120_000_000, help="Token cache size")
         p.add_argument("--bs", type=int, default=16)
-        p.add_argument("--lr", type=float, default=2e-5)
-        p.add_argument("--warmup", type=int, default=300)
+        p.add_argument("--lr", type=float, default=8e-5)
+        p.add_argument("--warmup", type=int, default=200)
         p.add_argument("--kd", type=float, default=0.5)
         p.add_argument("--eval-every", type=int, default=250)
         p.add_argument("--save-every", type=int, default=500)
@@ -65,26 +65,11 @@ def _run_fast_heal(heal_args: list[str]):
     def _wrapped_fused_ce_kd(model, h, y, donor, donor_h, kd, temp=1.0, chunk=2):
         if donor is not None and next(donor.parameters()).dtype == torch.float32 and h.is_cuda:
             donor.to(torch.bfloat16)
-            print("[vsa_lm.surgery] Converted frozen teacher to bfloat16 "
-                  "(saved 2.5 GiB VRAM, 2x faster teacher matmuls)", flush=True)
-        B = h.shape[0]
-        tot_loss = 0.0
-        for i in range(0, B, chunk):
-            hc = h[i:i + chunk]
-            yc = y[i:i + chunk]
-            dhc = donor_h[i:i + chunk] if donor_h is not None else None
-            w = hc.shape[0] / B
-
-            def _chunk_fn(h_part, y_part, dh_part):
-                l_part, _, _ = orig_fused_ce_kd(model, h_part, y_part, donor, dh_part, kd, temp, chunk=chunk)
-                return l_part
-
-            tot_loss = tot_loss + w * torch.utils.checkpoint.checkpoint(_chunk_fn, hc, yc, dhc, use_reentrant=False)
-        v = float(tot_loss.detach())
-        return tot_loss, v, 0.0
+            print("[vsa_lm.surgery] Converted frozen teacher to bfloat16 (2x faster teacher matmuls)", flush=True)
+        return orig_fused_ce_kd(model, h, y, donor, donor_h, kd, temp, chunk=chunk)
 
     c1.fused_ce_kd = _wrapped_fused_ce_kd
-    print("[vsa_lm] Activated FP32 chunk-checkpointed CE+KD + bf16 teacher!", flush=True)
+    print("[vsa_lm] Activated direct FP32 CE+KD + bf16 teacher!", flush=True)
     sys.argv = ["c3_heal.py"] + heal_args
     c3.main()
 
@@ -108,7 +93,7 @@ def main(argv: list[str] | None = None):
     p_conv.add_argument("--out", default="vsa_student_init.pth", help="Output .pth checkpoint path")
     p_conv.add_argument("--hybrid-every", type=int, default=4, help="Keep 1 Softmax layer every N layers (default: 4)")
     p_conv.add_argument("--max-T", type=int, default=1024, help="Training sequence length (default: 1024)")
-    p_conv.add_argument("--gamma-cap", type=float, default=0.995, help="Max initial decay horizon (default: 0.995)")
+    p_conv.add_argument("--gamma-cap", type=float, default=0.992, help="Max initial decay horizon (default: 0.992)")
     p_conv.add_argument("--hf-token", default=None, help="Optional HuggingFace token for gated models")
 
     sub.add_parser("heal", help="Run memory-optimal anchored healing on any converted VSA checkpoint")
