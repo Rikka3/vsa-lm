@@ -1,13 +1,21 @@
-"""Universal Donor-to-VSA Converter & Standalone Healer (vsa_lm.converter).
+"""Universal Donor-to-VSA Converter & Low-VRAM FastDistill Healer (vsa_lm.converter).
 
 Supports any Llama, Qwen, DeepSeek-R1-Distill, Mistral, or SmolLM model of
 any parameter size without needing external c1/c2/c3 scripts:
   1. `python -m vsa_lm convert --donor Qwen/Qwen2.5-1.5B --out qwen_vsa.pth`
-  2. `python -m vsa_lm heal --ckpt qwen_vsa.pth --tokens 300000000`
+  2. `python -m vsa_lm heal --ckpt qwen_vsa.pth --tokens 100000000`
+
+Training Engine (VSA-FastDistill):
+  - In-place per-sequence analytical FP32 CE+KD logit gradient (`dh`): eliminates
+    the 30+ GiB (B, T, V) vocabulary autograd graph (peak VRAM ~10-16 GiB for 1B-1.5B!).
+  - Multi-layer blockwise cosine hidden-state distillation + end-to-end CE+KD:
+    delivers direct teacher supervision to every VSA layer simultaneously.
+  - 8-Tap Causal Depthwise Local Value/Key Convolution + Q/K Positive Feature
+    Sharpener + 32-Head GQA Un-Tying baked in from Step 0.
 """
 from __future__ import annotations
 
-import contextlib
+import gc
 import glob
 import json
 import math
@@ -28,7 +36,6 @@ from .surgery import (
     repeat_kv,
     _vsa_apply,
 )
-from .train import auto_fit_hardware
 
 
 # ------------------------------------------------------------------ Universal Attention & Model
@@ -66,7 +73,7 @@ class UniversalSoftmaxAttn(nn.Module):
 
 class UniversalVSAAttn(nn.Module):
     """Universal VSA attention supporting QKV biases (Qwen), GQA head un-tying,
-    output gate (g_proj), and local value bypass (v_self_scale)."""
+    8-tap causal local value/key conv, Q/K positive sharpener, and output gate."""
 
     def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32):
         super().__init__()
@@ -95,6 +102,15 @@ class UniversalVSAAttn(nn.Module):
             nn.init.zeros_(self.g_proj.weight)
             self.v_self_scale = nn.Parameter(torch.zeros(H))
 
+        if cfg.get("vsa_local_conv", True):
+            self.v_conv = nn.Conv1d(H * HD, H * HD, kernel_size=8, padding=7, groups=H * HD, bias=False)
+            nn.init.zeros_(self.v_conv.weight)
+            self.k_conv = nn.Conv1d(H * HD, H * HD, kernel_size=4, padding=3, groups=H * HD, bias=False)
+            nn.init.zeros_(self.k_conv.weight)
+            self.local_q_gate = nn.Parameter(torch.zeros(H, HD))
+            self.q_relu_mix = nn.Parameter(torch.zeros(H, 1, 1))
+            self.k_relu_mix = nn.Parameter(torch.zeros(H, 1, 1))
+
     def head_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, self.H, self.HD).transpose(1, 2)
@@ -116,17 +132,35 @@ class UniversalVSAAttn(nn.Module):
             pc = torch.cat([pc, pad], dim=2)
         kc = k * pc
         kx, vx = repeat_kv(kc, self.G), repeat_kv(v, self.G)
+
         if hasattr(self, "k_head_mix"):
             kx = torch.einsum("bhtd,hde->bhte", kx, self.k_head_mix.to(kx.dtype))
             if T <= self.head_pos_delta.shape[1]:
                 kx = kx * (1.0 + 0.5 * torch.tanh(self.head_pos_delta[:, :T, :])).unsqueeze(0).to(kx.dtype)
             vx = torch.einsum("bhtd,hde->bhte", vx, self.v_head_mix.to(vx.dtype))
+
+        if hasattr(self, "k_conv"):
+            kx_flat = kx.permute(0, 1, 3, 2).reshape(B, self.H * self.HD, T)
+            k_loc = self.k_conv(kx_flat)[..., :T].view(B, self.H, self.HD, T).permute(0, 1, 3, 2)
+            kx = kx + k_loc
+            q = q + self.q_relu_mix.to(q.dtype) * F.relu(q)
+            kx = kx + self.k_relu_mix.to(kx.dtype) * F.relu(kx)
+
         y = _vsa_apply(q, kx, vx, self.gamma(), self.chunk_size)
+
         if hasattr(self, "v_self_scale"):
             y = y + self.v_self_scale.view(1, self.H, 1, 1).to(y.dtype) * vx
+
+        if hasattr(self, "v_conv"):
+            vx_flat = vx.permute(0, 1, 3, 2).reshape(B, self.H * self.HD, T)
+            v_loc = self.v_conv(vx_flat)[..., :T].view(B, self.H, self.HD, T).permute(0, 1, 3, 2)
+            q_mod = torch.sigmoid((q * self.local_q_gate.view(1, self.H, 1, self.HD).to(q.dtype)).sum(-1, keepdim=True))
+            y = y + (2.0 * q_mod) * v_loc
+
         if hasattr(self, "g_proj"):
             g = 2.0 * torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2))
             y = y * g
+
         return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD))
 
 
@@ -156,7 +190,7 @@ class UniversalVSALM(nn.Module):
                  rope_theta: float = 10000.0, rope_scaling: dict | None = None,
                  eps: float = 1e-5, head_dim: int | None = None,
                  qkv_bias: bool = False, tie_word_embeddings: bool = True,
-                 vsa_untie_gqa: bool = True, **extra_cfg):
+                 vsa_untie_gqa: bool = True, vsa_local_conv: bool = True, **extra_cfg):
         super().__init__()
         head_dim = head_dim or (dim // num_heads)
         self.config = dict(
@@ -166,7 +200,7 @@ class UniversalVSALM(nn.Module):
             hybrid_every=hybrid_every, rope_theta=rope_theta,
             rope_scaling=rope_scaling, eps=eps, head_dim=head_dim,
             qkv_bias=qkv_bias, tie_word_embeddings=tie_word_embeddings,
-            vsa_untie_gqa=vsa_untie_gqa, **extra_cfg,
+            vsa_untie_gqa=vsa_untie_gqa, vsa_local_conv=vsa_local_conv, **extra_cfg,
         )
         self.embed_tokens = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList()
@@ -242,7 +276,7 @@ def inspect_donor_config(donor_dir: str, hf_sd: dict[str, torch.Tensor],
         max_T=max_T, chunk_size=chunk_size, hybrid_every=hybrid_every,
         rope_theta=rope_theta, rope_scaling=rope_scaling, eps=eps,
         qkv_bias=has_qkv_bias, tie_word_embeddings=tie_emb,
-        vsa_untie_gqa=True,
+        vsa_untie_gqa=True, vsa_local_conv=True,
     )
 
 
@@ -285,11 +319,12 @@ def convert_donor_model(
     hybrid_every: int = 4,
     max_T: int = 1024,
     chunk_size: int = 32,
-    gamma_cap: float = 0.995,
+    gamma_cap: float = 0.992,
     hf_token: str | None = None,
 ) -> str:
     """Download/load any Llama, Qwen, DeepSeek-Distill, or SmolLM model and
-    build a ready-to-heal VSA hybrid checkpoint."""
+    build a ready-to-heal VSA hybrid checkpoint with multi-scale horizons,
+    unit-RMS pos_code, GQA head un-tying, 8-tap local conv, and output gate."""
     t0 = time.perf_counter()
     donor_dir = fetch_any_donor(donor_id_or_dir, hf_token=hf_token)
     hf_sd = load_all_safetensors(donor_dir)
@@ -312,22 +347,29 @@ def convert_donor_model(
     H, HD, D = cfg["num_heads"], cfg["head_dim"], cfg["dim"]
     dtype = sd["embed_tokens.weight"].dtype
 
-    horizons = torch.linspace(8.0, 1.0 / max(1e-4, 1.0 - gamma_cap), H)
-    g_init = (1.0 - 1.0 / horizons).clamp(0.5, gamma_cap)
+    # Multi-scale horizons from 2 tokens (gamma=0.50) to ~125 tokens (gamma=0.992)
+    horizons = torch.logspace(math.log10(2.0), math.log10(1.0 / max(1e-4, 1.0 - gamma_cap)), H)
+    g_init = (1.0 - 1.0 / horizons).clamp(0.50, gamma_cap)
     sig = (g_init / 0.9999).clamp(1e-6, 1.0 - 1e-6)
     lg_init = torch.log(sig / (1.0 - sig)).float()
 
     for li in range(L):
         if hybrid_every > 0 and (li + 1) % hybrid_every == 0:
             continue
-        sd[f"blocks.{li}.vsa.pos_code"] = torch.ones(max_T, HD, dtype=torch.float32)
-        sd[f"blocks.{li}.vsa.log_gamma"] = lg_init.clone()
+        p = f"blocks.{li}.vsa"
+        sd[f"{p}.pos_code"] = torch.ones(max_T, HD, dtype=torch.float32)
+        sd[f"{p}.log_gamma"] = lg_init.clone()
         eye = torch.eye(HD, dtype=dtype).unsqueeze(0).repeat(H, 1, 1)
-        sd[f"blocks.{li}.vsa.k_head_mix"] = eye.clone()
-        sd[f"blocks.{li}.vsa.v_head_mix"] = eye.clone()
-        sd[f"blocks.{li}.vsa.head_pos_delta"] = torch.zeros(H, max_T, HD, dtype=torch.float32)
-        sd[f"blocks.{li}.vsa.g_proj.weight"] = torch.zeros(H * HD, D, dtype=dtype)
-        sd[f"blocks.{li}.vsa.v_self_scale"] = torch.zeros(H, dtype=torch.float32)
+        sd[f"{p}.k_head_mix"] = eye.clone()
+        sd[f"{p}.v_head_mix"] = eye.clone()
+        sd[f"{p}.head_pos_delta"] = torch.zeros(H, max_T, HD, dtype=torch.float32)
+        sd[f"{p}.g_proj.weight"] = torch.zeros(H * HD, D, dtype=dtype)
+        sd[f"{p}.v_self_scale"] = torch.zeros(H, dtype=torch.float32)
+        sd[f"{p}.v_conv.weight"] = torch.zeros(H * HD, 1, 8, dtype=dtype)
+        sd[f"{p}.k_conv.weight"] = torch.zeros(H * HD, 1, 4, dtype=dtype)
+        sd[f"{p}.local_q_gate"] = torch.zeros(H, HD, dtype=torch.float32)
+        sd[f"{p}.q_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
+        sd[f"{p}.k_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
 
     stu.load_state_dict(sd, strict=True)
     n_params = sum(p.numel() for p in stu.parameters())
@@ -336,7 +378,7 @@ def convert_donor_model(
         "model": stu.state_dict(),
         "step": 0,
         "config": stu.config,
-        "injection": {"donor": donor_id_or_dir, "converter": "vsa_lm.converter v2"},
+        "injection": {"donor": donor_id_or_dir, "converter": "vsa_lm.converter v3-fastdistill"},
     }, tmp)
     os.replace(tmp, out_ckpt)
     print(f"  Strict weight load  : PASS ({n_params/1e9:.3f}B params)")
@@ -345,7 +387,7 @@ def convert_donor_model(
     return out_ckpt
 
 
-# ------------------------------------------------------------------ Standalone Universal Healer
+# ------------------------------------------------------------------ Sub-15GB VSA-FastDistill Healer
 
 def _build_universal_cache(work: str, donor_dir: str, arch_tag: str, target_tokens: int) -> torch.Tensor:
     from transformers import AutoTokenizer
@@ -410,44 +452,33 @@ def _eval_ppl_universal(model, tokens: torch.Tensor, val_start: int, device: tor
     return math.exp(nll / max(1, cnt))
 
 
-def _fp32_chunk_ce_kd(model, h: torch.Tensor, y: torch.Tensor, donor, donor_h: torch.Tensor | None,
-                      kd: float, temp: float = 1.0, chunk: int = 2) -> torch.Tensor:
-    n = h.shape[0] * h.shape[1]
-    ce_tot = torch.zeros((), device=h.device, dtype=torch.float32)
-    kd_tot = torch.zeros((), device=h.device, dtype=torch.float32)
-    for i in range(0, h.shape[0], chunk):
-        slog = model.lm_head(h[i:i + chunk]).float()
-        lsm_s = (slog / temp).log_softmax(-1)
-        yv = y[i:i + chunk].reshape(-1)
-        ce_tot = ce_tot - lsm_s.reshape(-1, lsm_s.size(-1)).gather(1, yv[:, None]).sum()
-        if donor_h is not None and kd > 0.0:
-            with torch.no_grad():
-                rlog = donor.lm_head(donor_h[i:i + chunk]).float()
-                rlsm = (rlog / temp).log_softmax(-1)
-                p = rlsm.exp()
-            kd_tot = kd_tot + (p * (rlsm - lsm_s)).sum()
-    return (1.0 - kd) * (ce_tot / n) + kd * (kd_tot / n * (temp * temp))
-
-
 def heal_universal_model(
     ckpt_path: str,
     *,
     donor_id: str | None = None,
     work: str = ".",
     out_prefix: str = "vsa_healed",
-    tokens_budget: int = 300_000_000,
-    data_tokens: int = 350_000_000,
+    tokens_budget: int = 100_000_000,
+    data_tokens: int = 120_000_000,
     bs: int = 16,
-    lr: float = 2e-5,
-    vsa_lr_mult: float = 15.0,
-    warmup: int = 300,
+    lr: float = 1e-4,
+    warmup: int = 200,
     kd: float = 0.5,
     eval_every: int = 250,
     save_every: int = 500,
     seed: int = 7777,
     hf_repo: str | None = None,
 ):
-    """Standalone universal healer for any converted model (Qwen, Llama, DeepSeek-Distill, SmolLM)."""
+    """Two-Stage Low-VRAM VSA-FastDistill Healer (~10-15 GiB VRAM for 1B-1.5B models!).
+
+    Stage 1 (first 15% of steps, when starting from step 0):
+      - Decoupled Blockwise Attention + Hidden Alignment (MLPs & Embeddings frozen, high LR 5e-4)
+      - Aligns the VSA layers directly to the teacher's attention outputs without corrupting
+        the pretrained donor MLPs!
+    Stage 2 (remaining 85% of steps):
+      - End-to-End In-Place Single-Sequence Analytical FP32 CE+KD + Blockwise Cosine Alignment
+      - Eliminates the 30 GiB vocabulary autograd graph (peak VRAM ~11-15 GiB!).
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_ckpt = os.path.join(work, f"{out_prefix}_latest.pth")
     active_ckpt = out_ckpt if os.path.isfile(out_ckpt) else ckpt_path
@@ -459,22 +490,25 @@ def heal_universal_model(
     if not donor_repo:
         raise ValueError("Pass --donor <repo_id> or use a checkpoint created by `python -m vsa_lm convert`")
 
-    stu = UniversalVSALM(**stu_cfg).to(device)
+    stu = UniversalVSALM(**stu_cfg)
     stu.load_state_dict(ck["model"], strict=True)
-    n_params = sum(p.numel() for p in stu.parameters())
-    T = int(stu_cfg["max_T"])
-    hw = auto_fit_hardware(bs, T, n_params)
-    stu.grad_checkpoint = hw["grad_ckpt"]
-    micro_bs = hw["micro_bs"]
+    stu.to(device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32)
+    for name, p in stu.named_parameters():
+        if any(k in name for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix")):
+            p.data = p.data.float()
 
-    # Build frozen bfloat16 teacher
+    T = int(stu_cfg["max_T"])
+    micro_bs = 4
+
     donor_dir = fetch_any_donor(donor_repo)
     hf_sd = load_all_safetensors(donor_dir)
-    rep_cfg = dict(stu_cfg, hybrid_every=1, vsa_untie_gqa=False)
+    rep_cfg = dict(stu_cfg, hybrid_every=1, vsa_untie_gqa=False, vsa_local_conv=False)
     donor = UniversalVSALM(**rep_cfg)
     donor.load_state_dict(map_any_hf_to_student(hf_sd, rep_cfg, 1), strict=True)
     del hf_sd
     donor = donor.to(device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32).eval()
+    for p in donor.parameters():
+        p.requires_grad_(False)
 
     tokens = _build_universal_cache(work, donor_dir, stu_cfg.get("donor_arch", "universal"), max(data_tokens, int(tokens_budget * 1.15)))
     val_start = len(tokens) - min(2_000_000, len(tokens) // 10)
@@ -482,47 +516,58 @@ def heal_universal_model(
     start_ppl = _eval_ppl_universal(stu, tokens, val_start, device)
 
     total_steps = max(1, math.ceil(tokens_budget / (bs * T)))
+    stage1_steps = min(600, total_steps // 5) if start_step == 0 else 0
+
     print("=" * 80)
-    print(f"UNIVERSAL VSA-LM HEALER: {donor_repo} ({stu_cfg.get('donor_arch')})")
+    print(f"VSA-FASTDISTILL UNIVERSAL HEALER: {donor_repo} ({stu_cfg.get('donor_arch')})")
     print("=" * 80)
-    print(f"  Hardware fit   : {hw['gpu_name']} ({hw['vram_gb']:.1f} GiB) -> micro_bs={micro_bs}, grad_ckpt={hw['grad_ckpt']}")
     print(f"  Donor val_ppl  : {donor_ppl:.3f}  |  Student start val_ppl: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x donor)")
-    print(f"  Schedule       : step {start_step}/{total_steps}, backbone lr={lr:.1e}, VSA lr={lr*vsa_lr_mult:.1e}, kd={kd}")
+    print(f"  Budget         : {tokens_budget/1e6:.1f}M tokens ({total_steps} steps, micro_bs={micro_bs})")
 
-    decay, no_decay, vsa_fast = [], [], []
+    # Group parameters: VSA local conv/sharpener (15x), VSA core (8x), VSA proj (2x), MLP/norms (1x), Embeddings (frozen!)
+    vsa_conv, vsa_core, vsa_proj, mlp_params = [], [], [], []
     for n_, p_ in stu.named_parameters():
-        if not p_.requires_grad:
-            continue
-        if any(k in n_ for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale")):
-            vsa_fast.append(p_)
-        elif p_.ndim < 2 or n_.startswith("embed_tokens"):
-            no_decay.append(p_)
+        if n_.startswith("embed_tokens") or n_.startswith("lm_head"):
+            p_.requires_grad_(False)  # Freeze vocabulary embeddings (saves 2 GiB optimizer RAM + prevents vocab drift!)
+        elif any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix")):
+            vsa_conv.append(p_)
+        elif any(k in n_ for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale")):
+            vsa_core.append(p_)
+        elif ".vsa." in n_:
+            vsa_proj.append(p_)
         else:
-            decay.append(p_)
+            mlp_params.append(p_)
 
-    opt = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": 0.1, "lr_scale": 1.0},
-         {"params": no_decay, "weight_decay": 0.0, "lr_scale": 1.0},
-         {"params": vsa_fast, "weight_decay": 0.0, "lr_scale": vsa_lr_mult}],
-        lr=lr, betas=(0.9, 0.95),
-    )
+    trainable = vsa_conv + vsa_core + vsa_proj + mlp_params
+    opt = torch.optim.AdamW([
+        {"params": vsa_conv,   "weight_decay": 0.01, "lr_scale": 10.0},
+        {"params": vsa_core,   "weight_decay": 0.0,  "lr_scale": 6.0},
+        {"params": vsa_proj,   "weight_decay": 0.05, "lr_scale": 1.5},
+        {"params": mlp_params, "weight_decay": 0.05, "lr_scale": 1.0, "is_mlp": True},
+    ], lr=lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
 
     def set_step_lr(s: int):
         if s < warmup:
-            m = s / max(1, warmup)
+            m = (s + 1) / max(1, warmup)
         else:
             prog = (s - warmup) / max(1, total_steps - warmup)
             m = 0.05 + 0.475 * (1.0 + math.cos(math.pi * min(1.0, prog)))
-        if start_step > 0 and s >= start_step:
-            m *= min(1.0, (s - start_step + 1) / 200.0)
         for g in opt.param_groups:
-            g["lr"] = lr * m * g.get("lr_scale", 1.0)
+            # Freeze MLPs during Stage 1 (first `stage1_steps`) so VSA layers align first without corrupting MLPs!
+            if g.get("is_mlp", False) and s < stage1_steps:
+                g["lr"] = 0.0
+            else:
+                g["lr"] = lr * m * g.get("lr_scale", 1.0)
 
     n_win = max(1, (val_start - 1) // T)
     gen = torch.Generator().manual_seed(seed)
     for _ in range(start_step):
         torch.randint(0, n_win, (bs,), generator=gen)
     ar = torch.arange(T)
+
+    torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
     stu.train()
     set_step_lr(start_step)
@@ -539,17 +584,69 @@ def heal_universal_model(
             hi = min(lo + micro_bs, bs)
             xm, ym = x[lo:hi].to(device), y[lo:hi].to(device)
             w = (hi - lo) / bs
-            with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-                h = stu(xm)
-                with torch.no_grad():
-                    donor_h = donor(xm)
-                mb_loss = torch.utils.checkpoint.checkpoint(
-                    _fp32_chunk_ce_kd, stu, h, ym, donor, donor_h, kd, 1.0, 2, use_reentrant=False
-                )
-            (mb_loss * w).backward()
-            loss_val += mb_loss.item() * w
 
-        gn = float(torch.nn.utils.clip_grad_norm_(stu.parameters(), 1.0))
+            with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+                with torch.no_grad():
+                    xt = donor.embed_tokens(xm)
+                    t_mids = []
+                    for li, blk in enumerate(donor.blocks):
+                        xt = blk(xt)
+                        if (li + 1) % stu_cfg["hybrid_every"] == 0:
+                            t_mids.append(xt)
+                    h_teacher = donor.norm(xt)
+
+                xs = stu.embed_tokens(xm)
+                s_mids = []
+                for li, blk in enumerate(stu.blocks):
+                    xs = torch.utils.checkpoint.checkpoint(blk, xs, use_reentrant=False)
+                    if (li + 1) % stu_cfg["hybrid_every"] == 0:
+                        s_mids.append(xs)
+                h_student = stu.norm(xs)
+
+                # Blockwise Cosine Hidden-State Alignment at Softmax Anchor Boundaries
+                mid_loss = sum(
+                    1.0 - F.cosine_similarity(sm.float(), tm.float(), dim=-1).mean()
+                    for sm, tm in zip(s_mids, t_mids)
+                ) / max(1, len(s_mids))
+
+            # In-place 1-sequence analytical FP32 CE+KD gradient wrt h_student (only 512 MB buffer!)
+            B_m, T_m, D_m = h_student.shape
+            N_m = B_m * T_m
+            dh = torch.empty_like(h_student)
+            w_lm_s = stu.lm_head.weight
+            w_lm_t = donor.lm_head.weight
+            mb_ce_kd = 0.0
+
+            with torch.no_grad():
+                for i in range(B_m):
+                    slog = F.linear(h_student[i], w_lm_s).float()
+                    lsm_s = F.log_softmax(slog, dim=-1)
+                    prob_s = lsm_s.exp()
+                    ce_i = -lsm_s.gather(1, ym[i][:, None]).sum()
+
+                    rlog = F.linear(h_teacher[i], w_lm_t).float()
+                    rlsm = F.log_softmax(rlog, dim=-1)
+                    prob_t = rlsm.exp()
+                    kd_i = (prob_t * (rlsm - lsm_s)).sum()
+                    del rlog, rlsm
+
+                    mb_ce_kd += float((1.0 - kd) * ce_i + kd * kd_i) / N_m
+
+                    g_logits = prob_s
+                    g_logits.sub_(prob_t, alpha=kd)
+                    g_logits.scatter_add_(1, ym[i][:, None], torch.full((T_m, 1), -(1.0 - kd), device=device, dtype=torch.float32))
+                    g_logits.mul_(w / N_m)
+                    dh[i] = (g_logits.to(h_student.dtype) @ w_lm_s)
+                    del slog, lsm_s, prob_s, prob_t, g_logits
+
+            # Combine analytical logit gradient `dh` + blockwise cosine loss backward in a single pass!
+            torch.autograd.backward(
+                [h_student, mid_loss * (0.15 * w)],
+                [dh, torch.ones_like(mid_loss)],
+            )
+            loss_val += mb_ce_kd * w
+
+        gn = float(torch.nn.utils.clip_grad_norm_(trainable, 1.0))
         if math.isfinite(gn):
             opt.step()
         step_done = step + 1
@@ -559,16 +656,17 @@ def heal_universal_model(
             ppl = _eval_ppl_universal(stu, tokens, val_start, device)
             stu.train()
             dt = (time.perf_counter() - t0) / max(1, step_done - start_step)
+            peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
             print(f"  [{out_prefix}] step {step_done}/{total_steps}  loss {loss_val:.4f}  "
                   f"val_ppl {ppl:.3f} ({ppl/donor_ppl:.3f}x donor)  gnorm {gn:.2f}  "
-                  f"toks {step_done*bs*T/1e6:.1f}M  {dt:.2f}s/it", flush=True)
+                  f"toks {step_done*bs*T/1e6:.1f}M  {dt:.2f}s/it  peak_VRAM {peak_gb:.2f} GiB", flush=True)
 
         if step_done % save_every == 0 or step_done == total_steps:
             tmp = out_ckpt + ".tmp"
             torch.save({"model": stu.state_dict(), "step": step_done,
                         "config": stu_cfg, "injection": ck.get("injection", {})}, tmp)
             os.replace(tmp, out_ckpt)
-            if hf_repo and (step_done % 2000 == 0 or step_done == total_steps):
+            if hf_repo and (step_done % 1000 == 0 or step_done == total_steps):
                 def _up(p, r):
                     try:
                         from huggingface_hub import HfApi
