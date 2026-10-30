@@ -4,14 +4,6 @@ Supports any Llama, Qwen, DeepSeek-R1-Distill, Mistral, or SmolLM model of
 any parameter size without needing external c1/c2/c3 scripts:
   1. `python -m vsa_lm convert --donor Qwen/Qwen2.5-1.5B --out qwen_vsa.pth`
   2. `python -m vsa_lm heal --ckpt qwen_vsa.pth --tokens 100000000`
-
-Training Engine (VSA-FastDistill):
-  - In-place per-sequence analytical FP32 CE+KD logit gradient (`dh`): eliminates
-    the 30+ GiB (B, T, V) vocabulary autograd graph (peak VRAM ~10-16 GiB for 1B-1.5B!).
-  - Multi-layer blockwise cosine hidden-state distillation + end-to-end CE+KD:
-    delivers direct teacher supervision to every VSA layer simultaneously.
-  - 8-Tap Causal Depthwise Local Value/Key Convolution + Q/K Positive Feature
-    Sharpener + 32-Head GQA Un-Tying baked in from Step 0.
 """
 from __future__ import annotations
 
@@ -37,8 +29,6 @@ from .surgery import (
     _vsa_apply,
 )
 
-
-# ------------------------------------------------------------------ Universal Attention & Model
 
 class UniversalSoftmaxAttn(nn.Module):
     """Donor softmax attention supporting arbitrary GQA ratios and optional QKV biases (Qwen)."""
@@ -224,8 +214,6 @@ class UniversalVSALM(nn.Module):
         return self.norm(x)
 
 
-# ------------------------------------------------------------------ Dynamic Loader & Surgery
-
 def fetch_any_donor(repo_or_dir: str, hf_token: str | None = None) -> str:
     if os.path.isdir(repo_or_dir):
         return repo_or_dir
@@ -322,9 +310,6 @@ def convert_donor_model(
     gamma_cap: float = 0.992,
     hf_token: str | None = None,
 ) -> str:
-    """Download/load any Llama, Qwen, DeepSeek-Distill, or SmolLM model and
-    build a ready-to-heal VSA hybrid checkpoint with multi-scale horizons,
-    unit-RMS pos_code, GQA head un-tying, 8-tap local conv, and output gate."""
     t0 = time.perf_counter()
     donor_dir = fetch_any_donor(donor_id_or_dir, hf_token=hf_token)
     hf_sd = load_all_safetensors(donor_dir)
@@ -347,7 +332,6 @@ def convert_donor_model(
     H, HD, D = cfg["num_heads"], cfg["head_dim"], cfg["dim"]
     dtype = sd["embed_tokens.weight"].dtype
 
-    # Multi-scale horizons from 2 tokens (gamma=0.50) to ~125 tokens (gamma=0.992)
     horizons = torch.logspace(math.log10(2.0), math.log10(1.0 / max(1e-4, 1.0 - gamma_cap)), H)
     g_init = (1.0 - 1.0 / horizons).clamp(0.50, gamma_cap)
     sig = (g_init / 0.9999).clamp(1e-6, 1.0 - 1e-6)
@@ -386,8 +370,6 @@ def convert_donor_model(
     print("=" * 80)
     return out_ckpt
 
-
-# ------------------------------------------------------------------ Sub-15GB VSA-FastDistill Healer
 
 def _build_universal_cache(work: str, donor_dir: str, arch_tag: str, target_tokens: int) -> torch.Tensor:
     from transformers import AutoTokenizer
@@ -469,16 +451,6 @@ def heal_universal_model(
     seed: int = 7777,
     hf_repo: str | None = None,
 ):
-    """Two-Stage Low-VRAM VSA-FastDistill Healer (~10-15 GiB VRAM for 1B-1.5B models!).
-
-    Stage 1 (first 15% of steps, when starting from step 0):
-      - Decoupled Blockwise Attention + Hidden Alignment (MLPs & Embeddings frozen, high LR 5e-4)
-      - Aligns the VSA layers directly to the teacher's attention outputs without corrupting
-        the pretrained donor MLPs!
-    Stage 2 (remaining 85% of steps):
-      - End-to-End In-Place Single-Sequence Analytical FP32 CE+KD + Blockwise Cosine Alignment
-      - Eliminates the 30 GiB vocabulary autograd graph (peak VRAM ~11-15 GiB!).
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_ckpt = os.path.join(work, f"{out_prefix}_latest.pth")
     active_ckpt = out_ckpt if os.path.isfile(out_ckpt) else ckpt_path
@@ -524,11 +496,10 @@ def heal_universal_model(
     print(f"  Donor val_ppl  : {donor_ppl:.3f}  |  Student start val_ppl: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x donor)")
     print(f"  Budget         : {tokens_budget/1e6:.1f}M tokens ({total_steps} steps, micro_bs={micro_bs})")
 
-    # Group parameters: VSA local conv/sharpener (15x), VSA core (8x), VSA proj (2x), MLP/norms (1x), Embeddings (frozen!)
     vsa_conv, vsa_core, vsa_proj, mlp_params = [], [], [], []
     for n_, p_ in stu.named_parameters():
         if n_.startswith("embed_tokens") or n_.startswith("lm_head"):
-            p_.requires_grad_(False)  # Freeze vocabulary embeddings (saves 2 GiB optimizer RAM + prevents vocab drift!)
+            p_.requires_grad_(False)
         elif any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix")):
             vsa_conv.append(p_)
         elif any(k in n_ for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale")):
@@ -553,7 +524,6 @@ def heal_universal_model(
             prog = (s - warmup) / max(1, total_steps - warmup)
             m = 0.05 + 0.475 * (1.0 + math.cos(math.pi * min(1.0, prog)))
         for g in opt.param_groups:
-            # Freeze MLPs during Stage 1 (first `stage1_steps`) so VSA layers align first without corrupting MLPs!
             if g.get("is_mlp", False) and s < stage1_steps:
                 g["lr"] = 0.0
             else:
@@ -569,6 +539,7 @@ def heal_universal_model(
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
+    use_ckpt = (torch.cuda.get_device_properties(0).total_memory < 32 * 1024**3) if device.type == "cuda" else False
     stu.train()
     set_step_lr(start_step)
     t0 = time.perf_counter()
@@ -598,18 +569,16 @@ def heal_universal_model(
                 xs = stu.embed_tokens(xm)
                 s_mids = []
                 for li, blk in enumerate(stu.blocks):
-                    xs = torch.utils.checkpoint.checkpoint(blk, xs, use_reentrant=False)
+                    xs = torch.utils.checkpoint.checkpoint(blk, xs, use_reentrant=False) if use_ckpt else blk(xs)
                     if (li + 1) % stu_cfg["hybrid_every"] == 0:
                         s_mids.append(xs)
                 h_student = stu.norm(xs)
 
-                # Blockwise Cosine Hidden-State Alignment at Softmax Anchor Boundaries
                 mid_loss = sum(
                     1.0 - F.cosine_similarity(sm.float(), tm.float(), dim=-1).mean()
                     for sm, tm in zip(s_mids, t_mids)
                 ) / max(1, len(s_mids))
 
-            # In-place 1-sequence analytical FP32 CE+KD gradient wrt h_student (only 512 MB buffer!)
             B_m, T_m, D_m = h_student.shape
             N_m = B_m * T_m
             dh = torch.empty_like(h_student)
@@ -639,7 +608,6 @@ def heal_universal_model(
                     dh[i] = (g_logits.to(h_student.dtype) @ w_lm_s)
                     del slog, lsm_s, prob_s, prob_t, g_logits
 
-            # Combine analytical logit gradient `dh` + blockwise cosine loss backward in a single pass!
             torch.autograd.backward(
                 [h_student, mid_loss * (0.15 * w)],
                 [dh, torch.ones_like(mid_loss)],
@@ -652,14 +620,19 @@ def heal_universal_model(
         step_done = step + 1
         set_step_lr(step_done)
 
+        if step_done in (1, 5) or (step_done % 10 == 0 and step_done % eval_every != 0):
+            dt = (time.perf_counter() - t0) / max(1, step_done - start_step)
+            peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
+            print(f"  [{out_prefix}] step {step_done:4d}/{total_steps}  loss {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
+
         if step_done % eval_every == 0 or step_done == total_steps:
             ppl = _eval_ppl_universal(stu, tokens, val_start, device)
             stu.train()
             dt = (time.perf_counter() - t0) / max(1, step_done - start_step)
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
-            print(f"  [{out_prefix}] step {step_done}/{total_steps}  loss {loss_val:.4f}  "
+            print(f"  >>> [{out_prefix} EVAL] step {step_done:4d}/{total_steps}  loss {loss_val:.4f}  "
                   f"val_ppl {ppl:.3f} ({ppl/donor_ppl:.3f}x donor)  gnorm {gn:.2f}  "
-                  f"toks {step_done*bs*T/1e6:.1f}M  {dt:.2f}s/it  peak_VRAM {peak_gb:.2f} GiB", flush=True)
+                  f"toks {step_done*bs*T/1e6:.1f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
         if step_done % save_every == 0 or step_done == total_steps:
             tmp = out_ckpt + ".tmp"
