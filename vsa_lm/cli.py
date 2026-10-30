@@ -8,7 +8,7 @@ import torch
 import torch.utils.checkpoint
 
 
-def _ should_use_legacy_c3(heal_args: list[str]) -> bool:
+def _should_use_legacy_c3(heal_args: list[str]) -> bool:
     """Use c3_heal.py only if it exists locally and the checkpoint is a C3 Llama-3.2-1B run."""
     c3_exists = any(os.path.isfile(os.path.join(d, "c3_heal.py")) for d in (os.getcwd(), "/marimo"))
     if not c3_exists:
