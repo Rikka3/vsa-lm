@@ -33,16 +33,17 @@ def _run_fast_heal(heal_args: list[str]):
         p.add_argument("--donor", default=None, help="Optional HF donor repo ID")
         p.add_argument("--work", default=".", help="Working directory")
         p.add_argument("--out-prefix", default="vsa_healed", help="Output checkpoint prefix")
-        p.add_argument("--tokens", type=int, default=100_000_000, help="Healing token budget")
-        p.add_argument("--data-tokens", type=int, default=120_000_000, help="Token cache size")
+        p.add_argument("--tokens", type=int, default=80_000_000, help="Healing token budget")
+        p.add_argument("--data-tokens", type=int, default=100_000_000, help="Token cache size")
         p.add_argument("--bs", type=int, default=16)
-        p.add_argument("--lr", type=float, default=8e-5)
-        p.add_argument("--warmup", type=int, default=200)
-        p.add_argument("--kd", type=float, default=0.5)
+        p.add_argument("--lr", type=float, default=1.5e-4)
+        p.add_argument("--warmup", type=int, default=150)
+        p.add_argument("--kd", type=float, default=1.0)
         p.add_argument("--eval-every", type=int, default=250)
         p.add_argument("--save-every", type=int, default=500)
         p.add_argument("--seed", type=int, default=7777)
         p.add_argument("--hf-repo", default=None, help="Optional HF repo for periodic checkpoint backups")
+        p.add_argument("--highspeed", action="store_true", help="Use more VRAM (no block checkpointing, micro_bs=8) for faster step time")
         args, _ = p.parse_known_args(heal_args)
         from .converter import heal_universal_model
         heal_universal_model(
@@ -50,6 +51,7 @@ def _run_fast_heal(heal_args: list[str]):
             tokens_budget=args.tokens, data_tokens=args.data_tokens, bs=args.bs,
             lr=args.lr, warmup=args.warmup, kd=args.kd, eval_every=args.eval_every,
             save_every=args.save_every, seed=args.seed, hf_repo=args.hf_repo,
+            highspeed=args.highspeed,
         )
         return
 
