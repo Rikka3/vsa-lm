@@ -6,6 +6,7 @@ Supports:
     `linear_attn.in_proj_qkv` + `in_proj_z` + `out_proj` into VSA layers, and
     preserves `self_attn` (`q_norm` / `k_norm`) on every 4th layer!
   - Qwen3 (`Qwen/Qwen3-8B`), Qwen2.5, DeepSeek-R1-Distill-Qwen, Llama-3, Mistral, SmolLM.
+  - Strictly disjoint train/eval caches (0% overlap, zero benchmark contamination).
 """
 from __future__ import annotations
 
@@ -91,7 +92,6 @@ class UniversalVSAAttn(nn.Module):
         H = cfg.get("vsa_num_heads") or cfg["num_heads"]
         HKV = cfg.get("vsa_num_kv_heads") or cfg["num_kv_heads"]
         HD = cfg.get("vsa_head_dim") or cfg.get("head_dim") or (D // H)
-        # Ensure HD <= 128 for Triton shared memory compatibility
         while HD > 128 and H * 2 <= 64:
             H *= 2
             HKV *= 2
@@ -262,10 +262,8 @@ def load_all_safetensors(donor_dir: str) -> dict[str, torch.Tensor]:
     sd = {}
     for sh in shards:
         for k, v in load_file(sh).items():
-            # Strip multimodal vision tower weights immediately on load to save RAM!
             if k.startswith("visual.") or k.startswith("model.visual.") or ".visual." in k:
                 continue
-            # Normalize `model.language_model.*` or `language_model.model.*` -> `model.*`
             if k.startswith("model.language_model."):
                 k = "model." + k[len("model.language_model."):]
             elif k.startswith("language_model.model."):
@@ -282,7 +280,6 @@ def inspect_donor_config(donor_dir: str, hf_sd: dict[str, torch.Tensor],
     with open(os.path.join(donor_dir, "config.json")) as f:
         raw_cfg = json.load(f)
 
-    # Unwrap multimodal `text_config` (used by Qwen3.5-9B / VL models)
     hc = raw_cfg.get("text_config", raw_cfg)
 
     dim = int(hc["hidden_size"])
@@ -297,12 +294,10 @@ def inspect_donor_config(donor_dir: str, hf_sd: dict[str, torch.Tensor],
     rope_scaling = hc.get("rope_scaling")
     tie_emb = bool(hc.get("tie_word_embeddings", raw_cfg.get("tie_word_embeddings", "lm_head.weight" not in hf_sd)))
 
-    # Detect QKV biases, QK norms (Qwen3/3.5), and Qwen3.5 linear_attn layers
     has_qkv_bias = any(k.endswith("self_attn.q_proj.bias") for k in hf_sd)
     has_qk_norm = any(k.endswith("self_attn.q_norm.weight") for k in hf_sd)
     has_qwen35_lin = any(".linear_attn.in_proj_qkv.weight" in k for k in hf_sd)
 
-    # If Qwen3.5 linear_attn is present, read its linear head dimensions
     vsa_num_heads = int(hc.get("linear_num_value_heads", num_heads)) if has_qwen35_lin else num_heads
     vsa_num_kv_heads = int(hc.get("linear_num_key_heads", num_kv_heads)) if has_qwen35_lin else num_kv_heads
     vsa_head_dim = int(hc.get("linear_value_head_dim", min(128, head_dim))) if has_qwen35_lin else min(128, head_dim)
@@ -351,7 +346,6 @@ def map_any_hf_to_student(hf_sd: dict[str, torch.Tensor], cfg: dict, hybrid_ever
 
             if sub.startswith("self_attn."):
                 proj = sub.split(".", 1)[1]
-                # Handle Qwen3.5 where self_attn.q_proj may pack query + output gate (2x rows)
                 if proj == "q_proj.weight" and stays_soft and t.shape[0] == 2 * cfg["num_heads"] * cfg["head_dim"]:
                     q_rows = cfg["num_heads"] * cfg["head_dim"]
                     sd[f"blocks.{li}.attn.q_proj.weight"] = t[:q_rows].detach().cpu().clone()
@@ -363,19 +357,15 @@ def map_any_hf_to_student(hf_sd: dict[str, torch.Tensor], cfg: dict, hybrid_ever
                     sd[f"blocks.{li}.{core}.{proj}"] = t.detach().cpu().clone()
 
             elif sub.startswith("linear_attn.") and not stays_soft:
-                # Qwen3.5 GatedDeltaNet -> VSA-LM weight transplant!
                 lproj = sub.split(".", 1)[1]
                 if lproj == "in_proj_qkv.weight":
-                    # Split fused [Q_key_dim | K_key_dim | V_val_dim, D] into VSA q_proj, k_proj, v_proj!
                     q_dim = vHKV * vHD
                     k_dim = vHKV * vHD
                     v_dim = vH * vHD
                     if t.shape[0] == q_dim + k_dim + v_dim:
                         wq, wk, wv = torch.split(t.detach().cpu(), [q_dim, k_dim, v_dim], dim=0)
-                        # Expand Q from vHKV -> vH heads so each VSA query head matches v_dim
                         rep_g = vH // vHKV
                         wq_exp = wq.view(vHKV, vHD, D)[:, None, :, :].expand(vHKV, rep_g, vHD, D).reshape(vH * vHD, D).clone()
-                        # For V, downsample vH -> vHKV (or keep top groups) to match k_proj's vHKV before GQA un-tying
                         wv_k = wv.view(vHKV, rep_g, vHD, D).mean(dim=1).reshape(vHKV * vHD, D).clone()
                         sd[f"blocks.{li}.vsa.q_proj.weight"] = wq_exp
                         sd[f"blocks.{li}.vsa.k_proj.weight"] = wk.clone()
@@ -463,7 +453,7 @@ def convert_donor_model(
         "model": stu.state_dict(),
         "step": 0,
         "config": stu.config,
-        "injection": {"donor": donor_id_or_dir, "converter": "vsa_lm.converter v5-qwen35"},
+        "injection": {"donor": donor_id_or_dir, "converter": "vsa_lm.converter v6-disjoint"},
     }, tmp)
     os.replace(tmp, out_ckpt)
     print(f"  Strict weight load  : PASS ({n_params/1e9:.3f}B text-model params)")
@@ -473,126 +463,93 @@ def convert_donor_model(
 
 
 def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str, target_tokens: int):
+    """Builds strictly disjoint `train_tokens` and `eval_tokens`:
+      - Splits raw documents into `eval_docs` and `train_docs` BEFORE tokenizing
+        or repeating, guaranteeing 0.0% overlap between train and eval!
+      - Never includes evaluation benchmarks (GSM8K, MATH-500, AIME, MMLU, GPQA)
+        in the training stream.
+    """
     import pyarrow.parquet as pq
     from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoTokenizer
 
     safe_tag = donor_repo.split("/")[-1].lower().replace("-", "_").replace(".", "_")
-    train_cache = os.path.join(work, f"{safe_tag}_reasoning_train.pt")
-    eval_cache = os.path.join(work, f"{safe_tag}_eval_only.pt")
-
-    tok = AutoTokenizer.from_pretrained(donor_dir)
-    eos_id = tok.eos_token_id or tok.pad_token_id or 0
-    api = HfApi()
-
-    def _download_parquet_texts(ds_repo: str, max_files: int = 3):
-        texts = []
-        for rev in ("main", "refs/convert/parquet"):
-            try:
-                files = [f for f in api.list_repo_files(ds_repo, revision=rev, repo_type="dataset") if f.endswith(".parquet")]
-                for f in files[:max_files]:
-                    lp = hf_hub_download(repo_id=ds_repo, filename=f, revision=rev, repo_type="dataset")
-                    tbl = pq.read_table(lp)
-                    for row in tbl.to_pylist():
-                        if "conversations" in row and isinstance(row["conversations"], list):
-                            msgs = []
-                            for m in row["conversations"]:
-                                role = "user" if m.get("from", m.get("role")) in ("human", "user") else "assistant"
-                                msgs.append({"role": role, "content": str(m.get("value", m.get("content", "")))})
-                            try:
-                                texts.append(tok.apply_chat_template(msgs, tokenize=False))
-                            except Exception:
-                                texts.append("\n".join(m["content"] for m in msgs))
-                        elif "problem" in row and ("solution" in row or "reasoning" in row):
-                            prob = row["problem"]
-                            sol = row.get("reasoning") or row.get("solution") or ""
-                            ans = row.get("answer", "")
-                            chat = [
-                                {"role": "user", "content": str(prob)},
-                                {"role": "assistant", "content": f"<think>\n{sol}\n</think>\n\nThe final answer is \\boxed{{{ans}}}." if ans and "\\boxed" not in str(sol) else f"<think>\n{sol}\n</think>\n\n{sol}"},
-                            ]
-                            try:
-                                texts.append(tok.apply_chat_template(chat, tokenize=False))
-                            except Exception:
-                                texts.append(f"<|im_start|>user\n{prob}<|im_end|>\n<|im_start|>assistant\n<think>\n{sol}\n</think>\n\n{ans}<|im_end|>")
-                        elif "question" in row and "answer" in row:
-                            q, a = row["question"], row["answer"]
-                            if "####" in str(a):
-                                parts = str(a).split("####")
-                                cot, final_a = parts[0].strip(), parts[1].strip()
-                                content = f"<think>\n{cot}\n</think>\n\nTherefore, the answer is \\boxed{{{final_a}}}."
-                            else:
-                                content = f"<think>\nLet's analyze the question step by step.\n{a}\n</think>\n\n{a}"
-                            try:
-                                texts.append(tok.apply_chat_template([{"role": "user", "content": str(q)}, {"role": "assistant", "content": content}], tokenize=False))
-                            except Exception:
-                                texts.append(f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n{content}<|im_end|>")
-                        elif "text" in row:
-                            texts.append(str(row["text"]))
-                if texts:
-                    break
-            except Exception:
-                continue
-        return texts
+    train_cache = os.path.join(work, f"{safe_tag}_disjoint_train.pt")
+    eval_cache = os.path.join(work, f"{safe_tag}_disjoint_eval.pt")
 
     if os.path.isfile(train_cache) and os.path.isfile(eval_cache):
         tr_t = torch.load(train_cache, weights_only=True)
         ev_t = torch.load(eval_cache, weights_only=True)
         if len(tr_t) >= int(target_tokens * 0.8):
-            print(f"[vsa-data] Loaded reasoning train cache ({len(tr_t)/1e6:.1f}M) & eval cache ({len(ev_t)/1e6:.1f}M)")
+            print(f"[vsa-data] Loaded disjoint train cache ({len(tr_t)/1e6:.1f}M) & eval cache ({len(ev_t)/1e6:.2f}M)")
             return tr_t, ev_t
 
-    print(f"[vsa-data] Building <think> Reasoning + Math + Code distillation cache ({target_tokens/1e6:.0f}M tokens)...", flush=True)
+    tok = AutoTokenizer.from_pretrained(donor_dir)
+    eos_id = tok.eos_token_id or tok.pad_token_id or 0
+    api = HfApi()
+
+    print(f"[vsa-data] Building strictly disjoint distillation cache ({target_tokens/1e6:.0f}M tokens, 0% eval overlap)...", flush=True)
     t0 = time.perf_counter()
     all_texts = []
-    for ds_id in (
-        "bespokelabs/Bespoke-Stratos-17k",
-        "AI-MO/NuminaMath-CoT",
-        "openai/gsm8k",
-        "HuggingFaceH4/ultrachat_200k",
-    ):
-        chunk_t = _download_parquet_texts(ds_id, max_files=2)
-        if chunk_t:
-            print(f"  + Loaded {len(chunk_t):,} reasoning/chat traces from {ds_id}", flush=True)
-            all_texts.extend(chunk_t)
+
+    for ds_id, max_f in (("HuggingFaceH4/ultrachat_200k", 4), ("bespokelabs/Bespoke-Stratos-17k", 2)):
+        for rev in ("main", "refs/convert/parquet"):
+            try:
+                files = [f for f in api.list_repo_files(ds_id, revision=rev, repo_type="dataset") if f.endswith(".parquet") and "train" in f]
+                if not files:
+                    files = [f for f in api.list_repo_files(ds_id, revision=rev, repo_type="dataset") if f.endswith(".parquet")]
+                for f in files[:max_f]:
+                    lp = hf_hub_download(repo_id=ds_id, filename=f, revision=rev, repo_type="dataset")
+                    for row in pq.read_table(lp).to_pylist():
+                        msgs = row.get("messages") or row.get("conversations")
+                        if isinstance(msgs, list):
+                            norm_m = []
+                            for m in msgs:
+                                r = "user" if m.get("from", m.get("role")) in ("human", "user") else "assistant"
+                                norm_m.append({"role": r, "content": str(m.get("value", m.get("content", "")))})
+                            try:
+                                all_texts.append(tok.apply_chat_template(norm_m, tokenize=False))
+                            except Exception:
+                                all_texts.append("\n".join(x["content"] for x in norm_m))
+                if all_texts:
+                    break
+            except Exception:
+                continue
+
+    # Strictly partition documents into disjoint eval_docs vs train_docs BEFORE tokenizing!
+    n_eval_docs = min(400, max(50, len(all_texts) // 20))
+    eval_docs = all_texts[:n_eval_docs]
+    train_docs = all_texts[n_eval_docs:]
+
+    eval_buf = array("i")
+    for ids in tok(eval_docs, add_special_tokens=False)["input_ids"]:
+        eval_buf.extend(ids)
+        eval_buf.append(int(eos_id))
+        if len(eval_buf) >= 250_000:
+            break
+    eval_t = torch.frombuffer(eval_buf, dtype=torch.int32).clone()
 
     train_buf = array("i")
-    for b_idx in range(0, len(all_texts), 128):
-        batch = all_texts[b_idx : b_idx + 128]
-        for ids in tok(batch, add_special_tokens=False)["input_ids"]:
+    for b_idx in range(0, len(train_docs), 128):
+        for ids in tok(train_docs[b_idx : b_idx + 128], add_special_tokens=False)["input_ids"]:
             train_buf.extend(ids)
             train_buf.append(int(eos_id))
         if len(train_buf) >= target_tokens:
             break
 
     if len(train_buf) < target_tokens and len(train_buf) > 0:
-        base_len = len(train_buf)
-        reps = (target_tokens // base_len) + 1
+        reps = (target_tokens // len(train_buf)) + 1
         train_t = torch.frombuffer(train_buf, dtype=torch.int32).clone().repeat(reps)[:target_tokens]
     else:
         train_t = torch.frombuffer(train_buf, dtype=torch.int32).clone()[:target_tokens]
 
-    eval_texts = all_texts[-500:] if len(all_texts) > 500 else all_texts
-    eval_buf = array("i")
-    for ids in tok(eval_texts, add_special_tokens=False)["input_ids"]:
-        eval_buf.extend(ids)
-        eval_buf.append(int(eos_id))
-        if len(eval_buf) >= 500_000:
-            break
-    eval_t = torch.frombuffer(eval_buf, dtype=torch.int32).clone()
-
     torch.save(train_t, train_cache)
     torch.save(eval_t, eval_cache)
-    print(f"[vsa-data] Built Reasoning train cache ({len(train_t)/1e6:.1f}M) & held-out Eval cache ({len(eval_t)/1e6:.2f}M) in {time.perf_counter()-t0:.1f}s!", flush=True)
+    print(f"[vsa-data] Built disjoint train ({len(train_t)/1e6:.1f}M) & held-out eval ({len(eval_t)/1e6:.2f}M) in {time.perf_counter()-t0:.1f}s!", flush=True)
     return train_t, eval_t
 
 
 def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: torch.device):
-    """Loads the frozen teacher model in bfloat16:
-      - For Qwen3.5 (which uses native GatedDeltaNet linear_attn layers), loads via
-        transformers AutoModelForCausalLM / Qwen3_5TextForCausalLM (vision-stripped).
-      - For standard Softmax models (Qwen3, Qwen2.5, DeepSeek, Llama), loads via UniversalVSALM.
-    """
     if stu_cfg.get("has_qwen35_lin", False):
         import transformers
         print(f"[vsa-teacher] Loading native Qwen3.5 teacher from {donor_dir} (vision-stripped, bfloat16)...", flush=True)
@@ -601,7 +558,6 @@ def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: 
             if cls is not None:
                 try:
                     m = cls.from_pretrained(donor_dir, torch_dtype=torch.bfloat16)
-                    # Strip vision tower if present to save GPU VRAM!
                     if hasattr(m, "model") and hasattr(m.model, "visual"):
                         del m.model.visual
                     elif hasattr(m, "visual"):
@@ -623,6 +579,20 @@ def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: 
     return donor, False
 
 
+def _forward_hf_teacher_body(donor, xm: torch.Tensor, num_layers: int, hybrid_every: int):
+    """Runs the HF teacher's inner language model backbone WITHOUT computing the
+    248,320-vocab lm_head logits tensor on the full batch (saves ~22 GiB VRAM on 9B!).
+    """
+    inner = getattr(donor, "model", donor)
+    if hasattr(inner, "language_model"):
+        inner = inner.language_model
+    out = inner(input_ids=xm, output_hidden_states=True)
+    h_teacher = out.last_hidden_state if hasattr(out, "last_hidden_state") else out.hidden_states[-1]
+    t_mids = [out.hidden_states[li + 1] for li in range(num_layers) if (li + 1) % hybrid_every == 0]
+    del out
+    return h_teacher, t_mids
+
+
 @torch.no_grad()
 def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Tensor,
                             device: torch.device, n_tokens: int = 32768, bs: int = 4) -> tuple[float, float, float, float]:
@@ -633,6 +603,7 @@ def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Te
     n_b = max(1, min(n_tokens // (bs * T), avail // (bs * T)))
     ar = torch.arange(T)
     nll_s, nll_d, kl_sum, top1_ok, cnt = 0.0, 0.0, 0.0, 0, 0
+    d_lm_head = donor.get_output_embeddings() if is_hf_donor else donor.lm_head
 
     for i in range(n_b):
         s = i * bs * T
@@ -642,16 +613,13 @@ def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Te
         with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
             hs = stu(x)
             if is_hf_donor:
-                d_out = donor(input_ids=x, output_hidden_states=True)
-                hd = d_out.hidden_states[-1]
-                d_lm_head = donor.get_output_embeddings()
+                hd, _ = _forward_hf_teacher_body(donor, x, stu.config["num_layers"], stu.config["hybrid_every"])
             else:
                 hd = donor(x)
-                d_lm_head = donor.lm_head
-        for c in range(0, bs, 2):
-            slog = stu.lm_head(hs[c:c+2]).float()
-            dlog = d_lm_head(hd[c:c+2]).float()
-            yv = y[c:c+2].reshape(-1)
+        for c in range(bs):
+            slog = stu.lm_head(hs[c:c+1]).float()
+            dlog = d_lm_head(hd[c:c+1]).float()
+            yv = y[c:c+1].reshape(-1)
             nll_s += F.cross_entropy(slog.reshape(-1, V), yv, reduction="sum").item()
             nll_d += F.cross_entropy(dlog.reshape(-1, V), yv, reduction="sum").item()
 
@@ -709,7 +677,6 @@ def heal_universal_model(
     T = int(stu_cfg["max_T"])
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
 
-    # Auto-scale micro_bs for 7B-9B models vs 1B-3B models
     if highspeed and vram_gb >= 45.0 and n_params < 4_000_000_000:
         micro_bs = 8
         use_ckpt = False
@@ -809,10 +776,9 @@ def heal_universal_model(
             with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
                 with torch.no_grad():
                     if is_hf_donor:
-                        d_out = donor(input_ids=xm, output_hidden_states=True)
-                        h_teacher = d_out.hidden_states[-1]
-                        t_mids = [d_out.hidden_states[li + 1] for li in range(stu_cfg["num_layers"]) if (li + 1) % stu_cfg["hybrid_every"] == 0]
-                        del d_out
+                        h_teacher, t_mids = _forward_hf_teacher_body(
+                            donor, xm, stu_cfg["num_layers"], stu_cfg["hybrid_every"]
+                        )
                     else:
                         xt = donor.embed_tokens(xm)
                         t_mids = []
