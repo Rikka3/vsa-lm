@@ -1,4 +1,4 @@
-"""Universal Donor-to-VSA Converter & Low-VRAM FastDistill Healer (vsa_lm.converter)."""
+"""Universal Donor-to-VSA Converter & Pure-KD Reasoning/Chat FastDistill Healer (vsa_lm.converter)."""
 from __future__ import annotations
 
 import gc
@@ -356,7 +356,7 @@ def convert_donor_model(
         "model": stu.state_dict(),
         "step": 0,
         "config": stu.config,
-        "injection": {"donor": donor_id_or_dir, "converter": "vsa_lm.converter v3-fastdistill"},
+        "injection": {"donor": donor_id_or_dir, "converter": "vsa_lm.converter v4-reasoning-kd"},
     }, tmp)
     os.replace(tmp, out_ckpt)
     print(f"  Strict weight load  : PASS ({n_params/1e9:.3f}B params)")
@@ -365,67 +365,173 @@ def convert_donor_model(
     return out_ckpt
 
 
-def _build_universal_cache(work: str, donor_dir: str, arch_tag: str, target_tokens: int) -> torch.Tensor:
+def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str, target_tokens: int):
+    """Builds TWO separate token caches:
+      1. `train_tokens`: For reasoning/chat models (DeepSeek/Qwen/Instruct), builds a
+         <think>...</think> Chain-of-Thought + Math + Code + Chat token stream so the
+         teacher demonstrates <think> reasoning throughout distillation!
+      2. `eval_tokens`: Held-out FineWeb-Edu + Reasoning evaluation split (strictly for
+         measuring Donor-matched Perplexity & Teacher-Student KL, NEVER trained on!).
+    """
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoTokenizer
-    from datasets import load_dataset
 
-    safe_tag = arch_tag.replace("/", "_").replace("-", "_")
-    cache_path = os.path.join(work, f"{safe_tag}_tokens.pt")
-    if os.path.isfile(cache_path):
-        toks = torch.load(cache_path, weights_only=True)
-        if len(toks) >= target_tokens:
-            print(f"[vsa-heal] Loaded token cache: {cache_path} ({len(toks)/1e6:.1f}M tokens)")
-            return toks
+    safe_tag = donor_repo.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+    train_cache = os.path.join(work, f"{safe_tag}_reasoning_train.pt")
+    eval_cache = os.path.join(work, f"{safe_tag}_eval_only.pt")
 
-    print(f"[vsa-heal] Building {target_tokens/1e6:.0f}M token cache with tokenizer from {donor_dir}...")
     tok = AutoTokenizer.from_pretrained(donor_dir)
-    bos_id = tok.bos_token_id
     eos_id = tok.eos_token_id or tok.pad_token_id or 0
-    ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", streaming=True, split="train")
+    api = HfApi()
 
-    buf = array("i")
-    t0, batch, n_toks = time.perf_counter(), [], 0
-    for ex in ds:
-        batch.append(ex["text"])
-        if len(batch) < 64:
-            continue
+    def _download_parquet_texts(ds_repo: str, max_files: int = 3):
+        texts = []
+        for rev in ("main", "refs/convert/parquet"):
+            try:
+                files = [f for f in api.list_repo_files(ds_repo, revision=rev, repo_type="dataset") if f.endswith(".parquet")]
+                for f in files[:max_files]:
+                    lp = hf_hub_download(repo_id=ds_repo, filename=f, revision=rev, repo_type="dataset")
+                    tbl = pq.read_table(lp)
+                    for row in tbl.to_pylist():
+                        # Handle reasoning/math/chat datasets with <think> formatting
+                        if "conversations" in row and isinstance(row["conversations"], list):
+                            msgs = []
+                            for m in row["conversations"]:
+                                role = "user" if m.get("from", m.get("role")) in ("human", "user") else "assistant"
+                                msgs.append({"role": role, "content": str(m.get("value", m.get("content", "")))})
+                            try:
+                                texts.append(tok.apply_chat_template(msgs, tokenize=False))
+                            except Exception:
+                                texts.append("\n".join(m["content"] for m in msgs))
+                        elif "problem" in row and ("solution" in row or "reasoning" in row):
+                            prob = row["problem"]
+                            sol = row.get("reasoning") or row.get("solution") or ""
+                            ans = row.get("answer", "")
+                            chat = [
+                                {"role": "user", "content": str(prob)},
+                                {"role": "assistant", "content": f"<think>\n{sol}\n</think>\n\nThe final answer is \\boxed{{{ans}}}." if ans and "\\boxed" not in str(sol) else f"<think>\n{sol}\n</think>\n\n{sol}"},
+                            ]
+                            try:
+                                texts.append(tok.apply_chat_template(chat, tokenize=False))
+                            except Exception:
+                                texts.append(f"<｜User｜>{prob}<｜Assistant｜><think>\n{sol}\n</think>\n\n{ans}")
+                        elif "question" in row and "answer" in row:
+                            q, a = row["question"], row["answer"]
+                            if "####" in str(a):
+                                parts = str(a).split("####")
+                                cot, final_a = parts[0].strip(), parts[1].strip()
+                                content = f"<think>\n{cot}\n</think>\n\nTherefore, the answer is \\boxed{{{final_a}}}."
+                            else:
+                                content = f"<think>\nLet's analyze the question step by step.\n{a}\n</think>\n\n{a}"
+                            try:
+                                texts.append(tok.apply_chat_template([{"role": "user", "content": str(q)}, {"role": "assistant", "content": content}], tokenize=False))
+                            except Exception:
+                                texts.append(f"<｜User｜>{q}<｜Assistant｜>{content}")
+                        elif "text" in row:
+                            texts.append(str(row["text"]))
+                if texts:
+                    break
+            except Exception:
+                continue
+        return texts
+
+    if os.path.isfile(train_cache) and os.path.isfile(eval_cache):
+        tr_t = torch.load(train_cache, weights_only=True)
+        ev_t = torch.load(eval_cache, weights_only=True)
+        if len(tr_t) >= int(target_tokens * 0.8):
+            print(f"[vsa-data] Loaded reasoning train cache ({len(tr_t)/1e6:.1f}M) & eval cache ({len(ev_t)/1e6:.1f}M)")
+            return tr_t, ev_t
+
+    print(f"[vsa-data] Building <think> Reasoning + Math + Code distillation cache ({target_tokens/1e6:.0f}M tokens)...", flush=True)
+    t0 = time.perf_counter()
+    all_texts = []
+    # Pull high-quality <think> math, reasoning, and instruction traces via parquet
+    for ds_id in (
+        "bespokelabs/Bespoke-Stratos-17k",
+        "AI-MO/NuminaMath-CoT",
+        "openai/gsm8k",
+        "HuggingFaceH4/ultrachat_200k",
+    ):
+        chunk_t = _download_parquet_texts(ds_id, max_files=2)
+        if chunk_t:
+            print(f"  + Loaded {len(chunk_t):,} reasoning/chat traces from {ds_id}", flush=True)
+            all_texts.extend(chunk_t)
+
+    train_buf = array("i")
+    for b_idx in range(0, len(all_texts), 128):
+        batch = all_texts[b_idx : b_idx + 128]
         for ids in tok(batch, add_special_tokens=False)["input_ids"]:
-            if bos_id is not None:
-                buf.append(int(bos_id))
-                n_toks += 1
-            buf.extend(ids)
-            buf.append(int(eos_id))
-            n_toks += len(ids) + 1
-        batch = []
-        if n_toks >= target_tokens:
+            train_buf.extend(ids)
+            train_buf.append(int(eos_id))
+        if len(train_buf) >= target_tokens:
             break
-    tokens = torch.frombuffer(buf, dtype=torch.int32).clone()
-    torch.save(tokens, cache_path)
-    print(f"[vsa-heal] Token cache built: {len(tokens)/1e6:.1f}M tokens ({time.perf_counter()-t0:.1f}s)")
-    return tokens
+
+    # If reasoning traces are smaller than target_tokens, cycle/pad with Reasoning + FineWeb
+    if len(train_buf) < target_tokens and len(train_buf) > 0:
+        base_len = len(train_buf)
+        reps = (target_tokens // base_len) + 1
+        train_t = torch.frombuffer(train_buf, dtype=torch.int32).clone().repeat(reps)[:target_tokens]
+    else:
+        train_t = torch.frombuffer(train_buf, dtype=torch.int32).clone()[:target_tokens]
+
+    # Build separate Eval-Only cache (2M tokens: 50% Reasoning/Math + 50% FineWeb-Edu, NEVER trained on!)
+    eval_texts = all_texts[-500:] if len(all_texts) > 500 else all_texts
+    eval_buf = array("i")
+    for ids in tok(eval_texts, add_special_tokens=False)["input_ids"]:
+        eval_buf.extend(ids)
+        eval_buf.append(int(eos_id))
+        if len(eval_buf) >= 500_000:
+            break
+    eval_t = torch.frombuffer(eval_buf, dtype=torch.int32).clone()
+
+    torch.save(train_t, train_cache)
+    torch.save(eval_t, eval_cache)
+    print(f"[vsa-data] Built Reasoning train cache ({len(train_t)/1e6:.1f}M) & held-out Eval cache ({len(eval_t)/1e6:.2f}M) in {time.perf_counter()-t0:.1f}s!", flush=True)
+    return train_t, eval_t
 
 
 @torch.no_grad()
-def _eval_ppl_universal(model, tokens: torch.Tensor, val_start: int, device: torch.device,
-                        n_tokens: int = 65536, bs: int = 8) -> float:
-    model.eval()
-    T = model.config["max_T"]
-    V = model.config["vocab_size"]
-    n_b = max(1, (n_tokens // (bs * T)))
+def _eval_reasoning_metrics(stu, donor, eval_tokens: torch.Tensor, device: torch.device,
+                            n_tokens: int = 32768, bs: int = 4) -> tuple[float, float, float, float]:
+    """Evaluates on held-out Reasoning/Chat tokens:
+      Returns (stu_ppl, donor_ppl, kl_nats, top1_agreement_pct)
+    """
+    stu.eval()
+    T = stu.config["max_T"]
+    V = stu.config["vocab_size"]
+    avail = len(eval_tokens) - 1
+    n_b = max(1, min(n_tokens // (bs * T), avail // (bs * T)))
     ar = torch.arange(T)
-    nll, cnt = 0.0, 0
+    nll_s, nll_d, kl_sum, top1_ok, cnt = 0.0, 0.0, 0.0, 0, 0
+
     for i in range(n_b):
-        s = val_start + i * bs * T
+        s = i * bs * T
         base = s + torch.arange(bs)[:, None] * T + ar[None, :]
-        x = tokens[base].long().to(device)
-        y = tokens[base + 1].long().to(device)
+        x = eval_tokens[base].long().to(device)
+        y = eval_tokens[base + 1].long().to(device)
         with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-            h = model(x)
-        for c in range(0, h.shape[0], 2):
-            logits = model.lm_head(h[c:c + 2]).float()
-            nll += F.cross_entropy(logits.reshape(-1, V), y[c:c + 2].reshape(-1), reduction="sum").item()
-            cnt += y[c:c + 2].numel()
-    return math.exp(nll / max(1, cnt))
+            hs = stu(x)
+            hd = donor(x)
+        for c in range(0, bs, 2):
+            slog = stu.lm_head(hs[c:c+2]).float()
+            dlog = donor.lm_head(hd[c:c+2]).float()
+            yv = y[c:c+2].reshape(-1)
+            nll_s += F.cross_entropy(slog.reshape(-1, V), yv, reduction="sum").item()
+            nll_d += F.cross_entropy(dlog.reshape(-1, V), yv, reduction="sum").item()
+
+            lsm_s = F.log_softmax(slog, dim=-1)
+            lsm_d = F.log_softmax(dlog, dim=-1)
+            p_d = lsm_d.exp()
+            kl_sum += float((p_d * (lsm_d - lsm_s)).sum().item())
+            top1_ok += int((slog.argmax(dim=-1) == dlog.argmax(dim=-1)).sum().item())
+            cnt += yv.numel()
+
+    stu_ppl = math.exp(nll_s / max(1, cnt))
+    don_ppl = math.exp(nll_d / max(1, cnt))
+    kl_nats = kl_sum / max(1, cnt)
+    top1_pct = (top1_ok / max(1, cnt)) * 100.0
+    return stu_ppl, don_ppl, kl_nats, top1_pct
 
 
 def heal_universal_model(
@@ -434,12 +540,12 @@ def heal_universal_model(
     donor_id: str | None = None,
     work: str = ".",
     out_prefix: str = "vsa_healed",
-    tokens_budget: int = 180_000_000,
-    data_tokens: int = 200_000_000,
+    tokens_budget: int = 80_000_000,
+    data_tokens: int = 100_000_000,
     bs: int = 16,
     lr: float = 1.5e-4,
-    warmup: int = 200,
-    kd: float = 0.5,
+    warmup: int = 150,
+    kd: float = 1.0,  # Default 1.0 = 100% Pure Teacher Distillation (never overwrites <think> behavior with raw labels!)
     eval_every: int = 250,
     save_every: int = 500,
     seed: int = 7777,
@@ -478,19 +584,19 @@ def heal_universal_model(
     for p in donor.parameters():
         p.requires_grad_(False)
 
-    tokens = _build_universal_cache(work, donor_dir, stu_cfg.get("donor_arch", "universal"), max(data_tokens, int(tokens_budget * 1.15)))
-    val_start = len(tokens) - min(2_000_000, len(tokens) // 10)
-    donor_ppl = _eval_ppl_universal(donor, tokens, val_start, device)
-    start_ppl = _eval_ppl_universal(stu, tokens, val_start, device)
+    train_tokens, eval_tokens = _build_reasoning_and_eval_caches(
+        work, donor_dir, donor_repo, max(data_tokens, int(tokens_budget * 1.05))
+    )
+    start_ppl, donor_ppl, start_kl, start_top1 = _eval_reasoning_metrics(stu, donor, eval_tokens, device)
 
     total_steps = max(1, math.ceil(tokens_budget / (bs * T)))
-    stage1_steps = min(500, total_steps // 6) if start_step == 0 else 0
+    stage1_steps = min(400, total_steps // 6) if start_step == 0 else 0
 
-    print("=" * 80)
-    print(f"VSA-FASTDISTILL UNIVERSAL HEALER: {donor_repo} ({stu_cfg.get('donor_arch')})")
-    print("=" * 80)
-    print(f"  Donor val_ppl  : {donor_ppl:.3f}  |  Student current val_ppl: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x donor)")
-    print(f"  Budget         : {tokens_budget/1e6:.1f}M tokens ({total_steps} steps, resume={start_step}, micro_bs={micro_bs})")
+    print("=" * 84)
+    print(f"VSA-FASTDISTILL PURE-TEACHER HEALER: {donor_repo} (kd={kd})")
+    print("=" * 84)
+    print(f"  Donor Eval PPL : {donor_ppl:.3f}  |  Student Start PPL: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x) | KL: {start_kl:.3f} | Top1: {start_top1:.1f}%")
+    print(f"  Budget         : {tokens_budget/1e6:.1f}M Reasoning/Chat tokens ({total_steps} steps, resume={start_step}, micro_bs={micro_bs})")
 
     vsa_conv, vsa_core, vsa_proj, mlp_params = [], [], [], []
     for n_, p_ in stu.named_parameters():
@@ -514,7 +620,7 @@ def heal_universal_model(
         {"params": vsa_conv,   "weight_decay": 0.01, "lr_scale": 8.0},
         {"params": vsa_core,   "weight_decay": 0.0,  "lr_scale": 5.0},
         {"params": vsa_proj,   "weight_decay": 0.05, "lr_scale": 1.5},
-        {"params": mlp_params, "weight_decay": 0.05, "lr_scale": 0.5, "is_mlp": True},
+        {"params": mlp_params, "weight_decay": 0.05, "lr_scale": 0.4, "is_mlp": True},
     ], lr=lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
 
     stable_end = int(total_steps * 0.65)
@@ -525,7 +631,7 @@ def heal_universal_model(
             m = 1.0
         else:
             prog = (s - stable_end) / max(1, total_steps - stable_end)
-            m = 0.08 + 0.46 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+            m = 0.05 + 0.475 * (1.0 + math.cos(math.pi * min(1.0, prog)))
         if start_step > 0 and s >= start_step:
             m *= min(1.0, (s - start_step + 1) / 100.0)
         for g in opt.param_groups:
@@ -534,7 +640,7 @@ def heal_universal_model(
             else:
                 g["lr"] = lr * m * g.get("lr_scale", 1.0)
 
-    n_win = max(1, (val_start - 1) // T)
+    n_win = max(1, (len(train_tokens) - 1) // T)
     gen = torch.Generator().manual_seed(seed)
     for _ in range(start_step):
         torch.randint(0, n_win, (bs,), generator=gen)
@@ -551,7 +657,7 @@ def heal_universal_model(
     for step in range(start_step, total_steps):
         idx = torch.randint(0, n_win, (bs,), generator=gen)
         base = idx[:, None] * T + ar[None, :]
-        x, y = tokens[base].long(), tokens[base + 1].long()
+        x, y = train_tokens[base].long(), train_tokens[base + 1].long()
         opt.zero_grad(set_to_none=True)
         loss_val = 0.0
 
@@ -578,17 +684,19 @@ def heal_universal_model(
                         s_mids.append(xs)
                 h_student = stu.norm(xs)
 
+                # Blockwise Cosine + Final Hidden-State Cosine Alignment
                 mid_loss = sum(
                     1.0 - F.cosine_similarity(sm.float(), tm.float(), dim=-1).mean()
                     for sm, tm in zip(s_mids, t_mids)
                 ) / max(1, len(s_mids))
+                final_h_loss = 1.0 - F.cosine_similarity(h_student.float(), h_teacher.float(), dim=-1).mean()
 
             B_m, T_m, D_m = h_student.shape
             N_m = B_m * T_m
             dh = torch.empty_like(h_student)
             w_lm_s = stu.lm_head.weight
             w_lm_t = donor.lm_head.weight
-            mb_ce_kd = 0.0
+            mb_kd = 0.0
 
             with torch.no_grad():
                 for i in range(0, B_m, 2):
@@ -599,7 +707,6 @@ def heal_universal_model(
                     slog = F.linear(hs_c, w_lm_s).float()
                     lsm_s = F.log_softmax(slog, dim=-1)
                     prob_s = lsm_s.exp()
-                    ce_i = -lsm_s.gather(-1, ym_c.unsqueeze(-1)).sum()
 
                     rlog = F.linear(ht_c, w_lm_t).float()
                     rlsm = F.log_softmax(rlog, dim=-1)
@@ -607,20 +714,26 @@ def heal_universal_model(
                     kd_i = (prob_t * (rlsm - lsm_s)).sum()
                     del rlog, rlsm
 
-                    mb_ce_kd += float((1.0 - kd) * ce_i + kd * kd_i) / N_m
+                    if kd >= 0.999:
+                        # 100% Pure Teacher KL Distillation (preserves <think> reasoning distribution!)
+                        mb_kd += float(kd_i) / N_m
+                        g_logits = (prob_s - prob_t) * (w / N_m)
+                    else:
+                        ce_i = -lsm_s.gather(-1, ym_c.unsqueeze(-1)).sum()
+                        mb_kd += float((1.0 - kd) * ce_i + kd * kd_i) / N_m
+                        g_logits = prob_s
+                        g_logits.sub_(prob_t, alpha=kd)
+                        g_logits.scatter_add_(-1, ym_c.unsqueeze(-1), torch.full_like(ym_c.unsqueeze(-1), -(1.0 - kd), dtype=torch.float32))
+                        g_logits.mul_(w / N_m)
 
-                    g_logits = prob_s
-                    g_logits.sub_(prob_t, alpha=kd)
-                    g_logits.scatter_add_(-1, ym_c.unsqueeze(-1), torch.full_like(ym_c.unsqueeze(-1), -(1.0 - kd), dtype=torch.float32))
-                    g_logits.mul_(w / N_m)
                     dh[i:i+2] = (g_logits.to(h_student.dtype) @ w_lm_s)
                     del slog, lsm_s, prob_s, prob_t, g_logits
 
             torch.autograd.backward(
-                [h_student, mid_loss * (0.15 * w)],
+                [h_student, (mid_loss + final_h_loss) * (0.20 * w)],
                 [dh, torch.ones_like(mid_loss)],
             )
-            loss_val += mb_ce_kd * w
+            loss_val += mb_kd * w
 
         gn = float(torch.nn.utils.clip_grad_norm_(trainable, 1.0))
         if math.isfinite(gn):
@@ -631,16 +744,15 @@ def heal_universal_model(
         if step_done in (start_step + 1, start_step + 5) or (step_done % 25 == 0 and step_done % eval_every != 0):
             dt = (time.perf_counter() - t0) / max(1, step_done - start_step)
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
-            print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  loss {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
+            print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_kl {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
         if step_done % eval_every == 0 or step_done == total_steps:
-            ppl = _eval_ppl_universal(stu, tokens, val_start, device)
+            s_ppl, d_ppl, kl_v, top1_v = _eval_reasoning_metrics(stu, donor, eval_tokens, device)
             stu.train()
             dt = (time.perf_counter() - t0) / max(1, step_done - start_step)
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
-            print(f"  >>> [{out_prefix} EVAL] step {step_done:5d}/{total_steps}  loss {loss_val:.4f}  "
-                  f"val_ppl {ppl:.3f} ({ppl/donor_ppl:.3f}x donor)  gnorm {gn:.2f}  "
-                  f"toks {step_done*bs*T/1e6:.1f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
+            print(f"  >>> [{out_prefix} EVAL] step {step_done:5d}/{total_steps}  val_ppl {s_ppl:.2f}/{d_ppl:.2f} ({s_ppl/d_ppl:.3f}x donor)  "
+                  f"KL {kl_v:.3f} nats  Top1 {top1_v:.1f}%  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
         if step_done % save_every == 0 or step_done == total_steps:
             tmp = out_ckpt + ".tmp"
