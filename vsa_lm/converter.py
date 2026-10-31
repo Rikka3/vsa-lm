@@ -1,4 +1,12 @@
-"""Universal Donor-to-VSA Converter & Pure-KD Reasoning/Chat FastDistill Healer (vsa_lm.converter)."""
+"""Universal Donor-to-VSA Converter & Pure-KD FastDistill Healer (vsa_lm.converter).
+
+Supports:
+  - Qwen3.5 Multimodal/Hybrid models (e.g. `Qwen/Qwen3.5-9B`): automatically strips
+    the vision tower, unwraps `text_config` / `model.language_model.*`, splits
+    `linear_attn.in_proj_qkv` + `in_proj_z` + `out_proj` into VSA layers, and
+    preserves `self_attn` (`q_norm` / `k_norm`) on every 4th layer!
+  - Qwen3 (`Qwen/Qwen3-8B`), Qwen2.5, DeepSeek-R1-Distill-Qwen, Llama-3, Mistral, SmolLM.
+"""
 from __future__ import annotations
 
 import gc
@@ -25,7 +33,8 @@ from .surgery import (
 
 
 class UniversalSoftmaxAttn(nn.Module):
-    """Donor softmax attention supporting arbitrary GQA ratios and optional QKV biases (Qwen)."""
+    """Donor softmax attention supporting arbitrary GQA ratios, optional QKV biases (Qwen2),
+    optional per-head q_norm/k_norm (Qwen3 / Qwen3.5), and optional attn output gate."""
 
     def __init__(self, cfg: dict):
         super().__init__()
@@ -37,33 +46,58 @@ class UniversalSoftmaxAttn(nn.Module):
         self.k_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
         self.v_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
         self.o_proj = nn.Linear(H * HD, D, bias=False)
+        if cfg.get("qk_norm", False):
+            self.q_norm = LlamaRMSNorm(HD, cfg["eps"])
+            self.k_norm = LlamaRMSNorm(HD, cfg["eps"])
+        else:
+            self.q_norm = None
+            self.k_norm = None
+        if cfg.get("softmax_gate", False):
+            self.g_proj = nn.Linear(D, H * HD, bias=False)
+        else:
+            self.g_proj = None
         self.rope = LlamaRoPE(HD, cfg["rope_theta"], cfg.get("rope_scaling"))
 
     def head_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.H, self.HD).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.HKV, self.HD).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.HKV, self.HD).transpose(1, 2)
-        return q, k, v
+        q = self.q_proj(x).view(B, T, self.H, self.HD)
+        k = self.k_proj(x).view(B, T, self.HKV, self.HD)
+        v = self.v_proj(x).view(B, T, self.HKV, self.HD)
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
         q, k, v = self.head_qkv(x)
         q, k = self.rope(q), self.rope(k)
         k, v = repeat_kv(k, self.G), repeat_kv(v, self.G)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        B, _, T, _ = y.shape
+        if self.g_proj is not None:
+            g = torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2))
+            y = y * g
         return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD))
 
 
 class UniversalVSAAttn(nn.Module):
-    """Universal VSA attention supporting QKV biases (Qwen), GQA head un-tying,
-    8-tap causal local value/key conv, Q/K positive sharpener, and output gate."""
+    """Universal VSA attention supporting QKV biases, Qwen3/3.5 dimensions,
+    GQA head un-tying, 8-tap causal local value/key conv, Q/K positive sharpener,
+    and output gate. Caps VSA head_dim at <= 128 so Triton kernels always fit in SRAM."""
 
     def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32):
         super().__init__()
-        D, H, HKV = cfg["dim"], cfg["num_heads"], cfg["num_kv_heads"]
-        HD = cfg.get("head_dim") or (D // H)
-        qkv_bias = bool(cfg.get("qkv_bias", False))
+        D = cfg["dim"]
+        H = cfg.get("vsa_num_heads") or cfg["num_heads"]
+        HKV = cfg.get("vsa_num_kv_heads") or cfg["num_kv_heads"]
+        HD = cfg.get("vsa_head_dim") or cfg.get("head_dim") or (D // H)
+        # Ensure HD <= 128 for Triton shared memory compatibility
+        while HD > 128 and H * 2 <= 64:
+            H *= 2
+            HKV *= 2
+            HD //= 2
+
+        qkv_bias = bool(cfg.get("vsa_qkv_bias", cfg.get("qkv_bias", False)))
         self.H, self.HKV, self.HD, self.G = H, HKV, HD, H // HKV
         self.q_proj = nn.Linear(D, H * HD, bias=qkv_bias)
         self.k_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
@@ -75,7 +109,7 @@ class UniversalVSAAttn(nn.Module):
         with torch.no_grad():
             horizons = torch.linspace(8.0, 200.0, H)
             self.log_gamma.copy_(torch.logit((1.0 - 1.0 / horizons) / 0.9999))
-        self.chunk_size = chunk_size
+        self.chunk_size = 16 if HD >= 128 else chunk_size
 
         if cfg.get("vsa_untie_gqa", True):
             eye = torch.eye(HD).unsqueeze(0).repeat(H, 1, 1)
@@ -166,7 +200,7 @@ class UniversalBlock(nn.Module):
 
 
 class UniversalVSALM(nn.Module):
-    """Universal VSA-LM supporting Llama, Qwen, DeepSeek-Distill, Mistral, and SmolLM."""
+    """Universal VSA-LM supporting Qwen3.5 (vision-stripped), Qwen3, Qwen2.5, DeepSeek-R1, Llama, Mistral, SmolLM."""
 
     def __init__(self, vocab_size: int, dim: int, num_layers: int, num_heads: int,
                  num_kv_heads: int, intermediate: int, max_T: int = 1024,
@@ -227,7 +261,18 @@ def load_all_safetensors(donor_dir: str) -> dict[str, torch.Tensor]:
         raise FileNotFoundError(f"No .safetensors files found in {donor_dir}")
     sd = {}
     for sh in shards:
-        sd.update(load_file(sh))
+        for k, v in load_file(sh).items():
+            # Strip multimodal vision tower weights immediately on load to save RAM!
+            if k.startswith("visual.") or k.startswith("model.visual.") or ".visual." in k:
+                continue
+            # Normalize `model.language_model.*` or `language_model.model.*` -> `model.*`
+            if k.startswith("model.language_model."):
+                k = "model." + k[len("model.language_model."):]
+            elif k.startswith("language_model.model."):
+                k = "model." + k[len("language_model.model."):]
+            elif k.startswith("language_model."):
+                k = k[len("language_model."):]
+            sd[k] = v
     return sd
 
 
@@ -235,7 +280,10 @@ def inspect_donor_config(donor_dir: str, hf_sd: dict[str, torch.Tensor],
                          max_T: int = 1024, chunk_size: int = 32,
                          hybrid_every: int = 4) -> dict:
     with open(os.path.join(donor_dir, "config.json")) as f:
-        hc = json.load(f)
+        raw_cfg = json.load(f)
+
+    # Unwrap multimodal `text_config` (used by Qwen3.5-9B / VL models)
+    hc = raw_cfg.get("text_config", raw_cfg)
 
     dim = int(hc["hidden_size"])
     num_layers = int(hc["num_hidden_layers"])
@@ -244,26 +292,49 @@ def inspect_donor_config(donor_dir: str, hf_sd: dict[str, torch.Tensor],
     head_dim = int(hc.get("head_dim") or (dim // num_heads))
     intermediate = int(hc["intermediate_size"])
     vocab_size = int(hc["vocab_size"])
-    eps = float(hc.get("rms_norm_eps", 1e-5))
-    rope_theta = float(hc.get("rope_theta", 10000.0))
+    eps = float(hc.get("rms_norm_eps", 1e-6))
+    rope_theta = float(hc.get("rope_theta", hc.get("rope_parameters", {}).get("rope_theta", 10000.0)))
     rope_scaling = hc.get("rope_scaling")
-    tie_emb = bool(hc.get("tie_word_embeddings", "lm_head.weight" not in hf_sd))
-    has_qkv_bias = "model.layers.0.self_attn.q_proj.bias" in hf_sd
+    tie_emb = bool(hc.get("tie_word_embeddings", raw_cfg.get("tie_word_embeddings", "lm_head.weight" not in hf_sd)))
+
+    # Detect QKV biases, QK norms (Qwen3/3.5), and Qwen3.5 linear_attn layers
+    has_qkv_bias = any(k.endswith("self_attn.q_proj.bias") for k in hf_sd)
+    has_qk_norm = any(k.endswith("self_attn.q_norm.weight") for k in hf_sd)
+    has_qwen35_lin = any(".linear_attn.in_proj_qkv.weight" in k for k in hf_sd)
+
+    # If Qwen3.5 linear_attn is present, read its linear head dimensions
+    vsa_num_heads = int(hc.get("linear_num_value_heads", num_heads)) if has_qwen35_lin else num_heads
+    vsa_num_kv_heads = int(hc.get("linear_num_key_heads", num_kv_heads)) if has_qwen35_lin else num_kv_heads
+    vsa_head_dim = int(hc.get("linear_value_head_dim", min(128, head_dim))) if has_qwen35_lin else min(128, head_dim)
+    if not has_qwen35_lin and head_dim > 128:
+        scale_f = head_dim // 128
+        vsa_num_heads = num_heads * scale_f
+        vsa_num_kv_heads = num_kv_heads * scale_f
+        vsa_head_dim = 128
 
     return dict(
-        donor_arch=hc.get("model_type", "unknown"),
+        donor_arch=raw_cfg.get("model_type", hc.get("model_type", "unknown")),
         vocab_size=vocab_size, dim=dim, num_layers=num_layers,
         num_heads=num_heads, num_kv_heads=num_kv_heads,
         head_dim=head_dim, intermediate=intermediate,
         max_T=max_T, chunk_size=chunk_size, hybrid_every=hybrid_every,
         rope_theta=rope_theta, rope_scaling=rope_scaling, eps=eps,
-        qkv_bias=has_qkv_bias, tie_word_embeddings=tie_emb,
+        qkv_bias=has_qkv_bias, vsa_qkv_bias=(has_qkv_bias and not has_qwen35_lin),
+        qk_norm=has_qk_norm, has_qwen35_lin=has_qwen35_lin,
+        vsa_num_heads=vsa_num_heads, vsa_num_kv_heads=vsa_num_kv_heads,
+        vsa_head_dim=vsa_head_dim,
+        tie_word_embeddings=tie_emb,
         vsa_untie_gqa=True, vsa_local_conv=True,
     )
 
 
 def map_any_hf_to_student(hf_sd: dict[str, torch.Tensor], cfg: dict, hybrid_every: int) -> dict[str, torch.Tensor]:
     sd = {}
+    D = cfg["dim"]
+    vH = cfg.get("vsa_num_heads", cfg["num_heads"])
+    vHKV = cfg.get("vsa_num_kv_heads", cfg["num_kv_heads"])
+    vHD = cfg.get("vsa_head_dim", cfg["head_dim"])
+
     for k, t in hf_sd.items():
         if k == "model.embed_tokens.weight":
             sd["embed_tokens.weight"] = t.detach().cpu().clone()
@@ -277,11 +348,45 @@ def map_any_hf_to_student(hf_sd: dict[str, torch.Tensor], cfg: dict, hybrid_ever
             li, sub = int(parts[2]), ".".join(parts[3:])
             stays_soft = hybrid_every > 0 and (li + 1) % hybrid_every == 0
             core = "attn" if stays_soft else "vsa"
+
             if sub.startswith("self_attn."):
                 proj = sub.split(".", 1)[1]
-                if proj in ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
-                            "q_proj.bias", "k_proj.bias", "v_proj.bias"):
+                # Handle Qwen3.5 where self_attn.q_proj may pack query + output gate (2x rows)
+                if proj == "q_proj.weight" and stays_soft and t.shape[0] == 2 * cfg["num_heads"] * cfg["head_dim"]:
+                    q_rows = cfg["num_heads"] * cfg["head_dim"]
+                    sd[f"blocks.{li}.attn.q_proj.weight"] = t[:q_rows].detach().cpu().clone()
+                elif proj in ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
+                              "q_proj.bias", "k_proj.bias", "v_proj.bias",
+                              "q_norm.weight", "k_norm.weight"):
+                    if not stays_soft and proj in ("q_norm.weight", "k_norm.weight"):
+                        continue
                     sd[f"blocks.{li}.{core}.{proj}"] = t.detach().cpu().clone()
+
+            elif sub.startswith("linear_attn.") and not stays_soft:
+                # Qwen3.5 GatedDeltaNet -> VSA-LM weight transplant!
+                lproj = sub.split(".", 1)[1]
+                if lproj == "in_proj_qkv.weight":
+                    # Split fused [Q_key_dim | K_key_dim | V_val_dim, D] into VSA q_proj, k_proj, v_proj!
+                    q_dim = vHKV * vHD
+                    k_dim = vHKV * vHD
+                    v_dim = vH * vHD
+                    if t.shape[0] == q_dim + k_dim + v_dim:
+                        wq, wk, wv = torch.split(t.detach().cpu(), [q_dim, k_dim, v_dim], dim=0)
+                        # Expand Q from vHKV -> vH heads so each VSA query head matches v_dim
+                        rep_g = vH // vHKV
+                        wq_exp = wq.view(vHKV, vHD, D)[:, None, :, :].expand(vHKV, rep_g, vHD, D).reshape(vH * vHD, D).clone()
+                        # For V, downsample vH -> vHKV (or keep top groups) to match k_proj's vHKV before GQA un-tying
+                        wv_k = wv.view(vHKV, rep_g, vHD, D).mean(dim=1).reshape(vHKV * vHD, D).clone()
+                        sd[f"blocks.{li}.vsa.q_proj.weight"] = wq_exp
+                        sd[f"blocks.{li}.vsa.k_proj.weight"] = wk.clone()
+                        sd[f"blocks.{li}.vsa.v_proj.weight"] = wv_k
+                elif lproj == "in_proj_z.weight":
+                    if t.shape[0] == vH * vHD:
+                        sd[f"blocks.{li}.vsa.g_proj.weight"] = t.detach().cpu().clone()
+                elif lproj == "out_proj.weight":
+                    if t.shape == (D, vH * vHD):
+                        sd[f"blocks.{li}.vsa.o_proj.weight"] = t.detach().cpu().clone()
+
             elif sub == "input_layernorm.weight":
                 sd[f"blocks.{li}.norm1.weight"] = t.detach().cpu().clone()
             elif sub == "post_attention_layernorm.weight":
@@ -313,17 +418,19 @@ def convert_donor_model(
     n_soft = (L // hybrid_every) if hybrid_every > 0 else 0
     n_vsa = L - n_soft
     print("=" * 80)
-    print(f"UNIVERSAL VSA-LM CONVERTER: {donor_id_or_dir}")
+    print(f"UNIVERSAL VSA-LM CONVERTER: {donor_id_or_dir} (Vision-Stripped if Multimodal)")
     print("=" * 80)
-    print(f"  Detected family     : {cfg['donor_arch']}  (qkv_bias={cfg['qkv_bias']}, tied_emb={cfg['tie_word_embeddings']})")
-    print(f"  Dimensions          : dim={cfg['dim']}, L={L}, H={cfg['num_heads']}, HKV={cfg['num_kv_heads']} (GQA {cfg['num_heads']//cfg['num_kv_heads']}:1), HD={cfg['head_dim']}")
+    print(f"  Detected family     : {cfg['donor_arch']}  (qkv_bias={cfg['qkv_bias']}, qk_norm={cfg['qk_norm']}, qwen35_lin={cfg['has_qwen35_lin']})")
+    print(f"  Dimensions          : dim={cfg['dim']}, L={L}, Softmax H={cfg['num_heads']}/HKV={cfg['num_kv_heads']} (HD={cfg['head_dim']}), VSA H={cfg['vsa_num_heads']}/HKV={cfg['vsa_num_kv_heads']} (HD={cfg['vsa_head_dim']})")
     print(f"  Target layout       : {n_vsa} VSA layers + {n_soft} Softmax layers (hybrid_every={hybrid_every})")
 
     stu = UniversalVSALM(**cfg)
     sd = map_any_hf_to_student(hf_sd, cfg, hybrid_every)
     del hf_sd
 
-    H, HD, D = cfg["num_heads"], cfg["head_dim"], cfg["dim"]
+    H = cfg["vsa_num_heads"]
+    HD = cfg["vsa_head_dim"]
+    D = cfg["dim"]
     dtype = sd["embed_tokens.weight"].dtype
 
     horizons = torch.logspace(math.log10(2.0), math.log10(1.0 / max(1e-4, 1.0 - gamma_cap)), H)
@@ -341,7 +448,7 @@ def convert_donor_model(
         sd[f"{p}.k_head_mix"] = eye.clone()
         sd[f"{p}.v_head_mix"] = eye.clone()
         sd[f"{p}.head_pos_delta"] = torch.zeros(H, max_T, HD, dtype=torch.float32)
-        sd[f"{p}.g_proj.weight"] = torch.zeros(H * HD, D, dtype=dtype)
+        sd.setdefault(f"{p}.g_proj.weight", torch.zeros(H * HD, D, dtype=dtype))
         sd[f"{p}.v_self_scale"] = torch.zeros(H, dtype=torch.float32)
         sd[f"{p}.v_conv.weight"] = torch.zeros(H * HD, 1, 8, dtype=dtype)
         sd[f"{p}.k_conv.weight"] = torch.zeros(H * HD, 1, 4, dtype=dtype)
@@ -356,23 +463,16 @@ def convert_donor_model(
         "model": stu.state_dict(),
         "step": 0,
         "config": stu.config,
-        "injection": {"donor": donor_id_or_dir, "converter": "vsa_lm.converter v4-reasoning-kd"},
+        "injection": {"donor": donor_id_or_dir, "converter": "vsa_lm.converter v5-qwen35"},
     }, tmp)
     os.replace(tmp, out_ckpt)
-    print(f"  Strict weight load  : PASS ({n_params/1e9:.3f}B params)")
+    print(f"  Strict weight load  : PASS ({n_params/1e9:.3f}B text-model params)")
     print(f"  Saved VSA student   : {out_ckpt}  ({time.perf_counter() - t0:.1f}s)")
     print("=" * 80)
     return out_ckpt
 
 
 def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str, target_tokens: int):
-    """Builds TWO separate token caches:
-      1. `train_tokens`: For reasoning/chat models (DeepSeek/Qwen/Instruct), builds a
-         <think>...</think> Chain-of-Thought + Math + Code + Chat token stream so the
-         teacher demonstrates <think> reasoning throughout distillation!
-      2. `eval_tokens`: Held-out FineWeb-Edu + Reasoning evaluation split (strictly for
-         measuring Donor-matched Perplexity & Teacher-Student KL, NEVER trained on!).
-    """
     import pyarrow.parquet as pq
     from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoTokenizer
@@ -394,7 +494,6 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
                     lp = hf_hub_download(repo_id=ds_repo, filename=f, revision=rev, repo_type="dataset")
                     tbl = pq.read_table(lp)
                     for row in tbl.to_pylist():
-                        # Handle reasoning/math/chat datasets with <think> formatting
                         if "conversations" in row and isinstance(row["conversations"], list):
                             msgs = []
                             for m in row["conversations"]:
@@ -415,7 +514,7 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
                             try:
                                 texts.append(tok.apply_chat_template(chat, tokenize=False))
                             except Exception:
-                                texts.append(f"<｜User｜>{prob}<｜Assistant｜><think>\n{sol}\n</think>\n\n{ans}")
+                                texts.append(f"<|im_start|>user\n{prob}<|im_end|>\n<|im_start|>assistant\n<think>\n{sol}\n</think>\n\n{ans}<|im_end|>")
                         elif "question" in row and "answer" in row:
                             q, a = row["question"], row["answer"]
                             if "####" in str(a):
@@ -427,7 +526,7 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
                             try:
                                 texts.append(tok.apply_chat_template([{"role": "user", "content": str(q)}, {"role": "assistant", "content": content}], tokenize=False))
                             except Exception:
-                                texts.append(f"<｜User｜>{q}<｜Assistant｜>{content}")
+                                texts.append(f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n{content}<|im_end|>")
                         elif "text" in row:
                             texts.append(str(row["text"]))
                 if texts:
@@ -446,7 +545,6 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
     print(f"[vsa-data] Building <think> Reasoning + Math + Code distillation cache ({target_tokens/1e6:.0f}M tokens)...", flush=True)
     t0 = time.perf_counter()
     all_texts = []
-    # Pull high-quality <think> math, reasoning, and instruction traces via parquet
     for ds_id in (
         "bespokelabs/Bespoke-Stratos-17k",
         "AI-MO/NuminaMath-CoT",
@@ -467,7 +565,6 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
         if len(train_buf) >= target_tokens:
             break
 
-    # If reasoning traces are smaller than target_tokens, cycle/pad with Reasoning + FineWeb
     if len(train_buf) < target_tokens and len(train_buf) > 0:
         base_len = len(train_buf)
         reps = (target_tokens // base_len) + 1
@@ -475,7 +572,6 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
     else:
         train_t = torch.frombuffer(train_buf, dtype=torch.int32).clone()[:target_tokens]
 
-    # Build separate Eval-Only cache (2M tokens: 50% Reasoning/Math + 50% FineWeb-Edu, NEVER trained on!)
     eval_texts = all_texts[-500:] if len(all_texts) > 500 else all_texts
     eval_buf = array("i")
     for ids in tok(eval_texts, add_special_tokens=False)["input_ids"]:
@@ -491,12 +587,45 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
     return train_t, eval_t
 
 
-@torch.no_grad()
-def _eval_reasoning_metrics(stu, donor, eval_tokens: torch.Tensor, device: torch.device,
-                            n_tokens: int = 32768, bs: int = 4) -> tuple[float, float, float, float]:
-    """Evaluates on held-out Reasoning/Chat tokens:
-      Returns (stu_ppl, donor_ppl, kl_nats, top1_agreement_pct)
+def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: torch.device):
+    """Loads the frozen teacher model in bfloat16:
+      - For Qwen3.5 (which uses native GatedDeltaNet linear_attn layers), loads via
+        transformers AutoModelForCausalLM / Qwen3_5TextForCausalLM (vision-stripped).
+      - For standard Softmax models (Qwen3, Qwen2.5, DeepSeek, Llama), loads via UniversalVSALM.
     """
+    if stu_cfg.get("has_qwen35_lin", False):
+        import transformers
+        print(f"[vsa-teacher] Loading native Qwen3.5 teacher from {donor_dir} (vision-stripped, bfloat16)...", flush=True)
+        for cls_name in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration", "AutoModelForCausalLM", "AutoModelForImageTextToText"):
+            cls = getattr(transformers, cls_name, None)
+            if cls is not None:
+                try:
+                    m = cls.from_pretrained(donor_dir, torch_dtype=torch.bfloat16)
+                    # Strip vision tower if present to save GPU VRAM!
+                    if hasattr(m, "model") and hasattr(m.model, "visual"):
+                        del m.model.visual
+                    elif hasattr(m, "visual"):
+                        del m.visual
+                    m = m.to(device, dtype=torch.bfloat16).eval()
+                    for p in m.parameters():
+                        p.requires_grad_(False)
+                    return m, True
+                except Exception:
+                    continue
+    hf_sd = load_all_safetensors(donor_dir)
+    rep_cfg = dict(stu_cfg, hybrid_every=1, vsa_untie_gqa=False, vsa_local_conv=False)
+    donor = UniversalVSALM(**rep_cfg)
+    donor.load_state_dict(map_any_hf_to_student(hf_sd, rep_cfg, 1), strict=True)
+    del hf_sd
+    donor = donor.to(device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32).eval()
+    for p in donor.parameters():
+        p.requires_grad_(False)
+    return donor, False
+
+
+@torch.no_grad()
+def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Tensor,
+                            device: torch.device, n_tokens: int = 32768, bs: int = 4) -> tuple[float, float, float, float]:
     stu.eval()
     T = stu.config["max_T"]
     V = stu.config["vocab_size"]
@@ -512,10 +641,16 @@ def _eval_reasoning_metrics(stu, donor, eval_tokens: torch.Tensor, device: torch
         y = eval_tokens[base + 1].long().to(device)
         with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
             hs = stu(x)
-            hd = donor(x)
+            if is_hf_donor:
+                d_out = donor(input_ids=x, output_hidden_states=True)
+                hd = d_out.hidden_states[-1]
+                d_lm_head = donor.get_output_embeddings()
+            else:
+                hd = donor(x)
+                d_lm_head = donor.lm_head
         for c in range(0, bs, 2):
             slog = stu.lm_head(hs[c:c+2]).float()
-            dlog = donor.lm_head(hd[c:c+2]).float()
+            dlog = d_lm_head(hd[c:c+2]).float()
             yv = y[c:c+2].reshape(-1)
             nll_s += F.cross_entropy(slog.reshape(-1, V), yv, reduction="sum").item()
             nll_d += F.cross_entropy(dlog.reshape(-1, V), yv, reduction="sum").item()
@@ -570,32 +705,28 @@ def heal_universal_model(
         if any(k in name for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix")):
             p.data = p.data.float()
 
+    n_params = sum(p.numel() for p in stu.parameters())
     T = int(stu_cfg["max_T"])
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
-    if highspeed and vram_gb >= 45.0:
+
+    # Auto-scale micro_bs for 7B-9B models vs 1B-3B models
+    if highspeed and vram_gb >= 45.0 and n_params < 4_000_000_000:
         micro_bs = 8
         use_ckpt = False
         mode_str = "HIGHSPEED (use_ckpt=False, micro_bs=8)"
     else:
-        # Default Low-VRAM mode (~14-22 GiB for 1.5B, ~45 GiB for 7B-8B!)
-        micro_bs = 4 if vram_gb >= 20.0 else 2
+        micro_bs = 2 if n_params >= 5_000_000_000 else (4 if vram_gb >= 20.0 else 2)
         use_ckpt = True
         mode_str = f"LOW-VRAM (use_ckpt=True, micro_bs={micro_bs})"
 
     donor_dir = fetch_any_donor(donor_repo)
-    hf_sd = load_all_safetensors(donor_dir)
-    rep_cfg = dict(stu_cfg, hybrid_every=1, vsa_untie_gqa=False, vsa_local_conv=False)
-    donor = UniversalVSALM(**rep_cfg)
-    donor.load_state_dict(map_any_hf_to_student(hf_sd, rep_cfg, 1), strict=True)
-    del hf_sd
-    donor = donor.to(device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32).eval()
-    for p in donor.parameters():
-        p.requires_grad_(False)
+    donor, is_hf_donor = _load_donor_teacher(donor_repo, donor_dir, stu_cfg, device)
+    w_lm_t = donor.get_output_embeddings().weight if is_hf_donor else donor.lm_head.weight
 
     train_tokens, eval_tokens = _build_reasoning_and_eval_caches(
         work, donor_dir, donor_repo, max(data_tokens, int(tokens_budget * 1.05))
     )
-    start_ppl, donor_ppl, start_kl, start_top1 = _eval_reasoning_metrics(stu, donor, eval_tokens, device)
+    start_ppl, donor_ppl, start_kl, start_top1 = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device)
 
     total_steps = max(1, math.ceil(tokens_budget / (bs * T)))
     stage1_steps = min(400, total_steps // 6) if start_step == 0 else 0
@@ -603,8 +734,9 @@ def heal_universal_model(
     print("=" * 84)
     print(f"VSA-FASTDISTILL PURE-TEACHER HEALER: {donor_repo} (kd={kd})")
     print("=" * 84)
+    print(f"  Memory Mode    : {mode_str} ({n_params/1e9:.2f}B Student)")
     print(f"  Donor Eval PPL : {donor_ppl:.3f}  |  Student Start PPL: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x) | KL: {start_kl:.3f} | Top1: {start_top1:.1f}%")
-    print(f"  Budget         : {tokens_budget/1e6:.1f}M Reasoning/Chat tokens ({total_steps} steps, resume={start_step}, micro_bs={micro_bs})")
+    print(f"  Budget         : {tokens_budget/1e6:.1f}M Reasoning/Chat tokens ({total_steps} steps, resume={start_step})")
 
     vsa_conv, vsa_core, vsa_proj, mlp_params = [], [], [], []
     for n_, p_ in stu.named_parameters():
@@ -676,13 +808,19 @@ def heal_universal_model(
 
             with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
                 with torch.no_grad():
-                    xt = donor.embed_tokens(xm)
-                    t_mids = []
-                    for li, blk in enumerate(donor.blocks):
-                        xt = blk(xt)
-                        if (li + 1) % stu_cfg["hybrid_every"] == 0:
-                            t_mids.append(xt)
-                    h_teacher = donor.norm(xt)
+                    if is_hf_donor:
+                        d_out = donor(input_ids=xm, output_hidden_states=True)
+                        h_teacher = d_out.hidden_states[-1]
+                        t_mids = [d_out.hidden_states[li + 1] for li in range(stu_cfg["num_layers"]) if (li + 1) % stu_cfg["hybrid_every"] == 0]
+                        del d_out
+                    else:
+                        xt = donor.embed_tokens(xm)
+                        t_mids = []
+                        for li, blk in enumerate(donor.blocks):
+                            xt = blk(xt)
+                            if (li + 1) % stu_cfg["hybrid_every"] == 0:
+                                t_mids.append(xt)
+                        h_teacher = donor.norm(xt)
 
                 xs = stu.embed_tokens(xm)
                 s_mids = []
@@ -692,7 +830,6 @@ def heal_universal_model(
                         s_mids.append(xs)
                 h_student = stu.norm(xs)
 
-                # Blockwise Cosine + Final Hidden-State Cosine Alignment
                 mid_loss = sum(
                     1.0 - F.cosine_similarity(sm.float(), tm.float(), dim=-1).mean()
                     for sm, tm in zip(s_mids, t_mids)
@@ -703,14 +840,13 @@ def heal_universal_model(
             N_m = B_m * T_m
             dh = torch.empty_like(h_student)
             w_lm_s = stu.lm_head.weight
-            w_lm_t = donor.lm_head.weight
             mb_kd = 0.0
 
             with torch.no_grad():
-                for i in range(0, B_m, 2):
-                    hs_c = h_student[i:i+2]
-                    ht_c = h_teacher[i:i+2]
-                    ym_c = ym[i:i+2]
+                for i in range(B_m):
+                    hs_c = h_student[i:i+1]
+                    ht_c = h_teacher[i:i+1]
+                    ym_c = ym[i:i+1]
 
                     slog = F.linear(hs_c, w_lm_s).float()
                     lsm_s = F.log_softmax(slog, dim=-1)
@@ -723,7 +859,6 @@ def heal_universal_model(
                     del rlog, rlsm
 
                     if kd >= 0.999:
-                        # 100% Pure Teacher KL Distillation (preserves <think> reasoning distribution!)
                         mb_kd += float(kd_i) / N_m
                         g_logits = (prob_s - prob_t) * (w / N_m)
                     else:
@@ -734,7 +869,7 @@ def heal_universal_model(
                         g_logits.scatter_add_(-1, ym_c.unsqueeze(-1), torch.full_like(ym_c.unsqueeze(-1), -(1.0 - kd), dtype=torch.float32))
                         g_logits.mul_(w / N_m)
 
-                    dh[i:i+2] = (g_logits.to(h_student.dtype) @ w_lm_s)
+                    dh[i:i+1] = (g_logits.to(h_student.dtype) @ w_lm_s)
                     del slog, lsm_s, prob_s, prob_t, g_logits
 
             torch.autograd.backward(
@@ -755,7 +890,7 @@ def heal_universal_model(
             print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_kl {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
         if step_done % eval_every == 0 or step_done == total_steps:
-            s_ppl, d_ppl, kl_v, top1_v = _eval_reasoning_metrics(stu, donor, eval_tokens, device)
+            s_ppl, d_ppl, kl_v, top1_v = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device)
             stu.train()
             dt = (time.perf_counter() - t0) / max(1, step_done - start_step)
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
