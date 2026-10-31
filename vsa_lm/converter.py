@@ -545,11 +545,12 @@ def heal_universal_model(
     bs: int = 16,
     lr: float = 1.5e-4,
     warmup: int = 150,
-    kd: float = 1.0,  # Default 1.0 = 100% Pure Teacher Distillation (never overwrites <think> behavior with raw labels!)
+    kd: float = 1.0,
     eval_every: int = 250,
     save_every: int = 500,
     seed: int = 7777,
     hf_repo: str | None = None,
+    highspeed: bool = False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_ckpt = os.path.join(work, f"{out_prefix}_latest.pth")
@@ -571,8 +572,15 @@ def heal_universal_model(
 
     T = int(stu_cfg["max_T"])
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
-    micro_bs = 8 if vram_gb >= 45.0 else 4
-    use_ckpt = (vram_gb < 32.0)
+    if highspeed and vram_gb >= 45.0:
+        micro_bs = 8
+        use_ckpt = False
+        mode_str = "HIGHSPEED (use_ckpt=False, micro_bs=8)"
+    else:
+        # Default Low-VRAM mode (~14-22 GiB for 1.5B, ~45 GiB for 7B-8B!)
+        micro_bs = 4 if vram_gb >= 20.0 else 2
+        use_ckpt = True
+        mode_str = f"LOW-VRAM (use_ckpt=True, micro_bs={micro_bs})"
 
     donor_dir = fetch_any_donor(donor_repo)
     hf_sd = load_all_safetensors(donor_dir)
