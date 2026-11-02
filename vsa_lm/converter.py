@@ -1003,13 +1003,14 @@ def heal_universal_model(
             p_.requires_grad_(start_step >= stage1_steps)
             mlp_params.append(p_)
 
+mlp_lr_scale = 0.08 if stu_cfg.get("has_qwen35_lin", False) else 0.20
     opt_groups = [
         {"params": vsa_conv, "weight_decay": 0.01, "lr_scale": 8.0},
         {"params": vsa_core, "weight_decay": 0.0,  "lr_scale": 5.0},
         {"params": vsa_proj, "weight_decay": 0.05, "lr_scale": 1.5},
     ]
     if start_step >= stage1_steps:
-        opt_groups.append({"params": mlp_params, "weight_decay": 0.05, "lr_scale": 0.4, "is_mlp": True})
+        opt_groups.append({"params": mlp_params, "weight_decay": 0.01, "lr_scale": mlp_lr_scale, "is_mlp": True})
         trainable = vsa_conv + vsa_core + vsa_proj + mlp_params
         mlp_unfrozen = True
     else:
@@ -1030,8 +1031,12 @@ def heal_universal_model(
         if start_step > 0 and s >= start_step:
             m *= min(1.0, (s - start_step + 1) / 100.0)
         for g in opt.param_groups:
-            if g.get("is_mlp", False) and s < stage1_steps:
-                g["lr"] = 0.0
+            if g.get("is_mlp", False):
+                if s < stage1_steps:
+                    g["lr"] = 0.0
+                else:
+                    mlp_warm = min(1.0, (s - stage1_steps + 1) / 150.0)
+                    g["lr"] = lr * m * g.get("lr_scale", 1.0) * mlp_warm
             else:
                 g["lr"] = lr * m * g.get("lr_scale", 1.0)
 
@@ -1052,7 +1057,7 @@ def heal_universal_model(
         if not mlp_unfrozen and step >= stage1_steps:
             for p_ in mlp_params:
                 p_.requires_grad_(True)
-            opt.add_param_group({"params": mlp_params, "weight_decay": 0.05, "lr_scale": 0.4, "is_mlp": True, "lr": lr * 0.4})
+            opt.add_param_group({"params": mlp_params, "weight_decay": 0.01, "lr_scale": mlp_lr_scale, "is_mlp": True, "lr": 0.0})
             trainable = vsa_conv + vsa_core + vsa_proj + mlp_params
             mlp_unfrozen = True
             set_step_lr(step)
