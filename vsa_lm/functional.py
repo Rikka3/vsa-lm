@@ -5,13 +5,17 @@ from .kernels import vsa_chunk_forward_kernel, vsa_chunk_backward_kernel, vsa_re
 
 
 class VSAChunkFunction(torch.autograd.Function):
-    """Chunkwise VSA attention with exact gradients, including d/dgamma."""
+    """Chunkwise VSA attention with exact gradients, including d/dgamma.
+    Uses BF16 TensorCore tl.dot at BLOCK_SIZE=32 (even for D=128) and reuses Y_saved in backward.
+    """
 
     @staticmethod
     def forward(ctx, q, k, v, gamma, chunk_size):
         B, H, T, D = q.shape
-        # For D >= 128 (e.g. Qwen-1.5B / DeepSeek-1.5B), use chunk_size=16 so backward shared memory stays < 64 KB
-        eff_chunk = 16 if (D >= 128 and chunk_size >= 16 and T % 16 == 0) else chunk_size
+        if q.dtype in (torch.bfloat16, torch.float16) and T % 32 == 0:
+            eff_chunk = 32 if chunk_size >= 32 else chunk_size
+        else:
+            eff_chunk = 16 if (D >= 128 and chunk_size >= 16 and T % 16 == 0) else chunk_size
         if T % eff_chunk or T < eff_chunk:
             raise ValueError(f"sequence length {T} must be a positive multiple of {eff_chunk}")
         q_flat = q.reshape(B*H, T, D).contiguous()
@@ -28,18 +32,20 @@ class VSAChunkFunction(torch.autograd.Function):
             q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
             M_saved.stride(0), M_saved.stride(1), M_saved.stride(2),
             B, H, T, D, BLOCK_SIZE=eff_chunk, num_warps=4, num_stages=(1 if D >= 128 else 2))
-        ctx.save_for_backward(q, k, v, gamma, M_saved)
+        y_out = y_flat.view(B, H, T, D)
+        ctx.save_for_backward(q, k, v, y_out, gamma, M_saved)
         ctx.chunk_size = eff_chunk
-        return y_flat.view(B, H, T, D)
+        return y_out
 
     @staticmethod
     def backward(ctx, dy):
-        q, k, v, gamma, M_saved = ctx.saved_tensors
+        q, k, v, y_saved, gamma, M_saved = ctx.saved_tensors
         B, H, T, D = q.shape
         chunk_size = ctx.chunk_size
         q_flat = q.reshape(B*H, T, D).contiguous()
         k_flat = k.reshape(B*H, T, D).contiguous()
         v_flat = v.reshape(B*H, T, D).contiguous()
+        y_flat = y_saved.reshape(B*H, T, D).contiguous()
         dy_flat = dy.reshape(B*H, T, D).contiguous()
         dq_flat = torch.empty(B*H, T, D, device=q.device, dtype=q.dtype)
         dk_flat = torch.empty_like(dq_flat)
@@ -47,7 +53,7 @@ class VSAChunkFunction(torch.autograd.Function):
         dgamma_flat = torch.empty(B*H, device=q.device, dtype=torch.float32)
         grid = (B * H,)
         vsa_chunk_backward_kernel[grid](
-            q_flat, k_flat, v_flat, dy_flat, M_saved, gamma,
+            q_flat, k_flat, v_flat, y_flat, dy_flat, M_saved, gamma,
             dq_flat, dk_flat, dv_flat, dgamma_flat,
             q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
             M_saved.stride(0), M_saved.stride(1), M_saved.stride(2),
