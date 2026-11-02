@@ -986,11 +986,9 @@ def heal_universal_model(
     print(f"  Donor Eval PPL : {donor_ppl:.3f}  |  Student Start PPL: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x) | KL: {start_kl:.3f} | Top1: {start_top1:.1f}%")
     print(f"  Budget         : {tokens_budget/1e6:.1f}M Reasoning/Chat tokens ({total_steps} steps, resume={start_step})")
 
-    vsa_conv, vsa_core, vsa_proj, mlp_params = [], [], [], []
+vsa_conv, vsa_core, vsa_proj = [], [], []
     for n_, p_ in stu.named_parameters():
-        if n_.startswith("embed_tokens") or n_.startswith("lm_head"):
-            p_.requires_grad_(False)
-        elif any(k in n_ for k in ("v_conv", "k_conv", "conv1d", "local_q_gate", "q_relu_mix", "k_relu_mix")):
+        if any(k in n_ for k in ("v_conv", "k_conv", "conv1d", "local_q_gate", "q_relu_mix", "k_relu_mix")):
             p_.requires_grad_(True)
             vsa_conv.append(p_)
         elif any(k in n_ for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale", "A_log", "dt_bias")):
@@ -1000,23 +998,15 @@ def heal_universal_model(
             p_.requires_grad_(True)
             vsa_proj.append(p_)
         else:
-            p_.requires_grad_(start_step >= stage1_steps)
-            mlp_params.append(p_)
+            # Keep donor's pretrained Embeddings, Softmax layers, MLPs, and RMSNorms 100% frozen!
+            p_.requires_grad_(False)
 
-mlp_lr_scale = 0.08 if stu_cfg.get("has_qwen35_lin", False) else 0.20
     opt_groups = [
-        {"params": vsa_conv, "weight_decay": 0.01, "lr_scale": 8.0},
-        {"params": vsa_core, "weight_decay": 0.0,  "lr_scale": 5.0},
-        {"params": vsa_proj, "weight_decay": 0.05, "lr_scale": 1.5},
+        {"params": vsa_conv, "weight_decay": 0.0, "lr_scale": 5.0},
+        {"params": vsa_core, "weight_decay": 0.0, "lr_scale": 5.0},
+        {"params": vsa_proj, "weight_decay": 0.0, "lr_scale": 1.0},
     ]
-    if start_step >= stage1_steps:
-        opt_groups.append({"params": mlp_params, "weight_decay": 0.01, "lr_scale": mlp_lr_scale, "is_mlp": True})
-        trainable = vsa_conv + vsa_core + vsa_proj + mlp_params
-        mlp_unfrozen = True
-    else:
-        trainable = vsa_conv + vsa_core + vsa_proj
-        mlp_unfrozen = False
-
+    trainable = vsa_conv + vsa_core + vsa_proj
     opt = torch.optim.AdamW(opt_groups, lr=lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
 
     stable_end = int(total_steps * 0.65)
