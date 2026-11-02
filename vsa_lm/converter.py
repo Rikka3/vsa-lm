@@ -171,11 +171,9 @@ class Qwen35VSAAttn(nn.Module):
 
         gam = self.gamma()
         y = _vsa_apply(q, kx, vx, gam, self.chunk_size)
-        # Un-attenuate in fp32 so y has O(1) variance before Qwen35RMSNormGated(eps=1e-6)
-        unscale = (self.HD ** 0.5) / (1.0 - gam).clamp_min(1e-4).view(1, self.H, 1, 1)
-        y_f32 = y.float() * unscale + self.v_self_scale.view(1, self.H, 1, 1) * vx.float()
+        y = y + self.v_self_scale.view(1, self.H, 1, 1).to(y.dtype) * vx
 
-        y_flat = y_f32.to(x.dtype).transpose(1, 2).reshape(-1, self.HD)
+        y_flat = y.transpose(1, 2).reshape(-1, self.HD)
         z_flat = self.in_proj_z(x).reshape(-1, self.HD)
         y_normed = self.norm(y_flat, z_flat).reshape(B, T, self.val_dim)
         return self.out_proj(y_normed)
@@ -929,7 +927,7 @@ def heal_universal_model(
     donor_dir = fetch_any_donor(donor_repo)
     donor, is_hf_donor = _load_donor_teacher(donor_repo, donor_dir, stu_cfg, device)
 
-    # E5 Optimization: Share frozen Teacher & Student Embedding/LM-Head storage (saves 1.19 GiB on 248k vocab!)
+    # E5 Optimization: Share frozen Teacher & Student Embedding/LM-Head storage
     if is_hf_donor:
         t_in_emb = donor.get_input_embeddings()
         t_out_emb = donor.get_output_embeddings()
@@ -975,7 +973,6 @@ def heal_universal_model(
             p_.requires_grad_(True)
             vsa_proj.append(p_)
         else:
-            # E3 Optimization: True Stage-1 MLP/Softmax freeze (saves 13.97 GiB of optimizer states & grads during Stage 1!)
             p_.requires_grad_(start_step >= stage1_steps)
             mlp_params.append(p_)
 
@@ -1024,7 +1021,7 @@ def heal_universal_model(
     stu.train()
     set_step_lr(start_step)
     t0 = time.perf_counter()
-    tok_slice = 512  # E2 Optimization: 512-token vocab KL slicing (saves 5.06 GiB VRAM!)
+    tok_slice = 512
 
     for step in range(start_step, total_steps):
         if not mlp_unfrozen and step >= stage1_steps:
@@ -1039,7 +1036,6 @@ def heal_universal_model(
         base = idx[:, None] * T + ar[None, :]
         x, y = train_tokens[base].long(), train_tokens[base + 1].long()
         opt.zero_grad(set_to_none=True)
-        # E1 Optimization: accumulate loss on GPU tensor with zero inner-loop CUDA syncs!
         loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
 
         for lo in range(0, bs, micro_bs):
@@ -1084,7 +1080,6 @@ def heal_universal_model(
             dh_2d = torch.empty_like(hs_2d)
             w_lm_s = stu.lm_head.weight
 
-            # E2 Optimization: 512-token sliced full-vocab KL/CE (cuts peak vocab tensor memory by >5 GiB)
             with torch.no_grad():
                 for t_lo in range(0, N_m, tok_slice):
                     t_hi = min(t_lo + tok_slice, N_m)
@@ -1157,7 +1152,6 @@ def heal_universal_model(
                         print(f"[vsa-hf] Upload skipped: {e}", flush=True)
                 threading.Thread(target=_up, args=(out_ckpt, hf_repo), daemon=True).start()
 
-    # Automatically re-attach Vision Tower sidecar if one was preserved during conversion!
     vis_sidecar = (ck.get("injection") or {}).get("visual_sidecar_path") or stu_cfg.get("visual_sidecar_path")
     if vis_sidecar and os.path.isfile(vis_sidecar):
         reattach_visual_tower(out_ckpt, vis_sidecar)
