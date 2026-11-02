@@ -9,7 +9,6 @@ import torch.utils.checkpoint
 
 
 def _should_use_legacy_c3(heal_args: list[str]) -> bool:
-    """Use c3_heal.py only if it exists locally and the checkpoint is a C3 Llama-3.2-1B run."""
     c3_exists = any(os.path.isfile(os.path.join(d, "c3_heal.py")) for d in (os.getcwd(), "/marimo"))
     if not c3_exists:
         return False
@@ -40,7 +39,7 @@ def _run_fast_heal(heal_args: list[str]):
         p.add_argument("--warmup", type=int, default=150)
         p.add_argument("--kd", type=float, default=1.0)
         p.add_argument("--eval-every", type=int, default=250)
-        p.add_argument("--save-every", type=int, default=500)
+        p.add_argument("--save-every", type=int, default=250)
         p.add_argument("--seed", type=int, default=7777)
         p.add_argument("--hf-repo", default=None, help="Optional HF repo for periodic checkpoint backups")
         p.add_argument("--highspeed", action="store_true", help="Disable activation checkpointing and use micro_bs=8 on 45GB+ GPUs")
@@ -100,7 +99,6 @@ def main(argv: list[str] | None = None):
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # 1. `python -m vsa_lm convert`
     p_conv = sub.add_parser("convert", help="Convert any Llama/Qwen/Mistral/SmolLM model into a VSA hybrid")
     p_conv.add_argument("--donor", required=True, help="HuggingFace repo ID or local snapshot directory")
     p_conv.add_argument("--out", default="vsa_student_init.pth", help="Output .pth checkpoint path")
@@ -109,16 +107,13 @@ def main(argv: list[str] | None = None):
     p_conv.add_argument("--gamma-cap", type=float, default=0.992, help="Max initial decay horizon (default: 0.992)")
     p_conv.add_argument("--hf-token", default=None, help="Optional HuggingFace token for gated models")
 
-    # 2. `python -m vsa_lm heal`
     sub.add_parser("heal", help="Run memory-optimal anchored healing on any converted VSA checkpoint")
 
-    # 3. `python -m vsa_lm train`
     p_train = sub.add_parser("train", help="Train or resume a VSA-LM from scratch with auto-hardware fitting")
     p_train.add_argument("--run", default="vsa", choices=["vsa", "base"], help="Model arm")
     p_train.add_argument("--max-len", type=int, default=512, help="Sequence length")
     p_train.add_argument("--work", default=None, help="Working directory for checkpoints")
 
-    # 4. `python -m vsa_lm serve`
     p_serve = sub.add_parser("serve", help="Start OpenAI-compatible /v1/chat/completions server for opencode / agents")
     p_serve.add_argument("--ckpt", required=True, help="Path to VSA-LM .pth checkpoint")
     p_serve.add_argument("--donor", default=None, help="HuggingFace repo ID for tokenizer")
@@ -126,11 +121,17 @@ def main(argv: list[str] | None = None):
     p_serve.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
     p_serve.add_argument("--no-quantize", action="store_true", help="Disable dynamic INT8 quantization on CPU")
 
-    # 5. `python -m vsa_lm scan`
     p_scan = sub.add_parser("scan", help="Run static capacity & horizon diagnostics on a checkpoint")
     p_scan.add_argument("--ckpt", required=True, help="Path to .pth checkpoint")
 
-    # 6. `python -m vsa_lm test`
+    p_bench = sub.add_parser("benchmark", help="Run real-world hard benchmarks (MMLU, ARC-C, ARC-E, PIQA, HellaSwag, GSM8K, VSA Memory)")
+    p_bench.add_argument("--ckpt", required=True, help="Path to VSA-LM .pth checkpoint")
+    p_bench.add_argument("--donor", default=None, help="Optional HF donor repo ID")
+    p_bench.add_argument("--no-donor-compare", action="store_true", help="Skip evaluating the donor model")
+    p_bench.add_argument("--limit", type=int, default=200, help="Samples per multiple-choice task (default: 200)")
+    p_bench.add_argument("--gsm8k-limit", type=int, default=40, help="Samples for generative GSM8K (default: 40)")
+    p_bench.add_argument("--out", default=None, help="Output JSON report path")
+
     sub.add_parser("test", help="Run the Triton kernel, gradient, decoder, and erasure parity suite")
 
     args = p.parse_args(argv)
@@ -156,6 +157,16 @@ def main(argv: list[str] | None = None):
     elif args.cmd == "scan":
         from .surgery import scan_checkpoint
         scan_checkpoint(args.ckpt)
+    elif args.cmd == "benchmark":
+        from .benchmark import run_benchmark_suite
+        run_benchmark_suite(
+            args.ckpt,
+            donor_id=args.donor,
+            compare_donor=not args.no_donor_compare,
+            limit=args.limit,
+            gsm8k_limit=args.gsm8k_limit,
+            out_json=args.out,
+        )
     elif args.cmd == "test":
         from .tests import run_all
         run_all()
