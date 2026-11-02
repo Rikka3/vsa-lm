@@ -920,7 +920,7 @@ def heal_universal_model(
         use_ckpt = False
         mode_str = f"HIGHSPEED (use_ckpt=False, micro_bs={micro_bs})"
     else:
-        micro_bs = 2 if n_params >= 5_000_000_000 else (4 if vram_gb >= 20.0 else 2)
+        micro_bs = 2 if n_params >= 3_500_000_000 else (4 if vram_gb >= 20.0 else 2)
         use_ckpt = True
         mode_str = f"LOW-VRAM (use_ckpt=True, micro_bs={micro_bs})"
 
