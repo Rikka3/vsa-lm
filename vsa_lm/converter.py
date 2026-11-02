@@ -1,18 +1,4 @@
-"""Universal Donor-to-VSA Converter & Pure-KD FastDistill Healer (vsa_lm.converter).
-
-Supports:
-  - Qwen3.5 Multimodal/Hybrid models (e.g. `Qwen/Qwen3.5-4B`, `Qwen/Qwen3.5-9B`):
-    * Preserves Vision Tower tensors in a `.safetensors` sidecar (`0 MB` GPU VRAM during healing)
-      and re-attaches them after healing.
-    * Uses exact `Qwen35ZeroCenteredRMSNorm` (`output = x_norm * (1.0 + weight)`).
-    * Uses exact `Qwen35SoftmaxAttn` (`q_proj` packed query+gate chunking, `q_norm`/`k_norm`,
-      `partial_rotary_factor=0.25` at `rope_theta=10,000,000`, `y * sigmoid(gate)`).
-    * Uses exact `Qwen35VSAAttn` preserving `in_proj_qkv`, `conv1d + silu`, L2-normalized Q/K,
-      `in_proj_b` write gate, `A_log`/`dt_bias` horizon init, `Qwen35RMSNormGated(z)`, and `out_proj`.
-  - Qwen3 (`Qwen/Qwen3-8B`), Qwen2.5, DeepSeek-R1-Distill-Qwen, Llama-3, Mistral, SmolLM.
-  - Strictly disjoint train/eval caches (0% overlap, zero benchmark contamination).
-  - Phase 4 Validated Speed & Memory Optimizations (E1 + E2 + E3 + E5 + E7) + Auto Zombie-VRAM Purge.
-"""
+"""Universal Donor-to-VSA Converter & Pure-KD FastDistill Healer (vsa_lm.converter)."""
 from __future__ import annotations
 
 import gc
@@ -41,9 +27,6 @@ from .surgery import (
 
 
 def _purge_zombie_vram():
-    """Clears Python/IPython/Marimo exception tracebacks and forces CUDA garbage collection
-    so a previously stopped or crashed cell never leaks 20-40 GiB of zombie tensors.
-    """
     for attr in ("last_traceback", "last_value", "last_type", "last_exc"):
         if hasattr(sys, attr):
             try:
@@ -64,8 +47,6 @@ def _purge_zombie_vram():
 
 
 class Qwen35ZeroCenteredRMSNorm(nn.Module):
-    """Exact Qwen3_5RMSNorm: output = x_norm * (1.0 + weight)."""
-
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(dim))
@@ -79,8 +60,6 @@ class Qwen35ZeroCenteredRMSNorm(nn.Module):
 
 
 class Qwen35RMSNormGated(nn.Module):
-    """Exact Qwen3_5RMSNormGated: weight * rsqrt(var + eps) * x * silu(z)."""
-
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
@@ -95,8 +74,6 @@ class Qwen35RMSNormGated(nn.Module):
 
 
 class Qwen35PartialRoPE(nn.Module):
-    """Partial RoPE for Qwen3.5 full-attention layers (rotates first rotary_dim dims)."""
-
     def __init__(self, head_dim: int, partial_factor: float = 0.25, theta: float = 10_000_000.0):
         super().__init__()
         self.rotary_dim = int(head_dim * partial_factor)
@@ -117,12 +94,6 @@ class Qwen35PartialRoPE(nn.Module):
 
 
 class Qwen35VSAAttn(nn.Module):
-    """Exact VSA replacement for Qwen3_5GatedDeltaNet:
-    Preserves pretrained in_proj_qkv, conv1d + silu, L2-normalized Q/K,
-    in_proj_b write gate, A_log/dt_bias horizon init, RMSNormGated(z), and out_proj,
-    while replacing the recurrent state with fixed-state VSA outer-product memory.
-    """
-
     def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32):
         super().__init__()
         D = cfg["dim"]
@@ -132,10 +103,7 @@ class Qwen35VSAAttn(nn.Module):
         conv_k = int(cfg.get("linear_conv_kernel_dim", 4))
         eps = float(cfg.get("eps", 1e-6))
 
-        self.H = HV
-        self.HKV = HK
-        self.HD = HD
-        self.G = HV // HK
+        self.H, self.HKV, self.HD, self.G = HV, HK, HD, HV // HK
         self.key_dim = HK * HD
         self.val_dim = HV * HD
         self.conv_dim = self.key_dim * 2 + self.val_dim
@@ -173,10 +141,7 @@ class Qwen35VSAAttn(nn.Module):
 
         q = F.normalize(q.view(B, T, self.HKV, self.HD).float(), p=2.0, dim=-1).to(x.dtype)
         k = F.normalize(k.view(B, T, self.HKV, self.HD).float(), p=2.0, dim=-1).to(x.dtype)
-        v = v.view(B, T, self.H, self.HD)
-
-        beta = torch.sigmoid(self.in_proj_b(x)).unsqueeze(-1)
-        v = v * beta
+        v = v.view(B, T, self.H, self.HD) * torch.sigmoid(self.in_proj_b(x)).unsqueeze(-1)
 
         q = q.repeat_interleave(self.G, dim=2).transpose(1, 2).contiguous()
         k = k.repeat_interleave(self.G, dim=2).transpose(1, 2).contiguous()
@@ -194,20 +159,14 @@ class Qwen35VSAAttn(nn.Module):
             kx = kx * (1.0 + 0.5 * torch.tanh(self.head_pos_delta[:, :T, :])).unsqueeze(0).to(kx.dtype)
         vx = torch.einsum("bhtd,hde->bhte", v, self.v_head_mix.to(v.dtype))
 
-        gam = self.gamma()
-        y = _vsa_apply(q, kx, vx, gam, self.chunk_size)
+        y = _vsa_apply(q, kx, vx, self.gamma(), self.chunk_size)
         y = y + self.v_self_scale.view(1, self.H, 1, 1).to(y.dtype) * vx
-
         y_flat = y.transpose(1, 2).reshape(-1, self.HD)
         z_flat = self.in_proj_z(x).reshape(-1, self.HD)
-        y_normed = self.norm(y_flat, z_flat).reshape(B, T, self.val_dim)
-        return self.out_proj(y_normed)
+        return self.out_proj(self.norm(y_flat, z_flat).reshape(B, T, self.val_dim))
 
 
 class UniversalSoftmaxAttn(nn.Module):
-    """Donor softmax attention supporting arbitrary GQA ratios, optional QKV biases (Qwen2),
-    optional per-head q_norm/k_norm (Qwen3 / Qwen3.5), packed Qwen3.5 q_proj gate, and partial RoPE."""
-
     def __init__(self, cfg: dict):
         super().__init__()
         D, H, HKV = cfg["dim"], cfg["num_heads"], cfg["num_kv_heads"]
@@ -228,14 +187,9 @@ class UniversalSoftmaxAttn(nn.Module):
             self.q_norm = norm_cls(HD, cfg["eps"])
             self.k_norm = norm_cls(HD, cfg["eps"])
         else:
-            self.q_norm = None
-            self.k_norm = None
+            self.q_norm, self.k_norm = None, None
 
-        if cfg.get("softmax_gate", False) and not self.packed_q_gate:
-            self.g_proj = nn.Linear(D, H * HD, bias=False)
-        else:
-            self.g_proj = None
-
+        self.g_proj = nn.Linear(D, H * HD, bias=False) if (cfg.get("softmax_gate", False) and not self.packed_q_gate) else None
         partial_factor = float(cfg.get("partial_rotary_factor", 1.0))
         if partial_factor < 1.0:
             self.rope = Qwen35PartialRoPE(HD, partial_factor=partial_factor, theta=cfg["rope_theta"])
@@ -245,50 +199,40 @@ class UniversalSoftmaxAttn(nn.Module):
     def head_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
         if self.packed_q_gate:
-            q_and_gate = self.q_proj(x).view(B, T, self.H, self.HD * 2)
-            q, _ = torch.chunk(q_and_gate, 2, dim=-1)
+            q, _ = torch.chunk(self.q_proj(x).view(B, T, self.H, self.HD * 2), 2, dim=-1)
         else:
             q = self.q_proj(x).view(B, T, self.H, self.HD)
         k = self.k_proj(x).view(B, T, self.HKV, self.HD)
         v = self.v_proj(x).view(B, T, self.HKV, self.HD)
         if self.q_norm is not None:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+            q, k = self.q_norm(q), self.k_norm(k)
         return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
         if self.packed_q_gate:
-            q_and_gate = self.q_proj(x).view(B, T, self.H, self.HD * 2)
-            q, gate = torch.chunk(q_and_gate, 2, dim=-1)
+            q, gate = torch.chunk(self.q_proj(x).view(B, T, self.H, self.HD * 2), 2, dim=-1)
             gate = gate.reshape(B, T, self.H * self.HD)
             k = self.k_proj(x).view(B, T, self.HKV, self.HD)
             v = self.v_proj(x).view(B, T, self.HKV, self.HD)
             if self.q_norm is not None:
-                q = self.q_norm(q)
-                k = self.k_norm(k)
+                q, k = self.q_norm(q), self.k_norm(k)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             q, k = self.rope(q), self.rope(k)
             k, v = repeat_kv(k, self.G), repeat_kv(v, self.G)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            y = y.transpose(1, 2).reshape(B, T, self.H * self.HD) * torch.sigmoid(gate)
-            return self.o_proj(y)
+            return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD) * torch.sigmoid(gate))
 
         q, k, v = self.head_qkv(x)
         q, k = self.rope(q), self.rope(k)
         k, v = repeat_kv(k, self.G), repeat_kv(v, self.G)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         if self.g_proj is not None:
-            g = torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2))
-            y = y * g
+            y = y * torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2))
         return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD))
 
 
 class UniversalVSAAttn(nn.Module):
-    """Universal VSA attention supporting QKV biases, Qwen3/2.5/Llama/DeepSeek dimensions,
-    GQA head un-tying, 8-tap causal local value/key conv, Q/K positive sharpener,
-    and output gate. Caps VSA head_dim at <= 128 so Triton kernels always fit in SRAM."""
-
     def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32):
         super().__init__()
         D = cfg["dim"]
@@ -296,9 +240,7 @@ class UniversalVSAAttn(nn.Module):
         HKV = cfg.get("vsa_num_kv_heads") or cfg["num_kv_heads"]
         HD = cfg.get("vsa_head_dim") or cfg.get("head_dim") or (D // H)
         while HD > 128 and H * 2 <= 64:
-            H *= 2
-            HKV *= 2
-            HD //= 2
+            H, HKV, HD = H * 2, HKV * 2, HD // 2
 
         qkv_bias = bool(cfg.get("vsa_qkv_bias", cfg.get("qkv_bias", False)))
         self.H, self.HKV, self.HD, self.G = H, HKV, HD, H // HKV
@@ -343,7 +285,7 @@ class UniversalVSAAttn(nn.Module):
         return (0.9999 * torch.sigmoid(self.log_gamma)).clamp(1e-4, 0.9999).float()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
+        B, T, _ = x.shape
         q, k, v = self.head_qkv(x)
         q, k = self.rope(q), self.rope(k)
         T_use = min(T, self.pos_code.shape[0])
@@ -368,20 +310,15 @@ class UniversalVSAAttn(nn.Module):
             kx = kx + self.k_relu_mix.to(kx.dtype) * F.relu(kx)
 
         y = _vsa_apply(q, kx, vx, self.gamma(), self.chunk_size)
-
         if hasattr(self, "v_self_scale"):
             y = y + self.v_self_scale.view(1, self.H, 1, 1).to(y.dtype) * vx
-
         if hasattr(self, "v_conv"):
             vx_flat = vx.permute(0, 1, 3, 2).reshape(B, self.H * self.HD, T)
             v_loc = self.v_conv(vx_flat)[..., :T].view(B, self.H, self.HD, T).permute(0, 1, 3, 2)
             q_mod = torch.sigmoid((q * self.local_q_gate.view(1, self.H, 1, self.HD).to(q.dtype)).sum(-1, keepdim=True))
             y = y + (2.0 * q_mod) * v_loc
-
         if hasattr(self, "g_proj"):
-            g = 2.0 * torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2))
-            y = y * g
-
+            y = y * (2.0 * torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2)))
         return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD))
 
 
@@ -391,10 +328,7 @@ class UniversalBlock(nn.Module):
         norm_cls = Qwen35ZeroCenteredRMSNorm if cfg.get("has_qwen35_lin", False) else LlamaRMSNorm
         self.norm1 = norm_cls(cfg["dim"], cfg["eps"])
         if attn_type == "vsa":
-            if cfg.get("has_qwen35_lin", False):
-                self.vsa = Qwen35VSAAttn(cfg, max_T, chunk_size)
-            else:
-                self.vsa = UniversalVSAAttn(cfg, max_T, chunk_size)
+            self.vsa = Qwen35VSAAttn(cfg, max_T, chunk_size) if cfg.get("has_qwen35_lin", False) else UniversalVSAAttn(cfg, max_T, chunk_size)
         else:
             self.attn = UniversalSoftmaxAttn(cfg)
         self.norm2 = norm_cls(cfg["dim"], cfg["eps"])
@@ -407,8 +341,6 @@ class UniversalBlock(nn.Module):
 
 
 class UniversalVSALM(nn.Module):
-    """Universal VSA-LM supporting Qwen3.5 (with Vision sidecar preservation), Qwen3, Qwen2.5, DeepSeek-R1, Llama, Mistral, SmolLM."""
-
     def __init__(self, vocab_size: int, dim: int, num_layers: int, num_heads: int,
                  num_kv_heads: int, intermediate: int, max_T: int = 1024,
                  chunk_size: int = 32, hybrid_every: int = 4,
@@ -431,8 +363,7 @@ class UniversalVSALM(nn.Module):
         self.blocks = nn.ModuleList()
         for li in range(num_layers):
             stays_soft = hybrid_every > 0 and (li + 1) % hybrid_every == 0
-            t = "softmax" if stays_soft else "vsa"
-            self.blocks.append(UniversalBlock(self.config, t, max_T, chunk_size))
+            self.blocks.append(UniversalBlock(self.config, "softmax" if stays_soft else "vsa", max_T, chunk_size))
         norm_cls = Qwen35ZeroCenteredRMSNorm if self.config.get("has_qwen35_lin", False) else LlamaRMSNorm
         self.norm = norm_cls(dim, eps)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
@@ -443,10 +374,7 @@ class UniversalVSALM(nn.Module):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
         for blk in self.blocks:
-            if self.grad_checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
-            else:
-                x = blk(x)
+            x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False) if (self.grad_checkpoint and self.training) else blk(x)
         return self.norm(x)
 
 
@@ -463,15 +391,11 @@ def fetch_any_donor(repo_or_dir: str, hf_token: str | None = None) -> str:
 
 
 def preserve_visual_tower(donor_dir: str, out_sidecar_path: str) -> tuple[int, float]:
-    """Extracts and saves all `visual.*` / `model.visual.*` tensors into a `.safetensors`
-    sidecar file on disk so Vision is 100% preserved while using 0 MB GPU VRAM during text healing.
-    """
     from safetensors.torch import load_file, save_file
     if os.path.isfile(out_sidecar_path):
         vis_sd = load_file(out_sidecar_path)
         mb = sum(v.numel() * v.element_size() for v in vis_sd.values()) / (1024 ** 2)
         return len(vis_sd), mb
-
     shards = sorted(glob.glob(os.path.join(donor_dir, "*.safetensors")))
     vis_sd = {}
     for sh in shards:
@@ -487,7 +411,6 @@ def preserve_visual_tower(donor_dir: str, out_sidecar_path: str) -> tuple[int, f
 
 
 def reattach_visual_tower(healed_ckpt_path: str, visual_sidecar_path: str, out_multimodal_ckpt_path: str | None = None) -> str:
-    """Re-attaches the preserved Vision Tower `.safetensors` sidecar into the healed VSA checkpoint."""
     from safetensors.torch import load_file
     if not os.path.isfile(visual_sidecar_path):
         raise FileNotFoundError(f"Vision sidecar not found: {visual_sidecar_path}")
@@ -530,9 +453,7 @@ def inspect_donor_config(donor_dir: str, hf_sd: dict[str, torch.Tensor],
                          hybrid_every: int = 4) -> dict:
     with open(os.path.join(donor_dir, "config.json")) as f:
         raw_cfg = json.load(f)
-
     hc = raw_cfg.get("text_config", raw_cfg)
-
     dim = int(hc["hidden_size"])
     num_layers = int(hc["num_hidden_layers"])
     num_heads = int(hc["num_attention_heads"])
@@ -560,9 +481,7 @@ def inspect_donor_config(donor_dir: str, hf_sd: dict[str, torch.Tensor],
     vsa_head_dim = int(hc.get("linear_value_head_dim", min(128, head_dim))) if has_qwen35_lin else min(128, head_dim)
     if not has_qwen35_lin and head_dim > 128:
         scale_f = head_dim // 128
-        vsa_num_heads = num_heads * scale_f
-        vsa_num_kv_heads = num_kv_heads * scale_f
-        vsa_head_dim = 128
+        vsa_num_heads, vsa_num_kv_heads, vsa_head_dim = num_heads * scale_f, num_kv_heads * scale_f, 128
 
     return dict(
         donor_arch=raw_cfg.get("model_type", hc.get("model_type", "unknown")),
@@ -586,44 +505,37 @@ def inspect_donor_config(donor_dir: str, hf_sd: dict[str, torch.Tensor],
 def map_any_hf_to_student(hf_sd: dict[str, torch.Tensor], cfg: dict, hybrid_every: int) -> dict[str, torch.Tensor]:
     sd = {}
     has_qwen35_lin = bool(cfg.get("has_qwen35_lin", False))
-
     for k, t in hf_sd.items():
         if k == "model.embed_tokens.weight":
             sd["embed_tokens.weight"] = t.detach().cpu().clone()
         elif k == "model.norm.weight":
             sd["norm.weight"] = t.detach().cpu().clone()
-        elif k == "lm_head.weight":
-            if not cfg["tie_word_embeddings"]:
-                sd["lm_head.weight"] = t.detach().cpu().clone()
+        elif k == "lm_head.weight" and not cfg["tie_word_embeddings"]:
+            sd["lm_head.weight"] = t.detach().cpu().clone()
         elif k.startswith("model.layers."):
             parts = k.split(".")
             li, sub = int(parts[2]), ".".join(parts[3:])
             stays_soft = hybrid_every > 0 and (li + 1) % hybrid_every == 0
             core = "attn" if stays_soft else "vsa"
-
             if sub.startswith("self_attn."):
                 proj = sub.split(".", 1)[1]
                 if proj in ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
-                            "q_proj.bias", "k_proj.bias", "v_proj.bias",
-                            "q_norm.weight", "k_norm.weight"):
+                            "q_proj.bias", "k_proj.bias", "v_proj.bias", "q_norm.weight", "k_norm.weight"):
                     if not stays_soft and proj in ("q_norm.weight", "k_norm.weight"):
                         continue
                     sd[f"blocks.{li}.{core}.{proj}"] = t.detach().cpu().clone()
-
             elif sub.startswith("linear_attn.") and not stays_soft and has_qwen35_lin:
                 lproj = sub.split(".", 1)[1]
                 if lproj in ("in_proj_qkv.weight", "conv1d.weight", "in_proj_z.weight",
                              "in_proj_b.weight", "in_proj_a.weight", "dt_bias", "A_log",
                              "norm.weight", "out_proj.weight"):
                     sd[f"blocks.{li}.vsa.{lproj}"] = t.detach().cpu().clone()
-
             elif sub == "input_layernorm.weight":
                 sd[f"blocks.{li}.norm1.weight"] = t.detach().cpu().clone()
             elif sub == "post_attention_layernorm.weight":
                 sd[f"blocks.{li}.norm2.weight"] = t.detach().cpu().clone()
             elif sub in ("mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"):
                 sd[f"blocks.{li}.{sub}"] = t.detach().cpu().clone()
-
     if cfg["tie_word_embeddings"]:
         sd["lm_head.weight"] = sd["embed_tokens.weight"]
     return sd
@@ -642,7 +554,6 @@ def convert_donor_model(
 ) -> str:
     t0 = time.perf_counter()
     donor_dir = fetch_any_donor(donor_id_or_dir, hf_token=hf_token)
-
     safe_tag = donor_id_or_dir.split("/")[-1].lower().replace("-", "_").replace(".", "_")
     vis_path = visual_sidecar_out or os.path.join(os.path.dirname(os.path.abspath(out_ckpt)), f"{safe_tag}_visual_tower.safetensors")
     n_vis, vis_mb = preserve_visual_tower(donor_dir, vis_path)
@@ -669,11 +580,8 @@ def convert_donor_model(
     sd = map_any_hf_to_student(hf_sd, cfg, hybrid_every)
     del hf_sd
 
-    H = cfg["vsa_num_heads"]
-    HD = cfg["vsa_head_dim"]
-    D = cfg["dim"]
+    H, HD, D = cfg["vsa_num_heads"], cfg["vsa_head_dim"], cfg["dim"]
     dtype = sd["embed_tokens.weight"].dtype
-
     horizons = torch.logspace(math.log10(2.0), math.log10(1.0 / max(1e-4, 1.0 - gamma_cap)), H)
     g_init = (1.0 - 1.0 / horizons).clamp(0.50, gamma_cap)
     sig = (g_init / 0.9999).clamp(1e-6, 1.0 - 1e-6)
@@ -685,8 +593,7 @@ def convert_donor_model(
         p = f"blocks.{li}.vsa"
         sd[f"{p}.pos_code"] = torch.ones(max_T, HD, dtype=torch.float32)
         if cfg.get("has_qwen35_lin", False) and f"{p}.A_log" in sd and f"{p}.dt_bias" in sd:
-            A_log = sd[f"{p}.A_log"].float()
-            dt_bias = sd[f"{p}.dt_bias"].float()
+            A_log, dt_bias = sd[f"{p}.A_log"].float(), sd[f"{p}.dt_bias"].float()
             g_static = torch.exp(-A_log.exp() * F.softplus(dt_bias)).clamp(0.20, gamma_cap)
             sd[f"{p}.log_gamma"] = torch.logit(g_static / 0.9999).float()
         else:
@@ -715,7 +622,7 @@ def convert_donor_model(
         "config": stu.config,
         "injection": {
             "donor": donor_id_or_dir,
-            "converter": "vsa_lm.converter v7-qwen35-exact",
+            "converter": "vsa_lm.converter v8-frozen-backbone",
             "visual_sidecar_path": vis_path if n_vis > 0 else None,
         },
     }, tmp)
@@ -727,12 +634,6 @@ def convert_donor_model(
 
 
 def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str, target_tokens: int):
-    """Builds strictly disjoint `train_tokens` and `eval_tokens`:
-      - Splits raw documents into `eval_docs` and `train_docs` BEFORE tokenizing
-        or repeating, guaranteeing 0.0% overlap between train and eval!
-      - Never includes evaluation benchmarks (GSM8K, MATH-500, AIME, MMLU, GPQA)
-        in the training stream.
-    """
     import pyarrow.parquet as pq
     from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoTokenizer
@@ -751,7 +652,6 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
     tok = AutoTokenizer.from_pretrained(donor_dir)
     eos_id = tok.eos_token_id or tok.pad_token_id or 0
     api = HfApi()
-
     print(f"[vsa-data] Building strictly disjoint distillation cache ({target_tokens/1e6:.0f}M tokens, 0% eval overlap)...", flush=True)
     t0 = time.perf_counter()
     all_texts = []
@@ -781,8 +681,7 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
                 continue
 
     n_eval_docs = min(400, max(50, len(all_texts) // 20))
-    eval_docs = all_texts[:n_eval_docs]
-    train_docs = all_texts[n_eval_docs:]
+    eval_docs, train_docs = all_texts[:n_eval_docs], all_texts[n_eval_docs:]
 
     eval_buf = array("i")
     for ids in tok(eval_docs, add_special_tokens=False)["input_ids"]:
@@ -843,10 +742,6 @@ def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: 
 
 
 def _forward_hf_teacher_body(donor, xm: torch.Tensor, num_layers: int, hybrid_every: int):
-    """Runs the HF teacher's inner language model backbone WITHOUT computing the
-    248,320-vocab lm_head logits tensor on the full batch, and immediately frees
-    all non-anchor layer hidden states.
-    """
     inner = getattr(donor, "model", donor)
     if hasattr(inner, "language_model"):
         inner = inner.language_model
@@ -896,11 +791,7 @@ def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Te
             del slog, dlog, lsm_s, lsm_d, p_d
         del hs, hd, x, y
 
-    stu_ppl = math.exp(nll_s / max(1, cnt))
-    don_ppl = math.exp(nll_d / max(1, cnt))
-    kl_nats = kl_sum / max(1, cnt)
-    top1_pct = (top1_ok / max(1, cnt)) * 100.0
-    return stu_ppl, don_ppl, kl_nats, top1_pct
+    return math.exp(nll_s / max(1, cnt)), math.exp(nll_d / max(1, cnt)), kl_sum / max(1, cnt), (top1_ok / max(1, cnt)) * 100.0
 
 
 def heal_universal_model(
@@ -956,7 +847,6 @@ def heal_universal_model(
     donor_dir = fetch_any_donor(donor_repo)
     donor, is_hf_donor = _load_donor_teacher(donor_repo, donor_dir, stu_cfg, device)
 
-    # E5 Optimization: Share frozen Teacher & Student Embedding/LM-Head storage
     if is_hf_donor:
         t_in_emb = donor.get_input_embeddings()
         t_out_emb = donor.get_output_embeddings()
@@ -970,23 +860,20 @@ def heal_universal_model(
     _purge_zombie_vram()
 
     w_lm_t = donor.get_output_embeddings().weight if is_hf_donor else donor.lm_head.weight
-
     train_tokens, eval_tokens = _build_reasoning_and_eval_caches(
         work, donor_dir, donor_repo, max(data_tokens, int(tokens_budget * 1.05))
     )
     start_ppl, donor_ppl, start_kl, start_top1 = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
-
     total_steps = max(1, math.ceil(tokens_budget / (bs * T)))
-    stage1_steps = min(400, total_steps // 6) if start_step == 0 else 0
 
     print("=" * 84)
     print(f"VSA-FASTDISTILL PURE-TEACHER HEALER: {donor_repo} (kd={kd})")
     print("=" * 84)
-    print(f"  Memory Mode    : {mode_str} ({n_params/1e9:.2f}B Student, E1+E2+E3+E5+E7 Active)")
+    print(f"  Memory Mode    : {mode_str} ({n_params/1e9:.2f}B Student, Frozen-Backbone + E1..E7 Active)")
     print(f"  Donor Eval PPL : {donor_ppl:.3f}  |  Student Start PPL: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x) | KL: {start_kl:.3f} | Top1: {start_top1:.1f}%")
     print(f"  Budget         : {tokens_budget/1e6:.1f}M Reasoning/Chat tokens ({total_steps} steps, resume={start_step})")
 
-vsa_conv, vsa_core, vsa_proj = [], [], []
+    vsa_conv, vsa_core, vsa_proj = [], [], []
     for n_, p_ in stu.named_parameters():
         if any(k in n_ for k in ("v_conv", "k_conv", "conv1d", "local_q_gate", "q_relu_mix", "k_relu_mix")):
             p_.requires_grad_(True)
@@ -998,7 +885,6 @@ vsa_conv, vsa_core, vsa_proj = [], [], []
             p_.requires_grad_(True)
             vsa_proj.append(p_)
         else:
-            # Keep donor's pretrained Embeddings, Softmax layers, MLPs, and RMSNorms 100% frozen!
             p_.requires_grad_(False)
 
     opt_groups = [
@@ -1021,14 +907,7 @@ vsa_conv, vsa_core, vsa_proj = [], [], []
         if start_step > 0 and s >= start_step:
             m *= min(1.0, (s - start_step + 1) / 100.0)
         for g in opt.param_groups:
-            if g.get("is_mlp", False):
-                if s < stage1_steps:
-                    g["lr"] = 0.0
-                else:
-                    mlp_warm = min(1.0, (s - stage1_steps + 1) / 150.0)
-                    g["lr"] = lr * m * g.get("lr_scale", 1.0) * mlp_warm
-            else:
-                g["lr"] = lr * m * g.get("lr_scale", 1.0)
+            g["lr"] = lr * m * g.get("lr_scale", 1.0)
 
     n_win = max(1, (len(train_tokens) - 1) // T)
     gen = torch.Generator().manual_seed(seed)
@@ -1043,7 +922,7 @@ vsa_conv, vsa_core, vsa_proj = [], [], []
     step_window = start_step
     tok_slice = 512
 
-
+    for step in range(start_step, total_steps):
         idx = torch.randint(0, n_win, (bs,), generator=gen)
         base = idx[:, None] * T + ar[None, :]
         x, y = train_tokens[base].long(), train_tokens[base + 1].long()
