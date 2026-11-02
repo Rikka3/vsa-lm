@@ -1043,14 +1043,6 @@ vsa_conv, vsa_core, vsa_proj = [], [], []
     step_window = start_step
     tok_slice = 512
 
-    for step in range(start_step, total_steps):
-        if not mlp_unfrozen and step >= stage1_steps:
-            for p_ in mlp_params:
-                p_.requires_grad_(True)
-            opt.add_param_group({"params": mlp_params, "weight_decay": 0.01, "lr_scale": mlp_lr_scale, "is_mlp": True, "lr": 0.0})
-            trainable = vsa_conv + vsa_core + vsa_proj + mlp_params
-            mlp_unfrozen = True
-            set_step_lr(step)
 
         idx = torch.randint(0, n_win, (bs,), generator=gen)
         base = idx[:, None] * T + ar[None, :]
