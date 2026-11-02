@@ -1,4 +1,4 @@
-"""Triton kernels for chunkwise VSA attention (TensorCore-accelerated forward scan, adjoint backward, and O(1) decode)."""
+"""Triton kernels for chunkwise VSA attention (BF16 TensorCore-accelerated forward scan, Y_saved adjoint backward, and O(1) decode)."""
 import triton
 import triton.language as tl
 
@@ -40,22 +40,24 @@ def vsa_chunk_forward_kernel(
         t_mask = t_offsets < T
         load_mask = t_mask[:, None]
 
-        q = tl.load(Q + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
-        k = tl.load(K + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
-        v = tl.load(V + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
+        q_raw = tl.load(Q + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0)
+        k_raw = tl.load(K + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0)
+        v_raw = tl.load(V + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0)
 
-        y_carry = tl.dot(q, M) * (local_decay_q[:, None] * inv_sqrt_d)
-        attn = tl.dot(q, tl.trans(k)) * inv_sqrt_d
+        # Use native dtype (bf16/fp16 on TensorCores, fp32 in fp32 tests) for tl.dot with fp32 accumulation
+        M_dot = M.to(q_raw.dtype)
+        y_carry = tl.dot(q_raw, M_dot) * (local_decay_q[:, None] * inv_sqrt_d)
+        attn = tl.dot(q_raw, tl.trans(k_raw)) * inv_sqrt_d
         causal_mask = (diff >= 0) & (t_mask[:, None] & t_mask[None, :])
         attn_masked = tl.where(causal_mask, attn * intra_decay, 0.0)
-        y_intra = tl.dot(attn_masked, v)
+        y_intra = tl.dot(attn_masked.to(v_raw.dtype), v_raw)
 
         y = (y_carry + y_intra) * one_minus_gamma
         y_ptrs = Y + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd
         tl.store(y_ptrs, y.to(Y.dtype.element_ty), mask=load_mask)
 
-        v_weighted = v * chunk_decay[:, None]
-        delta_M = tl.dot(tl.trans(k), v_weighted)
+        v_weighted = (v_raw.to(tl.float32) * chunk_decay[:, None]).to(k_raw.dtype)
+        delta_M = tl.dot(tl.trans(k_raw), v_weighted)
         M = chunk_total_decay * M + delta_M
 
         if i + BLOCK_SIZE < T:
@@ -65,7 +67,7 @@ def vsa_chunk_forward_kernel(
 
 @triton.jit
 def vsa_chunk_backward_kernel(
-    Q, K, V, dY, M_saved, GAMMA,
+    Q, K, V, Y_saved, dY, M_saved, GAMMA,
     dQ, dK, dV, dGAMMA,
     stride_qbh, stride_qt, stride_qd,
     stride_mbh, stride_mc, stride_mr,
@@ -79,6 +81,7 @@ def vsa_chunk_backward_kernel(
     head_idx = pid_bh % H
     gamma = tl.load(GAMMA + head_idx).to(tl.float32)
     one_minus_gamma = 1.0 - gamma
+    inv_omg = 1.0 / tl.maximum(one_minus_gamma, 1e-7)
 
     dM_acc = tl.zeros((D, D), dtype=tl.float32)
     dg_acc = 0.0
@@ -113,47 +116,54 @@ def vsa_chunk_backward_kernel(
         t_mask = t_offsets < T
         load_mask = t_mask[:, None]
 
-        q  = tl.load(Q  + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
-        k  = tl.load(K  + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
-        v  = tl.load(V  + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
+        q_raw = tl.load(Q + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0)
+        k_raw = tl.load(K + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0)
+        v_raw = tl.load(V + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0)
+        y_sav = tl.load(Y_saved + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
         dy_out = tl.load(dY + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
         dy = dy_out * one_minus_gamma
+        dy_dot = dy.to(q_raw.dtype)
 
         if c_idx == 0:
             M = tl.zeros((D, D), dtype=tl.float32)
         else:
             M = tl.load(M_saved + M_offset + (c_idx - 1) * stride_mc + d_offsets[:, None]*stride_mr + d_offsets[None,:]).to(tl.float32)
+        M_dot = M.to(q_raw.dtype)
+        dM_acc_dot = dM_acc.to(q_raw.dtype)
 
-        attn = tl.dot(q, tl.trans(k)) * inv_sqrt_d
+        attn = tl.dot(q_raw, tl.trans(k_raw)) * inv_sqrt_d
         causal_mask = (diff >= 0) & (t_mask[:, None] & t_mask[None, :])
         attn_masked = tl.where(causal_mask, attn * intra_decay, 0.0)
-        v_weighted = v * chunk_decay[:, None]
+        v_weighted = (v_raw.to(tl.float32) * chunk_decay[:, None]).to(q_raw.dtype)
 
-        dM_direct = tl.dot(tl.trans(q), dy * local_decay_q[:, None]) * inv_sqrt_d
+        dy_scaled = (dy * local_decay_q[:, None]).to(q_raw.dtype)
+        dM_direct = tl.dot(tl.trans(q_raw), dy_scaled) * inv_sqrt_d
         dM = dM_direct + chunk_total_decay * dM_acc
 
-        dQ_carry = tl.dot(dy, tl.trans(M)) * (local_decay_q[:, None] * inv_sqrt_d)
-        dA = tl.dot(dy, tl.trans(v))
+        dQ_carry = tl.dot(dy_dot, tl.trans(M_dot)) * (local_decay_q[:, None] * inv_sqrt_d)
+        dA = tl.dot(dy_dot, tl.trans(v_raw))
         dA_masked = tl.where(causal_mask, dA * intra_decay, 0.0)
-        dQ_intra = tl.dot(dA_masked, k) * inv_sqrt_d
+        dA_masked_dot = dA_masked.to(q_raw.dtype)
+        dQ_intra = tl.dot(dA_masked_dot, k_raw) * inv_sqrt_d
         dQ_chunk = dQ_carry + dQ_intra
 
-        dK_intra = tl.dot(tl.trans(dA_masked), q) * inv_sqrt_d
-        dK_rec = tl.dot(v_weighted, tl.trans(dM_acc))
+        dK_intra = tl.dot(tl.trans(dA_masked_dot), q_raw) * inv_sqrt_d
+        dK_rec = tl.dot(v_weighted, tl.trans(dM_acc_dot))
         dK_chunk = dK_intra + dK_rec
 
-        dV_intra = tl.dot(tl.trans(attn_masked), dy)
-        dV_rec = tl.dot(k * chunk_decay[:, None], dM_acc)
+        dV_intra = tl.dot(tl.trans(attn_masked.to(q_raw.dtype)), dy_dot)
+        k_weighted = (k_raw.to(tl.float32) * chunk_decay[:, None]).to(q_raw.dtype)
+        dV_rec = tl.dot(k_weighted, dM_acc_dot)
         dV_chunk = dV_intra + dV_rec
 
-        dg_acc += tl.sum(dQ_carry * q * (q_decay_powers / gamma)[:, None])
+        dg_acc += tl.sum(dQ_carry * q_raw.to(tl.float32) * (q_decay_powers / gamma)[:, None])
         attn_dot = tl.where(causal_mask, attn * intra_decay_dot, 0.0)
         dg_acc += tl.sum(attn_dot * dA)
         dg_acc += chunk_total_decay_dot * tl.sum(dM_acc * M)
-        dg_acc += tl.sum(tl.dot(tl.trans(k), v * chunk_decay_dot[:, None]) * dM_acc)
-        y_carry_val = tl.dot(q, M) * (local_decay_q[:, None] * inv_sqrt_d)
-        y_intra_val = tl.dot(attn_masked, v)
-        dg_acc -= tl.sum(dy_out * (y_carry_val + y_intra_val))
+        v_dot_w = (v_raw.to(tl.float32) * chunk_decay_dot[:, None]).to(q_raw.dtype)
+        dg_acc += tl.sum(tl.dot(tl.trans(k_raw), v_dot_w) * dM_acc)
+        # E7 optimization: reuse Y_saved * inv_omg instead of recomputing y_carry + y_intra!
+        dg_acc -= tl.sum(dy_out * (y_sav * inv_omg))
 
         tl.store(dQ + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd,
                  dQ_chunk.to(dQ.dtype.element_ty), mask=load_mask)
