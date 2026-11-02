@@ -11,7 +11,7 @@ Supports:
       `in_proj_b` write gate, `A_log`/`dt_bias` horizon init, `Qwen35RMSNormGated(z)`, and `out_proj`.
   - Qwen3 (`Qwen/Qwen3-8B`), Qwen2.5, DeepSeek-R1-Distill-Qwen, Llama-3, Mistral, SmolLM.
   - Strictly disjoint train/eval caches (0% overlap, zero benchmark contamination).
-  - Phase 4 Validated Speed & Memory Optimizations (E1 + E2 + E3 + E5 + E7).
+  - Phase 4 Validated Speed & Memory Optimizations (E1 + E2 + E3 + E5 + E7) + Auto Zombie-VRAM Purge.
 """
 from __future__ import annotations
 
@@ -20,8 +20,10 @@ import glob
 import json
 import math
 import os
+import sys
 import threading
 import time
+import traceback
 from array import array
 
 import torch
@@ -36,6 +38,29 @@ from .surgery import (
     repeat_kv,
     _vsa_apply,
 )
+
+
+def _purge_zombie_vram():
+    """Clears Python/IPython/Marimo exception tracebacks and forces CUDA garbage collection
+    so a previously stopped or crashed cell never leaks 20-40 GiB of zombie tensors.
+    """
+    for attr in ("last_traceback", "last_value", "last_type", "last_exc"):
+        if hasattr(sys, attr):
+            try:
+                tb = getattr(sys, attr)
+                if attr == "last_traceback" and tb is not None:
+                    traceback.clear_frames(tb)
+                elif attr in ("last_value", "last_exc") and hasattr(tb, "__traceback__") and tb.__traceback__ is not None:
+                    traceback.clear_frames(tb.__traceback__)
+                setattr(sys, attr, None)
+            except Exception:
+                pass
+    gc.collect()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
 
 class Qwen35ZeroCenteredRMSNorm(nn.Module):
@@ -819,21 +844,22 @@ def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: 
 
 def _forward_hf_teacher_body(donor, xm: torch.Tensor, num_layers: int, hybrid_every: int):
     """Runs the HF teacher's inner language model backbone WITHOUT computing the
-    248,320-vocab lm_head logits tensor on the full batch.
+    248,320-vocab lm_head logits tensor on the full batch, and immediately frees
+    all non-anchor layer hidden states.
     """
     inner = getattr(donor, "model", donor)
     if hasattr(inner, "language_model"):
         inner = inner.language_model
-    out = inner(input_ids=xm, output_hidden_states=True)
-    h_teacher = out.last_hidden_state if hasattr(out, "last_hidden_state") else out.hidden_states[-1]
-    t_mids = [out.hidden_states[li + 1] for li in range(num_layers) if (li + 1) % hybrid_every == 0]
+    out = inner(input_ids=xm, output_hidden_states=True, use_cache=False)
+    h_teacher = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out.hidden_states[-1]).detach()
+    t_mids = [out.hidden_states[li + 1].detach() for li in range(num_layers) if (li + 1) % hybrid_every == 0]
     del out
     return h_teacher, t_mids
 
 
 @torch.no_grad()
 def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Tensor,
-                            device: torch.device, n_tokens: int = 32768, bs: int = 4) -> tuple[float, float, float, float]:
+                            device: torch.device, n_tokens: int = 32768, bs: int = 2) -> tuple[float, float, float, float]:
     stu.eval()
     T = stu.config["max_T"]
     V = stu.config["vocab_size"]
@@ -867,6 +893,8 @@ def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Te
             kl_sum += float((p_d * (lsm_d - lsm_s)).sum().item())
             top1_ok += int((slog.argmax(dim=-1) == dlog.argmax(dim=-1)).sum().item())
             cnt += yv.numel()
+            del slog, dlog, lsm_s, lsm_d, p_d
+        del hs, hd, x, y
 
     stu_ppl = math.exp(nll_s / max(1, cnt))
     don_ppl = math.exp(nll_d / max(1, cnt))
@@ -888,11 +916,12 @@ def heal_universal_model(
     warmup: int = 150,
     kd: float = 1.0,
     eval_every: int = 250,
-    save_every: int = 500,
+    save_every: int = 250,
     seed: int = 7777,
     hf_repo: str | None = None,
     highspeed: bool = False,
 ):
+    _purge_zombie_vram()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_ckpt = os.path.join(work, f"{out_prefix}_latest.pth")
     active_ckpt = out_ckpt if os.path.isfile(out_ckpt) else ckpt_path
@@ -916,11 +945,11 @@ def heal_universal_model(
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
 
     if highspeed and vram_gb >= 45.0 and n_params < 4_600_000_000:
-        micro_bs = 4 if n_params >= 3_500_000_000 else 8
+        micro_bs = 4 if n_params >= 3_000_000_000 else 8
         use_ckpt = False
         mode_str = f"HIGHSPEED (use_ckpt=False, micro_bs={micro_bs})"
     else:
-        micro_bs = 2 if n_params >= 3_500_000_000 else (4 if vram_gb >= 20.0 else 2)
+        micro_bs = 2 if n_params >= 3_000_000_000 else (4 if vram_gb >= 20.0 else 2)
         use_ckpt = True
         mode_str = f"LOW-VRAM (use_ckpt=True, micro_bs={micro_bs})"
 
@@ -938,16 +967,14 @@ def heal_universal_model(
     else:
         donor.embed_tokens.weight = stu.embed_tokens.weight
         donor.lm_head.weight = stu.lm_head.weight
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    _purge_zombie_vram()
 
     w_lm_t = donor.get_output_embeddings().weight if is_hf_donor else donor.lm_head.weight
 
     train_tokens, eval_tokens = _build_reasoning_and_eval_caches(
         work, donor_dir, donor_repo, max(data_tokens, int(tokens_budget * 1.05))
     )
-    start_ppl, donor_ppl, start_kl, start_top1 = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device)
+    start_ppl, donor_ppl, start_kl, start_top1 = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
 
     total_steps = max(1, math.ceil(tokens_budget / (bs * T)))
     stage1_steps = min(400, total_steps // 6) if start_step == 0 else 0
@@ -1014,13 +1041,11 @@ def heal_universal_model(
         torch.randint(0, n_win, (bs,), generator=gen)
     ar = torch.arange(T)
 
-    torch.cuda.empty_cache()
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-
+    _purge_zombie_vram()
     stu.train()
     set_step_lr(start_step)
-    t0 = time.perf_counter()
+    t_window = time.perf_counter()
+    step_window = start_step
     tok_slice = 512
 
     for step in range(start_step, total_steps):
@@ -1071,6 +1096,7 @@ def heal_universal_model(
                     for sm, tm in zip(s_mids, t_mids)
                 ) / max(1, len(s_mids))
                 final_h_loss = 1.0 - F.cosine_similarity(h_student.float(), h_teacher.float(), dim=-1).mean()
+                del s_mids, t_mids
 
             B_m, T_m, D_m = h_student.shape
             N_m = B_m * T_m
@@ -1111,10 +1137,12 @@ def heal_universal_model(
                     dh_2d[t_lo:t_hi] = (g_logits.to(h_student.dtype) @ w_lm_s)
                     del slog, lsm_s, prob_s, prob_t, g_logits
 
+            del h_teacher, ht_2d
             torch.autograd.backward(
                 [h_student, (mid_loss + final_h_loss) * (0.20 * w)],
                 [dh_2d.view(B_m, T_m, D_m), torch.ones_like(mid_loss)],
             )
+            del h_student, hs_2d, dh_2d, mid_loss, final_h_loss
 
         gn_tensor = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         if torch.isfinite(gn_tensor):
@@ -1125,14 +1153,18 @@ def heal_universal_model(
         if step_done in (start_step + 1, start_step + 5) or (step_done % 25 == 0 and step_done % eval_every != 0):
             loss_val = float(loss_gpu.item())
             gn = float(gn_tensor.item())
-            dt = (time.perf_counter() - t0) / max(1, step_done - start_step)
+            now = time.perf_counter()
+            dt = (now - t_window) / max(1, step_done - step_window)
+            t_window, step_window = now, step_done
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
             print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_kl {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
         if step_done % eval_every == 0 or step_done == total_steps:
-            s_ppl, d_ppl, kl_v, top1_v = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device)
+            s_ppl, d_ppl, kl_v, top1_v = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
             stu.train()
-            dt = (time.perf_counter() - t0) / max(1, step_done - start_step)
+            now = time.perf_counter()
+            dt = (now - t_window) / max(1, step_done - step_window)
+            t_window, step_window = now, step_done
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
             print(f"  >>> [{out_prefix} EVAL] step {step_done:5d}/{total_steps}  val_ppl {s_ppl:.2f}/{d_ppl:.2f} ({s_ppl/d_ppl:.3f}x donor)  "
                   f"KL {kl_v:.3f} nats  Top1 {top1_v:.1f}%  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
@@ -1142,7 +1174,7 @@ def heal_universal_model(
             torch.save({"model": stu.state_dict(), "step": step_done,
                         "config": stu_cfg, "injection": ck.get("injection", {})}, tmp)
             os.replace(tmp, out_ckpt)
-            if hf_repo and (step_done % 1000 == 0 or step_done == total_steps):
+            if hf_repo and (step_done % 500 == 0 or step_done == total_steps):
                 def _up(p, r):
                     try:
                         from huggingface_hub import HfApi
