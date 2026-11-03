@@ -216,7 +216,7 @@ class UniversalVSALM(nn.Module):
                  vsa_untie_gqa: bool = True, vsa_local_conv: bool = True, **extra_cfg):
         super().__init__()
         head_dim = head_dim or (dim // num_heads)
-        layer_types = extra_cfg.get("layer_types") or compute_layer_types(
+        layer_types = extra_cfg.pop("layer_types", None) or compute_layer_types(
             num_layers, hybrid_every, extra_cfg.get("donor_layer_types")
         )
         self.config = dict(
