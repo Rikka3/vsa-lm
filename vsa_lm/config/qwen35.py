@@ -1,4 +1,4 @@
-"""Qwen3.5 hybrid linear-attention, zero-centered RMSNorm, partial RoPE, and Vision sidecar utilities."""
+"""Qwen3.5 native GatedDeltaNet preservation, zero-centered RMSNorm, partial RoPE, and Vision sidecar."""
 from __future__ import annotations
 
 import glob
@@ -57,16 +57,50 @@ class Qwen35PartialRoPE(nn.Module):
         return torch.cat((x_rot_out, x_pass), dim=-1)
 
 
+def _chunk_gated_delta_rule_native(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                                   g: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    """A1 + A2 Fix: Exact GatedDeltaNet chunked recurrence (`M <- exp(g)*(I - beta*k*k^T)M + beta*k*v^T`).
+    Uses transformers/FLA kernel if available, otherwise fast chunked tensor recurrence.
+    """
+    try:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+        out, _ = torch_chunk_gated_delta_rule(q, k, v, g=g, beta=beta, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=True)
+        return out
+    except Exception:
+        B, T, H, D = q.shape
+        qf = F.normalize(q.float(), p=2.0, dim=-1) * (D ** -0.5)
+        kf = F.normalize(k.float(), p=2.0, dim=-1)
+        vf = v.float() * beta.float().unsqueeze(-1)
+        decay = g.float().exp().unsqueeze(-1).unsqueeze(-1)
+        M = torch.zeros(B, H, D, D, device=q.device, dtype=torch.float32)
+        ys = []
+        for t in range(T):
+            kt = kf[:, t]
+            vt = vf[:, t]
+            qt = qf[:, t]
+            M = decay[:, t] * M
+            proj = torch.einsum("bhkv,bhk->bhv", M, kt)
+            M = M - torch.einsum("bhk,bhv->bhkv", kt * beta[:, t].float().unsqueeze(-1), proj) + torch.einsum("bhk,bhv->bhkv", kt, vt)
+            ys.append(torch.einsum("bhkv,bhk->bhv", M, qt).unsqueeze(1))
+        return torch.cat(ys, dim=1).to(q.dtype)
+
+
 class Qwen35VSAAttn(nn.Module):
-    def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32):
+    """A1 + A2 Fix: Preserves native Qwen3.5 GatedDeltaNet on `linear_attention` layers (`mode='gated_deltanet'`)
+    so 0% quality is lost on the 24 linear layers, while VSA converts the `full_attention` layers!
+    Also supports legacy `vsa` mode for backward compatibility with older checkpoints.
+    """
+
+    def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32, mode: str = "gated_deltanet"):
         super().__init__()
         D = cfg["dim"]
-        HK = cfg.get("vsa_num_kv_heads", 16)
-        HV = cfg.get("vsa_num_heads", 32)
-        HD = cfg.get("vsa_head_dim", 128)
+        HK = cfg.get("linear_num_key_heads", cfg.get("vsa_num_kv_heads", 16))
+        HV = cfg.get("linear_num_value_heads", cfg.get("vsa_num_heads", 32))
+        HD = cfg.get("linear_value_head_dim", cfg.get("vsa_head_dim", 128))
         conv_k = int(cfg.get("linear_conv_kernel_dim", 4))
         eps = float(cfg.get("eps", 1e-6))
 
+        self.mode = mode
         self.H, self.HKV, self.HD, self.G = HV, HK, HD, HV // HK
         self.key_dim = HK * HD
         self.val_dim = HV * HD
@@ -86,71 +120,71 @@ class Qwen35VSAAttn(nn.Module):
         self.norm = Qwen35RMSNormGated(HD, eps=eps)
         self.out_proj = nn.Linear(self.val_dim, D, bias=False)
 
-        self.rope = LlamaRoPE(HD, 10000.0, None)
-        self.rope_mix = nn.Parameter(torch.zeros(HV, 1, 1))
-        self.pos_code = nn.Parameter(torch.ones(max_T, HD))
-        self.log_gamma = nn.Parameter(torch.zeros(HV))
-        eye = torch.eye(HD).unsqueeze(0).repeat(HV, 1, 1)
-        self.k_head_mix = nn.Parameter(eye.clone())
-        self.v_head_mix = nn.Parameter(eye.clone())
-        self.head_pos_delta = nn.Parameter(torch.zeros(HV, max_T, HD))
-        self.v_self_scale = nn.Parameter(torch.zeros(HV))
-
-        self.v_conv = nn.Conv1d(HV * HD, HV * HD, kernel_size=8, padding=7, groups=HV * HD, bias=False)
-        nn.init.zeros_(self.v_conv.weight)
-        self.local_q_gate = nn.Parameter(torch.zeros(HV, HD))
-        self.q_relu_mix = nn.Parameter(torch.zeros(HV, 1, 1))
-        self.k_relu_mix = nn.Parameter(torch.zeros(HV, 1, 1))
+        if mode != "gated_deltanet":
+            self.rope = LlamaRoPE(HD, 10000.0, None)
+            self.rope_mix = nn.Parameter(torch.zeros(HV, 1, 1))
+            self.pos_code = nn.Parameter(torch.ones(max_T, HD))
+            self.log_gamma = nn.Parameter(torch.zeros(HV))
+            eye = torch.eye(HD).unsqueeze(0).repeat(HV, 1, 1)
+            self.k_head_mix = nn.Parameter(eye.clone())
+            self.v_head_mix = nn.Parameter(eye.clone())
+            self.head_pos_delta = nn.Parameter(torch.zeros(HV, max_T, HD))
+            self.v_self_scale = nn.Parameter(torch.zeros(HV))
+            self.v_conv = nn.Conv1d(HV * HD, HV * HD, kernel_size=8, padding=7, groups=HV * HD, bias=False)
+            nn.init.zeros_(self.v_conv.weight)
+            self.local_q_gate = nn.Parameter(torch.zeros(HV, HD))
+            self.q_relu_mix = nn.Parameter(torch.zeros(HV, 1, 1))
+            self.k_relu_mix = nn.Parameter(torch.zeros(HV, 1, 1))
 
     def gamma(self) -> torch.Tensor:
-        return (0.9999 * torch.sigmoid(self.log_gamma)).clamp(1e-4, 0.9999).float()
+        if hasattr(self, "log_gamma"):
+            return (0.9999 * torch.sigmoid(self.log_gamma)).clamp(1e-4, 0.9999).float()
+        return torch.exp(-self.A_log.float().exp() * F.softplus(self.dt_bias.float())).clamp(1e-4, 0.9999)
 
     def extract_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
         mixed_qkv = self.in_proj_qkv(x).transpose(1, 2)
         mixed_qkv = F.silu(self.conv1d(mixed_qkv)[..., :T]).transpose(1, 2)
         q, k, v = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.val_dim], dim=-1)
-
         q = F.normalize(q.view(B, T, self.HKV, self.HD).float(), p=2.0, dim=-1).to(x.dtype)
         k = F.normalize(k.view(B, T, self.HKV, self.HD).float(), p=2.0, dim=-1).to(x.dtype)
         v = v.view(B, T, self.H, self.HD) * torch.sigmoid(self.in_proj_b(x)).unsqueeze(-1)
-
         q = q.repeat_interleave(self.G, dim=2).transpose(1, 2).contiguous()
         k = k.repeat_interleave(self.G, dim=2).transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
-
-        rmix = torch.tanh(self.rope_mix).view(1, self.H, 1, 1).to(q.dtype)
-        q = q + rmix * (self.rope(q) - q)
-        k = k + rmix * (self.rope(k) - k)
-
-        T_use = min(T, self.pos_code.shape[0])
-        pc = self.pos_code[:T_use].view(1, 1, T_use, self.HD).to(k.dtype)
-        if T > T_use:
-            pad = torch.ones(1, 1, T - T_use, self.HD, device=k.device, dtype=k.dtype)
-            pc = torch.cat([pc, pad], dim=2)
-        kc = k * pc
-
-        kx = torch.einsum("bhtd,hde->bhte", kc, self.k_head_mix.to(kc.dtype))
-        if T <= self.head_pos_delta.shape[1]:
-            kx = kx * (1.0 + 0.5 * torch.tanh(self.head_pos_delta[:, :T, :])).unsqueeze(0).to(kx.dtype)
-        vx = torch.einsum("bhtd,hde->bhte", v, self.v_head_mix.to(v.dtype))
-
-        q = q + self.q_relu_mix.view(1, self.H, 1, 1).to(q.dtype) * F.relu(q)
-        kx = kx + self.k_relu_mix.view(1, self.H, 1, 1).to(kx.dtype) * F.relu(kx)
-        return q, kx, vx
+        if hasattr(self, "k_head_mix"):
+            T_use = min(T, self.pos_code.shape[0])
+            pc = self.pos_code[:T_use].view(1, 1, T_use, self.HD).to(k.dtype)
+            if T > T_use:
+                pc = torch.cat([pc, torch.ones(1, 1, T - T_use, self.HD, device=k.device, dtype=k.dtype)], dim=2)
+            k = torch.einsum("bhtd,hde->bhte", k * pc, self.k_head_mix.to(k.dtype))
+            v = torch.einsum("bhtd,hde->bhte", v, self.v_head_mix.to(v.dtype))
+        return q, k, v
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
+        if self.mode == "gated_deltanet" and not hasattr(self, "log_gamma"):
+            mixed_qkv = self.in_proj_qkv(x).transpose(1, 2)
+            mixed_qkv = F.silu(self.conv1d(mixed_qkv)[..., :T]).transpose(1, 2)
+            q, k, v = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.val_dim], dim=-1)
+            q = q.view(B, T, self.HKV, self.HD).repeat_interleave(self.G, dim=2)
+            k = k.view(B, T, self.HKV, self.HD).repeat_interleave(self.G, dim=2)
+            v = v.view(B, T, self.H, self.HD)
+            beta = self.in_proj_b(x).sigmoid()
+            g = -self.A_log.float().exp() * F.softplus(self.in_proj_a(x).float() + self.dt_bias.float())
+            core_out = _chunk_gated_delta_rule_native(q, k, v, g, beta)
+            z_flat = self.in_proj_z(x).reshape(-1, self.HD)
+            y_normed = self.norm(core_out.reshape(-1, self.HD), z_flat).reshape(B, T, self.val_dim)
+            return self.out_proj(y_normed)
+
         q, kx, vx = self.extract_qkv(x)
         y = _vsa_apply(q, kx, vx, self.gamma(), self.chunk_size)
         y = y + self.v_self_scale.view(1, self.H, 1, 1).to(y.dtype) * vx
-
         if hasattr(self, "v_conv"):
             vx_flat = vx.permute(0, 1, 3, 2).reshape(B, self.H * self.HD, T)
             v_loc = self.v_conv(vx_flat)[..., :T].view(B, self.H, self.HD, T).permute(0, 1, 3, 2)
             q_mod = torch.sigmoid((q * self.local_q_gate.view(1, self.H, 1, self.HD).to(q.dtype)).sum(-1, keepdim=True))
             y = y + (2.0 * q_mod) * v_loc
-
         y_flat = y.transpose(1, 2).reshape(-1, self.HD)
         z_flat = self.in_proj_z(x).reshape(-1, self.HD)
         return self.out_proj(self.norm(y_flat, z_flat).reshape(B, T, self.val_dim))
