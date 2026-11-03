@@ -13,12 +13,13 @@
 :root{
   --bg:#120e1c;
   --bg-card:#191328;
+  --bg-card-hover:#221a36;
   --bg-alt:#1e1730;
   --cream:#faf4eb;
+  --cream-dim:#dcd1eb;
   --muted:#a99bbd;
-  --border:#2e2246;
+  --border:#2b2044;
   --border-strong:#000;
-  /* Mistral sunset meeting twilight purple */
   --amber:#ffb83e;
   --orange:#ff7828;
   --coral:#f43f5e;
@@ -29,78 +30,163 @@
   --px:'Press Start 2P',monospace;
   --mono:'VT323',monospace;
 }
+
 *{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--cream);font:16px/1.65 Inter,system-ui,sans-serif;overflow-x:hidden;-webkit-font-smoothing:antialiased}
-body:before{content:"";position:fixed;inset:0;pointer-events:none;z-index:-1;background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:28px 28px}
-a{color:var(--lilac);text-decoration:none}
+body{
+  background:var(--bg);
+  color:var(--cream);
+  font:16px/1.65 Inter,system-ui,sans-serif;
+  overflow-x:hidden;
+  -webkit-font-smoothing:antialiased;
+}
+body:before{
+  content:"";
+  position:fixed;
+  inset:0;
+  pointer-events:none;
+  z-index:-1;
+  background-image:linear-gradient(rgba(255,255,255,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.022) 1px,transparent 1px);
+  background-size:28px 28px;
+}
+a{color:var(--lilac);text-decoration:none;transition:color .15s}
 a:hover{color:var(--amber)}
 ::selection{background:var(--purple);color:#fff}
 
-/* NAV + XP BAR */
-nav{position:fixed;top:0;left:0;right:0;z-index:50;display:flex;align-items:center;justify-content:space-between;padding:12px 5vw;background:rgba(18,14,28,.88);backdrop-filter:blur(10px);border-bottom:3px solid var(--border-strong)}
+/* NAV */
+nav{
+  position:fixed;
+  top:0;left:0;right:0;
+  z-index:50;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:12px 5vw;
+  background:rgba(18,14,28,.88);
+  backdrop-filter:blur(10px);
+  border-bottom:3px solid var(--border-strong);
+}
 .logo{display:flex;align-items:center;gap:12px;font:13px var(--px);color:var(--cream);letter-spacing:1px}
 .logo i{display:grid;grid-template-columns:repeat(3,7px);gap:1px}
 .logo i b{width:7px;height:7px;display:block}
-nav ul{display:flex;gap:22px;list-style:none;font:20px var(--mono)}
-nav ul a{color:var(--muted);transition:color .15s}
+nav ul{display:flex;gap:26px;list-style:none;font:21px var(--mono)}
+nav ul a{color:var(--muted)}
 nav ul a:hover{color:var(--amber)}
-.xp{position:fixed;top:54px;left:0;right:0;height:7px;background:#1a1228;z-index:49;border-bottom:2px solid var(--border-strong)}
+.xp{position:fixed;top:54px;left:0;right:0;height:6px;background:#181126;z-index:49;border-bottom:2px solid var(--border-strong)}
 .xp b{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--amber),var(--coral),var(--purple),var(--lilac))}
-.lv{position:fixed;top:66px;left:50%;transform:translateX(-50%);z-index:49;font:10px var(--px);color:var(--amber);background:rgba(18,14,28,.9);padding:2px 8px;border:2px solid #000;text-shadow:1px 1px 0 #000}
+.lv{position:fixed;top:66px;left:50%;transform:translateX(-50%);z-index:49;font:10px var(--px);color:var(--amber);background:rgba(18,14,28,.92);padding:3px 10px;border:2px solid #000;box-shadow:inset 1px 1px 0 rgba(255,184,62,.3)}
 
 /* HERO */
-.hero{position:relative;height:100vh;min-height:620px;overflow:hidden}
+.hero{position:relative;height:100vh;min-height:640px;overflow:hidden}
 #sky{position:absolute;inset:0;width:100%;height:100%}
-.hero-inner{position:relative;z-index:2;max-width:1120px;margin:0 auto;padding:18vh 5vw 0}
+.hero-inner{position:relative;z-index:2;max-width:1120px;margin:0 auto;padding:17vh 5vw 0}
 .tagline{display:inline-flex;align-items:center;gap:8px;font:11px/1 var(--px);color:var(--amber);background:rgba(25,19,40,.9);padding:7px 12px;border:2px solid #000;margin-bottom:18px;box-shadow:inset 2px 2px 0 rgba(255,184,62,.2)}
 .tagline:before{content:"";width:8px;height:8px;background:var(--coral);display:inline-block}
 h1{font:clamp(40px,9.5vw,112px)/1.05 var(--px);margin-top:4px;color:var(--cream);text-shadow:4px 4px 0 var(--coral),8px 8px 0 var(--violet),12px 12px 0 #000}
 h1 span{color:var(--amber)}
-.lede{max-width:620px;font-size:clamp(16px,1.9vw,19px);margin:26px 0 24px;color:#ded3eb;text-shadow:0 2px 4px rgba(0,0,0,.6)}
+.lede{max-width:640px;font-size:clamp(16px,1.9vw,20px);line-height:1.6;margin:24px 0;color:var(--cream-dim);text-shadow:0 2px 4px rgba(0,0,0,.6)}
 .chips{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:30px}
 .chip{font:20px/1.2 var(--mono);background:rgba(25,19,40,.88);padding:5px 12px;border:2px solid #000;box-shadow:inset 2px 2px 0 #3b2c56}
 .chip b{color:var(--amber);font-weight:400}
-.btn{display:inline-block;font:11px/1 var(--px);padding:15px 18px;margin:0 10px 10px 0;color:#fff;background:#2d2146;border:3px solid #000;box-shadow:inset 2px 2px 0 #523b7e,inset -2px -2px 0 #171026;text-shadow:1px 1px 0 #000;transition:transform .1s,background .15s}
-.btn:hover{background:#3e2e60;transform:translateY(-1px)}
-.btn.pri{background:var(--coral);box-shadow:inset 2px 2px 0 #ffa3b4,inset -2px -2px 0 #9f1239;text-shadow:1px 1px 0 #5e0a22}
-.btn.pri:hover{background:#fb5b7a}
+.btn{display:inline-block;font:11px/1 var(--px);padding:14px 18px;margin:0 10px 10px 0;color:#fff;background:#2b2042;border:3px solid #000;box-shadow:inset 2px 2px 0 #4a3670,inset -2px -2px 0 #130d1f;text-shadow:1px 1px 0 #000;transition:transform .1s,background .15s}
+.btn:hover{background:#382956;transform:translateY(-1px)}
+.btn.pri{background:var(--coral);box-shadow:inset 2px 2px 0 #ffa0b2,inset -2px -2px 0 #9f1239;text-shadow:1px 1px 0 #5c071d}
+.btn.pri:hover{background:#fb5575}
 .cue{position:absolute;bottom:22px;left:50%;transform:translateX(-50%);z-index:3;font:10px var(--px);color:var(--amber);text-shadow:2px 2px 0 #000;animation:bob 1.4s steps(2) infinite}
 @keyframes bob{50%{transform:translate(-50%,6px)}}
 
-/* MISTRAL STRIPE */
 .stripe{height:16px;background:linear-gradient(90deg,var(--amber) 0%,var(--orange) 22%,var(--coral) 45%,var(--purple) 70%,var(--lilac) 88%,var(--cyan) 100%);border-top:3px solid #000;border-bottom:3px solid #000}
 
-/* SCROLLY */
-.scrolly{position:relative;height:var(--len,420vh)}
-.stage{position:sticky;top:0;height:100vh;display:grid;grid-template-columns:minmax(300px,38%) 1fr;gap:4vw;align-items:center;padding:84px 5vw 30px;max-width:1400px;margin:0 auto}
-.copy{display:flex;flex-direction:column;gap:18px;height:min(70vh,560px)}
-.chap .kicker{font:20px var(--mono);color:var(--amber);letter-spacing:1px;text-transform:uppercase}
-.chap h2{font:clamp(16px,2vw,22px)/1.5 var(--px);margin-top:6px;text-shadow:2px 2px 0 #281442}
-.dots{display:flex;gap:6px}
-.dots i{width:14px;height:14px;background:#241b36;border:2px solid #000;box-shadow:inset -2px -2px 0 #120d1c}
-.dots i.on{background:var(--coral);box-shadow:inset -2px -2px 0 #9f1239,inset 2px 2px 0 #ff99ab}
-.steps{position:relative;flex:1}
-.step{position:absolute;left:0;right:0;top:0;opacity:0;transform:translateY(22px);transition:opacity .4s ease-out,transform .4s ease-out;pointer-events:none}
-.step.on{opacity:1;transform:none;pointer-events:auto}
-.step h3{font:13px/1.7 var(--px);color:var(--lilac);margin-bottom:10px}
-.step p{color:var(--muted);font-size:16px}
-.step b{color:var(--cream);font-weight:600}
-.step code,.sec code{font:20px var(--mono);color:var(--amber);background:rgba(0,0,0,.35);padding:1px 6px;border:1px solid #36264f}
-.view{position:relative;height:min(76vh,640px);background:#130e20;border:4px solid #000;box-shadow:inset 3px 3px 0 #2f214a,inset -3px -3px 0 #08050e,8px 8px 0 #000}
-.view canvas{width:100%;height:100%;display:block;image-rendering:pixelated}
+/* BRAID-STYLE SCROLLYTELLING CONTAINER (Cards Left, Animation Right) */
+.scrolly-section{position:relative;padding:40px 0 60px}
+.scrolly-container{
+  max-width:1400px;
+  margin:0 auto;
+  padding:0 5vw;
+  display:grid;
+  grid-template-columns:minmax(320px,40%) 1fr;
+  gap:4.5vw;
+  align-items:start;
+}
+
+/* Scrolling Cards on Left */
+.story-steps{
+  display:flex;
+  flex-direction:column;
+  padding:12vh 0 34vh;
+  order:1;
+}
+.story-step{
+  min-height:46vh;
+  display:flex;
+  align-items:center;
+  opacity:0.32;
+  transform:translateY(16px);
+  transition:opacity .35s ease,transform .35s ease;
+}
+.story-step.active{
+  opacity:1;
+  transform:translateY(0);
+}
+.story-card{
+  width:100%;
+  background:var(--bg-card);
+  border:3px solid #000;
+  box-shadow:inset 2px 2px 0 #31234c,inset -2px -2px 0 #08050e,6px 6px 0 #000;
+  padding:26px 28px;
+  position:relative;
+  transition:box-shadow .2s ease;
+}
+.story-step.active .story-card{
+  box-shadow:inset 2px 2px 0 #4a3670,inset -2px -2px 0 #08050e,6px 6px 0 #000,0 0 22px rgba(168,85,247,0.18);
+}
+.story-step.active .story-card:before{
+  content:"";
+  position:absolute;
+  top:0;left:0;right:0;
+  height:4px;
+  background:linear-gradient(90deg,var(--amber),var(--coral),var(--purple));
+}
+.story-rate{
+  display:inline-block;
+  font:18px var(--mono);
+  color:var(--amber);
+  text-transform:uppercase;
+  letter-spacing:1px;
+  margin-bottom:8px;
+}
+.story-card h3{font:13px/1.6 var(--px);color:var(--lilac);margin-bottom:12px}
+.story-card p{color:var(--muted);font-size:16px;line-height:1.65}
+.story-card b{color:var(--cream);font-weight:600}
+.story-card code,.sec code{font:20px var(--mono);color:var(--amber);background:rgba(0,0,0,.4);padding:1px 6px;border:1px solid #36264f}
+
+/* Sticky Graphic on Right */
+.story-graphic{
+  position:sticky;
+  top:84px;
+  height:min(76vh,630px);
+  background:#130e20;
+  border:4px solid #000;
+  box-shadow:inset 3px 3px 0 #2d1f46,inset -3px -3px 0 #07040d,8px 8px 0 #000;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+  order:2;
+}
+.story-graphic canvas{width:100%;height:100%;display:block;image-rendering:pixelated}
 
 /* REGULAR SECTIONS */
-.sec{max-width:1120px;margin:0 auto;padding:120px 5vw 60px}
+.sec{max-width:1120px;margin:0 auto;padding:110px 5vw 60px}
 .sec .kicker{font:20px var(--mono);color:var(--amber);letter-spacing:1px;text-transform:uppercase}
 .sec h2{font:clamp(18px,2.4vw,28px)/1.4 var(--px);margin:8px 0 16px;text-shadow:2px 2px 0 #281442}
-.sec>p{color:var(--muted);max-width:740px;margin-bottom:28px}
+.sec>p{color:var(--muted);max-width:760px;margin-bottom:28px}
 .scroll-x{overflow-x:auto;padding-bottom:8px}
-.inv{width:100%;border-collapse:separate;border-spacing:3px;font:21px/1.25 var(--mono);min-width:640px}
+.inv{width:100%;border-collapse:separate;border-spacing:3px;font:21px/1.25 var(--mono);min-width:660px}
 .inv th{font:9px/1.6 var(--px);color:var(--amber);text-align:left;padding:12px;background:#0d0917;border:2px solid #000}
 .inv td{background:var(--bg-card);padding:10px 12px;color:var(--muted);border:2px solid #000;box-shadow:inset 2px 2px 0 #2b1f42}
 .inv td:first-child{color:var(--cream)}
 .inv .w{color:var(--amber)}
+
 .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
 .card{background:var(--bg-card);border:3px solid #000;box-shadow:inset 2px 2px 0 #33244e,inset -2px -2px 0 #0a0712,6px 6px 0 #000;padding:22px;position:relative}
 .card:before{content:"";position:absolute;top:0;left:0;right:0;height:4px;background:linear-gradient(90deg,var(--amber),var(--coral),var(--purple))}
@@ -109,18 +195,15 @@ h1 span{color:var(--amber)}
 .card .big{font:44px/1 var(--mono);color:var(--amber);margin:8px 0}
 pre{background:#0a0712;border:3px solid #000;box-shadow:inset 2px 2px 0 #24183a;padding:18px 20px;overflow:auto;font:13.5px/1.7 ui-monospace,Menlo,Consolas,monospace;color:#f3e8ff;margin:14px 0 24px}
 pre .c{color:#7f6e98}
-.reveal{opacity:1;transform:none}
+
 footer{border-top:3px solid #000;background:#090610;padding:44px 5vw;text-align:center;font:20px var(--mono);color:#7f6e98}
 footer a{color:var(--lilac)}
 
 @media (max-width:860px){
-  nav ul{display:none}
-  .stage{grid-template-columns:1fr;grid-template-rows:50vh auto;gap:16px;padding:74px 14px 14px;align-items:start}
-  .view{order:-1;height:50vh;box-shadow:inset 3px 3px 0 #2f214a,inset -3px -3px 0 #08050e,4px 4px 0 #000}
-  .copy{height:auto;gap:10px}
-  .chap h2{font-size:13px}
-  .steps{min-height:34vh}
-  .step p{font-size:15px}
+  .scrolly-container{grid-template-columns:1fr;gap:18px;padding:20px 14px}
+  .story-graphic{position:sticky;top:64px;height:48vh;box-shadow:inset 3px 3px 0 #2d1f46,inset -3px -3px 0 #07040d,4px 4px 0 #000;z-index:20;order:1}
+  .story-steps{padding:10px 0 40px;order:2}
+  .story-step{min-height:auto;margin-bottom:34px}
 }
 </style>
 </head>
@@ -136,218 +219,307 @@ footer a{color:var(--lilac)}
     VSA-LM
   </a>
   <ul>
-    <li><a href="#problem">[01] Problem</a></li>
-    <li><a href="#how">[02] Mechanics</a></li>
-    <li><a href="#race">[03] Speed</a></li>
-    <li><a href="#forget">[04] Unlearn</a></li>
-    <li><a href="#compare">[05] Compare</a></li>
-    <li><a href="#start">[06] Build</a></li>
+    <li><a href="#models">Models</a></li>
+    <li><a href="#start">Build</a></li>
+    <li><a href="https://github.com/Rikka3/vsa-lm" target="_blank" rel="noopener">GitHub ↗</a></li>
   </ul>
 </nav>
 <div class="xp"><b id="xpb"></b></div>
 <div class="lv" id="lv">LV 0</div>
 
+<!-- HERO -->
 <header class="hero" id="top">
   <canvas id="sky"></canvas>
   <div class="hero-inner">
-    <div class="tagline">OPEN SOURCE · MIT · LINEAR RECURRENT ATTENTION</div>
+    <div class="tagline">OPEN SOURCE · MIT · LINEAR ATTENTION</div>
     <h1>VSA<span>-LM</span></h1>
-    <p class="lede">A language model that folds context into a <b>fixed-size block</b> instead of an ever-growing KV cache. 75% of attention layers condense the past into one D×D matrix per head.</p>
+    <p class="lede">A language model that remembers in a <b>fixed-size block</b> instead of an ever-growing KV cache. 75% of attention layers fold the entire past into one D×D matrix per head.</p>
     <div class="chips">
       <span class="chip"><b>−75%</b> KV RAM</span>
       <span class="chip"><b>2.43×</b> decode @ 64k</span>
       <span class="chip"><b>&lt;1 ms</b> exact forget</span>
-      <span class="chip"><b>0 bytes</b> KV growth during CoT</span>
+      <span class="chip"><b>0 bytes</b> KV growth while thinking</span>
     </div>
-    <a class="btn pri" href="https://github.com/Rikka3/vsa-lm">View on GitHub</a>
-    <a class="btn" href="https://huggingface.co/rikkathree/vsa-lm">Models on Hugging Face</a>
+    <a class="btn pri" href="https://github.com/Rikka3/vsa-lm" target="_blank" rel="noopener">View on GitHub</a>
+    <a class="btn" href="https://huggingface.co/rikkathree" target="_blank" rel="noopener">Models on Hugging Face</a>
   </div>
   <div class="cue">SCROLL ▼</div>
 </header>
 <div class="stripe"></div>
 
 <!-- 1. PROBLEM -->
-<section class="scrolly" id="problem" data-scene="kv" style="--len:380vh">
-  <div class="stage">
-    <div class="copy">
-      <div class="chap"><p class="kicker">[ CHAPTER 01 // PROBLEM ]</p><h2>Every token leaves a brick behind</h2></div>
-      <div class="dots"></div>
-      <div class="steps">
-        <div class="step"><h3>A transformer never forgets</h3><p>For every token, every attention layer stores a <b>key</b> and a <b>value</b> vector. That pile is the <b>KV cache</b>, and it only ever grows. Scroll down to feed it tokens.</p></div>
-        <div class="step"><h3>Memory grows linearly</h3><p>For Llama-3.2-1B the cache is <b>16 MB at 512 tokens</b> and <b>2,048 MB at 65,536</b>. Long chats, large documents and deep reasoning traces all pay that rent.</p></div>
-        <div class="step"><h3>…and decoding slows down</h3><p>Each new token has to attend over the whole pile. Measured decode speed drops from <b>148 tok/s</b> to <b>51 tok/s</b> at 64k context.</p></div>
+<section class="scrolly-section" id="problem" data-scene="kv">
+  <div class="scrolly-container">
+    <div class="story-steps">
+      <div class="story-step active">
+        <div class="story-card">
+          <span class="story-rate">Chapter 01 · Step 01</span>
+          <h3>A transformer never forgets</h3>
+          <p>For every token, every attention layer stores a <b>key</b> and a <b>value</b> vector. That pile is the <b>KV cache</b>, and it only ever grows. Scroll down to stream tokens into it.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 01 · Step 02</span>
+          <h3>Memory grows linearly</h3>
+          <p>For Llama-3.2-1B the cache is <b>16 MB at 512 tokens</b> and <b>2,048 MB at 65,536</b>. Long chats, large documents and long reasoning traces all pay that rent.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 01 · Step 03</span>
+          <h3>…and decoding slows down</h3>
+          <p>Each new token has to attend over the whole pile. Measured decode speed drops from <b>148 tok/s</b> down to <b>51 tok/s</b> at 64k context.</p>
+        </div>
       </div>
     </div>
-    <div class="view"><canvas></canvas></div>
+    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
 
 <!-- 2. HOW -->
-<section class="scrolly" id="how" data-scene="vsa" style="--len:480vh">
-  <div class="stage">
-    <div class="copy">
-      <div class="chap"><p class="kicker">[ CHAPTER 02 // MECHANICS ]</p><h2>Fold the past into one fixed block</h2></div>
-      <div class="dots"></div>
-      <div class="steps">
-        <div class="step"><h3>1 · Project</h3><p>Each incoming token is projected into a key <b>k</b> and a value <b>v</b>. VSA-LM uses positive, sharpened features plus an 8-tap causal local convolution.</p></div>
-        <div class="step"><h3>2 · Bind with an outer product</h3><p><b>k ⊗ v</b> turns two vectors into a D×D imprint of the token. Every cell is <code>k[i]·v[j]</code>.</p></div>
-        <div class="step"><h3>3 · Decay and add</h3><p><code>M_t = γ·M_(t−1) + k_t ⊗ v_t</code><br>Old imprints fade by γ while new ones are stacked on top. Learned multi-scale decay (<b>γ ∈ [0.50, 0.992]</b>) gives both short- and long-memory heads. <b>The matrix never gets bigger.</b></p></div>
-        <div class="step"><h3>4 · Read with the query</h3><p><code>y_t = (1−γ)/√D · M_t q_t</code><br>One matrix–vector product per token, regardless of context length. That is <b>O(1) decode</b>, executed in a fused Triton kernel.</p></div>
+<section class="scrolly-section" id="how" data-scene="vsa">
+  <div class="scrolly-container">
+    <div class="story-steps">
+      <div class="story-step active">
+        <div class="story-card">
+          <span class="story-rate">Chapter 02 · Step 01</span>
+          <h3>1 · Project &amp; local conv</h3>
+          <p>Each incoming token is projected into a key <b>k</b> and a value <b>v</b>. VSA-LM uses positive, sharpened features plus an 8-tap causal local convolution.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 02 · Step 02</span>
+          <h3>2 · Bind with an outer product</h3>
+          <p><code>k ⊗ v</code> turns two vectors into a D×D imprint of the token. Every cell contains <code>k[i]·v[j]</code>.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 02 · Step 03</span>
+          <h3>3 · Decay and add</h3>
+          <p><code>M_t = γ·M_(t−1) + k_t ⊗ v_t</code><br>Old imprints fade by γ while new ones are stacked on top. Learned multi-scale decay (<b>γ ∈ [0.50, 0.992]</b>) gives both short- and long-memory heads. <b>The matrix never gets bigger.</b></p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 02 · Step 04</span>
+          <h3>4 · Read with the query</h3>
+          <p><code>y_t = (1−γ)/√D · M_t q_t</code><br>One matrix–vector product per token, however long the context is. That is <b>O(1) decode</b>, done in a fused Triton kernel.</p>
+        </div>
       </div>
     </div>
-    <div class="view"><canvas></canvas></div>
+    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
 
 <!-- 3. RACE -->
-<section class="scrolly" id="race" data-scene="race" style="--len:400vh">
-  <div class="stage">
-    <div class="copy">
-      <div class="chap"><p class="kicker">[ CHAPTER 03 // BENCHMARK ]</p><h2>Same architecture family. Longer context.</h2></div>
-      <div class="dots"></div>
-      <div class="steps">
-        <div class="step"><h3>Short context: a tie</h3><p>From 512 to 8k tokens both models decode at about <b>149 tok/s</b>, but VSA carries a far smaller cache footprint (<b>67 MB vs 256 MB</b> at 8k).</p></div>
-        <div class="step"><h3>32k: pulling away</h3><p>The standard transformer slows to <b>85.5 tok/s</b>. VSA-Llama holds <b>149.7 tok/s</b>, which is <b>1.75× faster</b>.</p></div>
-        <div class="step"><h3>64k: 2.43× faster, 4× smaller</h3><p><b>124.7 vs 51.4 tok/s</b> and <b>515 MB vs 2,048 MB</b> of cache (−74.9%). Measured benchmarks on VSA-Llama-3.2-1B vs original Llama-3.2-1B.</p></div>
+<section class="scrolly-section" id="race" data-scene="race">
+  <div class="scrolly-container">
+    <div class="story-steps">
+      <div class="story-step active">
+        <div class="story-card">
+          <span class="story-rate">Chapter 03 · Step 01</span>
+          <h3>Short context: a tie</h3>
+          <p>From 512 to 8k tokens both models decode at about <b>149 tok/s</b>, but VSA already carries a far smaller cache footprint (<b>67 MB vs 256 MB</b> at 8k).</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 03 · Step 02</span>
+          <h3>32k: pulling away</h3>
+          <p>The standard transformer slows to <b>85.5 tok/s</b>. VSA-Llama holds <b>149.7 tok/s</b>, which is <b>1.75× faster</b>.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 03 · Step 03</span>
+          <h3>64k: 2.43× faster, 4× smaller</h3>
+          <p><b>124.7 vs 51.4 tok/s</b> and <b>515 MB vs 2,048 MB</b> of cache (−74.9%). Measured benchmarks for VSA-Llama-3.2-1B vs original unquantized Llama-3.2-1B.</p>
+        </div>
       </div>
     </div>
-    <div class="view"><canvas></canvas></div>
+    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
 
 <!-- 4. HYBRID -->
-<section class="scrolly" id="hybrid" data-scene="tower" style="--len:340vh">
-  <div class="stage">
-    <div class="copy">
-      <div class="chap"><p class="kicker">[ CHAPTER 04 // HYBRID STACK ]</p><h2>Three VSA layers for every softmax layer</h2></div>
-      <div class="dots"></div>
-      <div class="steps">
-        <div class="step"><h3>75% VSA · 25% softmax</h3><p>Every 4th layer keeps exact softmax attention as an anchor for precise recall. The other <b>three of every four</b> layers compress context into a fixed state, so only the amber layers' caches grow.</p></div>
-        <div class="step"><h3>Convert any donor model</h3><p>A Hugging Face model is surgically converted in about <b>20–30 seconds</b>, then healed with <b>VSA-FastDistill</b> from the donor. Supported donors: Llama, Qwen, DeepSeek-Distill, Mistral and SmolLM.</p></div>
+<section class="scrolly-section" id="hybrid" data-scene="tower">
+  <div class="scrolly-container">
+    <div class="story-steps">
+      <div class="story-step active">
+        <div class="story-card">
+          <span class="story-rate">Chapter 04 · Step 01</span>
+          <h3>75% VSA · 25% softmax</h3>
+          <p>Every 4th layer keeps exact softmax attention as an anchor for precise recall. The other <b>three of every four</b> layers compress context into a fixed state, so only the anchor layers' caches grow.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 04 · Step 02</span>
+          <h3>Convert any donor model</h3>
+          <p>A Hugging Face model is surgically converted in about <b>20–30 seconds</b>, then healed with <b>VSA-FastDistill</b> from the donor. Tricks include GQA head un-tying, causal conv and multi-scale decay. Supported donors: Llama, Qwen, DeepSeek-Distill, Mistral and SmolLM.</p>
+        </div>
       </div>
     </div>
-    <div class="view"><canvas></canvas></div>
+    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
 
 <!-- 5. FORGET -->
-<section class="scrolly" id="forget" data-scene="forget" style="--len:400vh">
-  <div class="stage">
-    <div class="copy">
-      <div class="chap"><p class="kicker">[ CHAPTER 05 // EXACT UNLEARNING ]</p><h2>Memorize. Then subtract it back out.</h2></div>
-      <div class="dots"></div>
-      <div class="steps">
-        <div class="step"><h3>memorize(doc)</h3><p>A document is streamed into live state. Each token adds its decayed <code>k⊗v</code> imprint into the <b>same</b> fixed matrix, with no new rows and no cache bloat.</p></div>
-        <div class="step"><h3>The state is linear</h3><p>M is a plain sum of outer products, so the model knows exactly how much each document contributed. Standard transformers have no equivalent mechanism.</p></div>
-        <div class="step"><h3>forget(doc)</h3><p><code>M ← M − Σ γ^Δt · k_t ⊗ v_t</code><br>The document is removed surgically in <b>under 1 ms</b>, with <b>residual error below 1e-5</b>.</p></div>
+<section class="scrolly-section" id="forget" data-scene="forget">
+  <div class="scrolly-container">
+    <div class="story-steps">
+      <div class="story-step active">
+        <div class="story-card">
+          <span class="story-rate">Chapter 05 · Step 01</span>
+          <h3>memorize(doc)</h3>
+          <p>A document is streamed into the live state. Each token adds its decayed <code>k⊗v</code> imprint into the <b>same</b> fixed matrix, with no new rows and no new cache.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 05 · Step 02</span>
+          <h3>The state is linear</h3>
+          <p>M is a plain sum of outer products, so the model knows exactly how much each document contributed. Transformers have no equivalent handle on their weights or cache.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 05 · Step 03</span>
+          <h3>forget(doc)</h3>
+          <p><code>M ← M − Σ γ^Δt · k_t ⊗ v_t</code><br>The document is removed surgically in <b>under 1 ms</b>, with <b>residual error below 1e-5</b>.</p>
+        </div>
       </div>
     </div>
-    <div class="view"><canvas></canvas></div>
+    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
 
 <!-- 6. CARTRIDGES -->
-<section class="scrolly" id="cartridges" data-scene="cart" style="--len:400vh">
-  <div class="stage">
-    <div class="copy">
-      <div class="chap"><p class="kicker">[ CHAPTER 06 // CARTRIDGES ]</p><h2>Context as cartridges on disk</h2></div>
-      <div class="dots"></div>
-      <div class="steps">
-        <div class="step"><h3>Encode to .vsa cartridges</h3><p>Documents or past chats are encoded into compact <code>.vsa</code> state files on your SSD. They take <b>0.00 MB</b> of idle GPU/CPU RAM.</p></div>
-        <div class="step"><h3>Route the query</h3><p>A question comes in, and the bank routes to the right cartridge in <b>under 20 ms</b>.</p></div>
-        <div class="step"><h3>Mount, answer, unmount</h3><p>The state is mounted, the model answers, and the state is algebraically erased. In tests, R1-Qwen-1.5B achieved <b>4/4 exact secret retrieval</b> with a <b>0.0 erase residual</b>.</p></div>
+<section class="scrolly-section" id="cartridges" data-scene="cart">
+  <div class="scrolly-container">
+    <div class="story-steps">
+      <div class="story-step active">
+        <div class="story-card">
+          <span class="story-rate">Chapter 06 · Step 01</span>
+          <h3>Encode to .vsa cartridges</h3>
+          <p>Documents or past chats are encoded into compact <code>.vsa</code> state files on your SSD. They take <b>0.00 MB</b> of idle GPU/CPU RAM.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 06 · Step 02</span>
+          <h3>Route the query</h3>
+          <p>A question comes in, and the bank routes to the right cartridge in <b>under 20 ms</b>.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 06 · Step 03</span>
+          <h3>Mount, answer, unmount</h3>
+          <p>The state is mounted, the model answers, and the state is then algebraically erased. In tests, the R1-Qwen-1.5B conversion scored <b>4/4 exact secret retrieval</b> with a <b>0.0 erase residual</b>.</p>
+        </div>
       </div>
     </div>
-    <div class="view"><canvas></canvas></div>
+    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
 
 <!-- 7. THINK -->
-<section class="scrolly" id="think" data-scene="think" style="--len:340vh">
-  <div class="stage">
-    <div class="copy">
-      <div class="chap"><p class="kicker">[ CHAPTER 07 // LATENT REASONING ]</p><h2>Think inside the block, not on the cache</h2></div>
-      <div class="dots"></div>
-      <div class="steps">
-        <div class="step"><h3>K recurrent passes</h3><p>Instead of generating verbose chain-of-thought tokens, the model runs <b>K latent passes</b> entirely inside the fixed VSA state matrices. Softmax KV caches stay frozen.</p></div>
-        <div class="step"><h3>K = 0 → K = 4</h3><p>On VSA-DeepSeek-R1-Qwen-1.5B, answer CE loss drops from <b>1.218 to 0.274</b> and true-token confidence jumps from <b>52.95% to 81.65%</b>. Cache growth is <b>0 bytes</b>.</p></div>
+<section class="scrolly-section" id="think" data-scene="think">
+  <div class="scrolly-container">
+    <div class="story-steps">
+      <div class="story-step active">
+        <div class="story-card">
+          <span class="story-rate">Chapter 07 · Step 01</span>
+          <h3>K recurrent passes</h3>
+          <p>Instead of writing out verbose chain-of-thought tokens that balloon the cache, the model runs <b>K latent passes</b> entirely inside the fixed VSA state matrices. Softmax KV caches stay frozen.</p>
+        </div>
+      </div>
+      <div class="story-step">
+        <div class="story-card">
+          <span class="story-rate">Chapter 07 · Step 02</span>
+          <h3>K = 0 → K = 4</h3>
+          <p>On VSA-DeepSeek-R1-Qwen-1.5B, answer CE loss falls from <b>1.218 to 0.274</b> and true-token confidence rises from <b>52.95% to 81.65%</b>. Memory growth during thinking is <b>0 bytes</b>.</p>
+        </div>
       </div>
     </div>
-    <div class="view"><canvas></canvas></div>
+    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
 
 <!-- COMPARE -->
 <section class="sec" id="compare">
-  <p class="kicker">[ SPECS ]</p>
+  <p class="kicker">Side by side</p>
   <h2>Transformer vs VSA-LM</h2>
-  <p>VSA trades a small fraction of exactness in 75% of layers for constant memory, constant-time decode, and state arithmetic.</p>
+  <p>VSA trades a little exactness in 75% of layers for constant memory, constant-time decode, and a state you can edit with arithmetic.</p>
   <div class="scroll-x"><table class="inv">
     <tr><th>PARAMETER</th><th>STANDARD TRANSFORMER</th><th>VSA-LM HYBRID</th></tr>
     <tr><td>Memory per new token</td><td>K and V appended in every layer</td><td class="w">Fixed D×D state in 75% of layers; only 25% grow</td></tr>
-    <tr><td>Decode cost</td><td>Attends over the full history</td><td class="w">O(1) recurrent step in VSA layers</td></tr>
+    <tr><td>Decode cost</td><td>Attends over the whole history</td><td class="w">O(1) recurrent step in VSA layers</td></tr>
     <tr><td>KV RAM @ 64k (1B)</td><td>2,048 MB</td><td class="w">515 MB (−74.9%)</td></tr>
     <tr><td>Decode @ 64k (1B)</td><td>51.4 tok/s</td><td class="w">124.7 tok/s (2.43×)</td></tr>
     <tr><td>Forget a document</td><td>No exact mechanism</td><td class="w">Algebraic subtraction, &lt;1 ms, residual &lt;1e-5</td></tr>
     <tr><td>Extra reasoning</td><td>Every thought token grows the cache</td><td class="w">Latent passes, 0 bytes KV growth</td></tr>
-    <tr><td>Exact recall</td><td class="w">Every token kept verbatim</td><td>Compressed in VSA layers; softmax anchors keep precision</td></tr>
+    <tr><td>Exact recall</td><td class="w">Every token kept verbatim</td><td>Compressed in VSA layers; softmax layers keep precision</td></tr>
     <tr><td>Quality vs donor</td><td>Baseline</td><td>79.9% top-1 match (R1-Qwen-1.5B) · 1.213× PPL (Llama-1B)</td></tr>
   </table></div>
 </section>
 
 <!-- MODELS -->
 <section class="sec" id="models">
-  <p class="kicker">[ REPOSITORY ]</p>
+  <p class="kicker">Inventory</p>
   <h2>Pretrained &amp; converted models</h2>
   <div class="grid3">
     <div class="card">
       <h3>VSA-DeepSeek-R1-Qwen-1.5B</h3>
       <div class="big">79.9%</div>
       <p>Top-1 match with donor (9.52 vs 10.16 PPL). 21 VSA + 7 softmax, −74.6% KV RAM, full &lt;think&gt; CoT.</p>
-      <p style="margin-top:12px"><a href="https://huggingface.co/rikkathree/vsa-deepseek-r1-qwen-1.5b">rikkathree/vsa-deepseek-r1-qwen-1.5b →</a></p>
+      <p style="margin-top:12px"><a href="https://huggingface.co/rikkathree" target="_blank" rel="noopener">rikkathree/vsa-deepseek-r1-qwen-1.5b →</a></p>
     </div>
     <div class="card">
       <h3>VSA-Llama-3.2-1B</h3>
       <div class="big">2.43×</div>
       <p>Faster decode at 64k. 12 VSA + 4 softmax, 97.1% ARC-Easy and 95.0% PIQA retained, −74.9% KV RAM.</p>
-      <p style="margin-top:12px"><a href="https://huggingface.co/rikkathree/vsa-llama-3.2-1b">rikkathree/vsa-llama-3.2-1b →</a></p>
+      <p style="margin-top:12px"><a href="https://huggingface.co/rikkathree" target="_blank" rel="noopener">rikkathree/vsa-llama-3.2-1b →</a></p>
     </div>
     <div class="card">
       <h3>VSA-LM-100M (scratch)</h3>
       <div class="big">47/48</div>
       <p>Binder multi-doc recall. 6 VSA + 2 softmax trained from scratch on FineWeb-Edu / DCLM; 0.996× donor PPL.</p>
-      <p style="margin-top:12px"><a href="https://huggingface.co/rikkathree/vsa-lm">rikkathree/vsa-lm →</a></p>
+      <p style="margin-top:12px"><a href="https://huggingface.co/rikkathree" target="_blank" rel="noopener">rikkathree/vsa-lm →</a></p>
     </div>
   </div>
 </section>
 
 <!-- BENCH -->
 <section class="sec" id="bench">
-  <p class="kicker">[ HARDWARE RUNS ]</p>
+  <p class="kicker">Measured · fused Triton O(1) decode kernel</p>
   <h2>Speed &amp; memory scaling</h2>
   <div class="scroll-x"><table class="inv">
-    <tr><th>CONTEXT</th><th>LLAMA-3.2-1B</th><th>VSA-LLAMA</th><th>SPEEDUP</th><th>LLAMA CACHE</th><th>VSA CACHE</th><th>SAVED</th></tr>
+    <tr><th>Context</th><th>Llama-3.2-1B</th><th>VSA-Llama</th><th>Speedup</th><th>Llama cache</th><th>VSA cache</th><th>Saved</th></tr>
     <tr><td>512</td><td>148.4 tok/s</td><td class="w">149.2 tok/s</td><td>1.01×</td><td>16 MB</td><td class="w">7 MB</td><td>56.2%</td></tr>
     <tr><td>8,192</td><td>148.9 tok/s</td><td class="w">148.8 tok/s</td><td>1.00×</td><td>256 MB</td><td class="w">67 MB</td><td>73.8%</td></tr>
     <tr><td>16,384</td><td>138.8 tok/s</td><td class="w">149.2 tok/s</td><td>1.08×</td><td>512 MB</td><td class="w">131 MB</td><td>74.4%</td></tr>
-    <tr><td>32,768</td><td>85.5 tok/s</td><td class="w">149.7 tok/s</td><td>1.75×</td><td>1,024 MB</td><td class="w">259 MB</td><td>74.7%</td></tr>
-    <tr><td>65,536</td><td>51.4 tok/s</td><td class="w">124.7 tok/s</td><td>2.43×</td><td>2,048 MB</td><td class="w">515 MB</td><td>74.9%</td></tr>
+    <tr><td>32,768</td><td>85.5 tok/s</td><td class="w">149.7 tok/s</td><td class="w">1.75×</td><td>1,024 MB</td><td class="w">259 MB</td><td>74.7%</td></tr>
+    <tr><td>65,536</td><td>51.4 tok/s</td><td class="w">124.7 tok/s</td><td class="w">2.43×</td><td>2,048 MB</td><td class="w">515 MB</td><td>74.9%</td></tr>
   </table></div>
 </section>
 
 <!-- START -->
 <section class="sec" id="start">
-  <p class="kicker">[ QUICKSTART ]</p>
-  <h2>Terminal Setup</h2>
-<pre><span class="c"># Clone repository &amp; install dependencies</span>
-git clone https://github.com/Rikka3/vsa-lm.git
+  <p class="kicker">Crafting table</p>
+  <h2>Quickstart</h2>
+<pre>git clone https://github.com/Rikka3/vsa-lm.git
 cd vsa-lm
 pip install -r requirements.txt
 
@@ -362,31 +534,59 @@ python -m vsa_lm heal --ckpt deepseek_vsa_init.pth \
 <pre><span class="c"># OpenAI-compatible local server (GPU or CPU-only with INT8)</span>
 python -m vsa_lm serve --ckpt vsa_deepseek_r1_qwen_1.5b.pth \
     --donor deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 8000</pre>
-  <a class="btn pri" href="https://github.com/Rikka3/vsa-lm">Read the full README</a>
+  <a class="btn pri" href="https://github.com/Rikka3/vsa-lm" target="_blank" rel="noopener">Read the full README</a>
 </section>
 
 <footer>
-  VSA-LM · MIT License · © 2026 Rikka3 · <a href="https://github.com/Rikka3/vsa-lm">github.com/Rikka3/vsa-lm</a><br>
+  VSA-LM · MIT License · © 2026 Rikka3 · <a href="https://github.com/Rikka3/vsa-lm" target="_blank" rel="noopener">github.com/Rikka3/vsa-lm</a><br>
   Blocks drawn by hand, in code.
 </footer>
 
 <script>
-const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
-const clamp=(x,a=0,b=1)=>Math.max(a,Math.min(b,x)),lerp=(a,b,t)=>a+(b-a)*t;
-const ease=t=>t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2,seg=(p,a,b)=>clamp((p-a)/(b-a));
+const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+const clamp = (x, a=0, b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t < .5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2)/2;
+const seg = (p, a, b) => clamp((p - a) / (b - a));
+
 function rng(s){return()=>{s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
 function hash(x,y){let h=(Math.round(x)*374761393+Math.round(y)*668265263)|0;h=Math.imul(h^(h>>>13),1274126177);return((h^(h>>>16))>>>0)/4294967296}
 
 /* Mistral Sunset-to-Purple ramp */
-const RAMP=['#130a24','#24103e','#48126b','#7b1c8c','#b5287f','#ea4f52','#ff8c2b','#ffcf4d'].map(h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16)));
+const RAMP = ['#130a24','#24103e','#48126b','#7b1c8c','#b5287f','#ea4f52','#ff8c2b','#ffcf4d'].map(h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16)));
 function ramp(t){t=clamp(t)*(RAMP.length-1);const i=Math.min(RAMP.length-2,Math.floor(t)),f=t-i,a=RAMP[i],b=RAMP[i+1];return`rgb(${a[0]+(b[0]-a[0])*f|0},${a[1]+(b[1]-a[1])*f|0},${a[2]+(b[2]-a[2])*f|0})`}
-function blk(c,x,y,s,col,a=1){if(a<=0)return;x=Math.round(x);y=Math.round(y);s=Math.round(s);c.globalAlpha=a;c.fillStyle=col;c.fillRect(x,y,s,s);const e=Math.max(1,Math.round(s/8));c.fillStyle='rgba(255,255,255,.24)';c.fillRect(x,y,s,e);c.fillRect(x,y,e,s);c.fillStyle='rgba(0,0,0,.35)';c.fillRect(x,y+s-e,s,e);c.fillRect(x+s-e,y,e,s);if(s>=14){c.fillStyle='rgba(0,0,0,.15)';const q=Math.max(2,Math.round(s/6));for(let k=0;k<3;k++){c.fillRect(x+e+Math.floor(hash(x+k*7,y+k*13)*(s-2*e-q)),y+e+Math.floor(hash(y+k*3,x+k)*(s-2*e-q)),q,q)}}c.globalAlpha=1}
-function txt(c,s,x,y,size=10,col='#faf4eb',al='left'){c.font=`${size}px "Press Start 2P",monospace`;c.textAlign=al;c.textBaseline='middle';c.fillStyle='rgba(0,0,0,.75)';c.fillText(s,x+2,y+2);c.fillStyle=col;c.fillText(s,x,y)}
-function mono(c,s,x,y,size=22,col='#a99bbd',al='left'){c.font=`${size}px VT323,monospace`;c.textAlign=al;c.textBaseline='middle';c.fillStyle=col;c.fillText(s,x,y)}
+
+function blk(c,x,y,s,col,a=1){
+  if(a<=0)return;
+  x=Math.round(x);y=Math.round(y);s=Math.round(s);
+  c.globalAlpha=a;c.fillStyle=col;c.fillRect(x,y,s,s);
+  const e=Math.max(1,Math.round(s/8));
+  c.fillStyle='rgba(255,255,255,.24)';c.fillRect(x,y,s,e);c.fillRect(x,y,e,s);
+  c.fillStyle='rgba(0,0,0,.35)';c.fillRect(x,y+s-e,s,e);c.fillRect(x+s-e,y,e,s);
+  if(s>=14){
+    c.fillStyle='rgba(0,0,0,.15)';
+    const q=Math.max(2,Math.round(s/6));
+    for(let k=0;k<3;k++){
+      c.fillRect(x+e+Math.floor(hash(x+k*7,y+k*13)*(s-2*e-q)),y+e+Math.floor(hash(y+k*3,x+k)*(s-2*e-q)),q,q);
+    }
+  }
+  c.globalAlpha=1;
+}
+
+function txt(c,s,x,y,size=10,col='#faf4eb',al='left'){
+  c.font=`${size}px "Press Start 2P",monospace`;c.textAlign=al;c.textBaseline='middle';
+  c.fillStyle='rgba(0,0,0,.75)';c.fillText(s,x+2,y+2);
+  c.fillStyle=col;c.fillText(s,x,y);
+}
+function mono(c,s,x,y,size=22,col='#a99bbd',al='left'){
+  c.font=`${size}px VT323,monospace`;c.textAlign=al;c.textBaseline='middle';
+  c.fillStyle=col;c.fillText(s,x,y);
+}
 const fmt=n=>Math.round(n).toLocaleString('en-US');
 const small=w=>w<520;
 
-/* Benchmark data */
+/* Benchmarks */
 const BL=[9,13,14,15,16],BS=[148.4,148.9,138.8,85.5,51.4],VSs=[149.2,148.8,149.2,149.7,124.7];
 function interp(xs,ys,x){if(x<=xs[0])return ys[0];for(let i=1;i<xs.length;i++)if(x<=xs[i])return lerp(ys[i-1],ys[i],(x-xs[i-1])/(xs[i]-xs[i-1]));return ys[ys.length-1]}
 const baseMB=t=>t/32,vsaMB=t=>3+t/128;
@@ -533,7 +733,7 @@ function think(c,w,h,p,t){
   mono(c,'softmax KV growth while thinking',bx,sy+76,fs);mono(c,'0 bytes',bx+bw,sy+76,fs+2,'#c084fc','right');
 }
 
-/* ---------- Hero sky (Mistral atmospheric sunset) ---------- */
+/* ---------- Hero sky (Mistral dusk) ---------- */
 const sky=$('#sky'),sc=sky.getContext('2d');let SW=0,SH=0;
 function noise1(x,seed){const i=Math.floor(x),f=x-i,u=f*f*(3-2*f);return lerp(hash(i,seed),hash(i+1,seed),u)}
 function drawSky(t){
@@ -555,31 +755,29 @@ function drawSky(t){
   const gr=c.createLinearGradient(0,h*.82,0,h);gr.addColorStop(0,'rgba(18,14,28,0)');gr.addColorStop(1,'rgba(18,14,28,1)');c.fillStyle=gr;c.fillRect(0,h*.82,w,h*.18);
 }
 
-/* ---------- Engine & Lifecycle ---------- */
+/* ---------- Engine (Braid-style sticky tracking) ---------- */
 const SCENES={kv,vsa,race,tower,forget,cart,think};
-const scenes=$$('.scrolly').map(sec=>{
-  const cv=$('canvas',sec),steps=$$('.step',sec),dots=$('.dots',sec);
-  dots.innerHTML=steps.map(()=>'<i></i>').join('');
-  return{sec,cv,ctx:cv.getContext('2d'),steps,dots:$$('i',dots),draw:SCENES[sec.dataset.scene],p:0,w:0,h:0,idx:-1};
+const scenes=$$('.scrolly-section').map(sec=>{
+  const cv=$('canvas',sec),steps=$$('.story-step',sec);
+  return{sec,cv,ctx:cv.getContext('2d'),steps,draw:SCENES[sec.dataset.scene],p:0,w:0,h:0,idx:-1};
 });
 
 function resizeCanvas(s,w,h){
   const d=Math.min(window.devicePixelRatio||1,2);
   s.w=w;s.h=h;
-  s.cv.width=w*d;
-  s.cv.height=h*d;
+  s.cv.width=w*d;s.cv.height=h*d;
   s.ctx.setTransform(d,0,0,d,0,0);
   s.ctx.imageSmoothingEnabled=false;
 }
 
 function resize(){
-  const d=Math.min(window.devicePixelRatio||1,2);
   scenes.forEach(s=>{
     const r=s.cv.getBoundingClientRect();
     if(r.width>0&&r.height>0) resizeCanvas(s,r.width,r.height);
   });
   const r=sky.getBoundingClientRect();
   if(r.width>0&&r.height>0){
+    const d=Math.min(window.devicePixelRatio||1,2);
     SW=r.width;SH=r.height;
     sky.width=SW*d;sky.height=SH*d;
     sc.setTransform(d,0,0,d,0,0);
@@ -595,8 +793,9 @@ function prog(sec){
 }
 
 const xpb=$('#xpb'),lv=$('#lv');
+
 function loop(now){
-  // Check for auto-recovery if dimensions weren't available at init
+  // Self-healing dimensions check
   scenes.forEach(s=>{
     if(s.w===0||s.h===0){
       const r=s.cv.getBoundingClientRect();
@@ -615,21 +814,33 @@ function loop(now){
   }
 
   drawSky(now);
+
   scenes.forEach((s)=>{
     const r=s.sec.getBoundingClientRect();
     if(r.bottom<-100||r.top>window.innerHeight+100) return;
+
+    // Smooth progress interpolation
     const target=prog(s.sec);
     s.p+=(target-s.p)*0.18;
     if(Math.abs(target-s.p)<0.0008) s.p=target;
+
     if(s.w>0&&s.h>0){
       s.ctx.clearRect(0,0,s.w,s.h);
       s.draw(s.ctx,s.w,s.h,s.p,now);
     }
-    const idx=Math.min(s.steps.length-1,Math.floor(target*s.steps.length));
-    if(idx!==s.idx){
-      s.idx=idx;
-      s.steps.forEach((e,k)=>e.classList.toggle('on',k===idx));
-      s.dots.forEach((e,k)=>e.classList.toggle('on',k<=idx));
+
+    // Braid-style center-viewport active step detection
+    const viewCenter=window.innerHeight*0.5;
+    let bestIdx=0,minDist=Infinity;
+    s.steps.forEach((step,i)=>{
+      const sr=step.getBoundingClientRect();
+      const dist=Math.abs((sr.top+sr.height*0.5)-viewCenter);
+      if(dist<minDist){minDist=dist;bestIdx=i;}
+    });
+
+    if(bestIdx!==s.idx){
+      s.idx=bestIdx;
+      s.steps.forEach((e,k)=>e.classList.toggle('active',k===bestIdx));
     }
   });
 
