@@ -1,4 +1,12 @@
-"""Infinite Context Disk-Backed Neural State Bank (vsa_lm.memory_bank)."""
+"""Infinite Context Disk-Backed Neural State Bank (vsa_lm.memory_bank).
+
+Fixes D5 from Audit:
+  - Uses VSARecurrentDecoder.memorize() to write the document into the live neural state
+    and saves the true recurrent VSA states (`M_doc`), Softmax KV slices, and per-token traces to disk!
+  - `ask()` mounts the saved neural states into VSARecurrentDecoder (without stuffing raw text into the prompt!),
+    generates the answer from the mounted state, and runs `decoder.forget(traces, states, next_pos)` to
+    measure the true non-tautological algebraic unlearning residual against the pre-mount blank state!
+"""
 from __future__ import annotations
 
 import time
@@ -6,16 +14,18 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from .surgery import repeat_kv
+from .decode import VSARecurrentDecoder
+from .server import get_all_eos_ids
 
 
 class VSAMemoryBank:
-    """Disk-backed `.vsa` neural cartridge manager for infinite context in O(1) active RAM."""
+    """Disk-backed `.vsa` neural cartridge manager with true state mounting & algebraic `forget()`."""
 
     def __init__(self, model, tokenizer, bank_dir: str | Path = "./vsa_memory_bank"):
         self.model = model.eval()
         self.tokenizer = tokenizer
         self.device = next(model.parameters()).device
+        self.decoder = VSARecurrentDecoder(self.model, wrap_positions=False)
         self.bank_dir = Path(bank_dir)
         self.bank_dir.mkdir(parents=True, exist_ok=True)
         self.index: dict[str, torch.Tensor] = {}
@@ -32,47 +42,36 @@ class VSAMemoryBank:
     @torch.no_grad()
     def memorize_to_disk(self, doc_name: str, text: str) -> Path:
         emb_layer = self.model.embed_tokens if hasattr(self.model, "embed_tokens") else self.model.embed
-        ids = self.tokenizer.encode(text, add_special_tokens=False)
-        L = len(ids)
-        pad = (-L) % 32
-        pad_id = self.tokenizer.eos_token_id or 0
-        x_in = torch.tensor([ids + ([pad_id] * pad if pad else [])], dtype=torch.long, device=self.device)
+        doc_prefix = f"Document: {text.strip()}\n"
+        ids = self.tokenizer.encode(doc_prefix, add_special_tokens=False)
+        x_in = torch.tensor([ids], dtype=torch.long, device=self.device)
 
-        vsa_states = {}
         with torch.autocast("cuda", torch.bfloat16, enabled=(self.device.type == "cuda")):
-            x = emb_layer(x_in)
-            router_key = F.normalize(x[0, :L].float().mean(dim=0).cpu(), dim=0)
-            for li, blk in enumerate(self.model.blocks):
-                h = blk.norm1(x)
-                if hasattr(blk, "vsa"):
-                    ly = blk.vsa
-                    if hasattr(ly, "extract_qkv"):
-                        _, kx, vx = ly.extract_qkv(h)
-                    elif hasattr(ly, "head_qkv"):
-                        q, k, v = ly.head_qkv(h)
-                        q, k = ly.rope(q), ly.rope(k)
-                        kc = k * ly.pos_code[:x.shape[1]].view(1, 1, -1, ly.HD).to(k.dtype)
-                        kx, vx = repeat_kv(kc, ly.G), repeat_kv(v, ly.G)
-                        if hasattr(ly, "k_head_mix") and ly.k_head_mix is not None:
-                            kx = torch.einsum("bhtd,hde->bhte", kx, ly.k_head_mix.to(kx.dtype))
-                            vx = torch.einsum("bhtd,hde->bhte", vx, ly.v_head_mix.to(vx.dtype))
-                    else:
-                        B, T_s, _ = h.shape
-                        kx = ly.to_k(h).view(B, T_s, ly.HKV, ly.HD).transpose(1, 2)
-                        vx = ly.to_v(h).view(B, T_s, ly.HKV, ly.HD).transpose(1, 2)
-                    gam = ly.gamma()
-                    w_dec = gam.view(1, ly.H, 1, 1) ** torch.arange(L - 1, -1, -1, device=self.device, dtype=torch.float32).view(1, 1, L, 1)
-                    M_doc = torch.einsum("bhtk,bhtv->bhkv", kx[:, :, :L].float() * w_dec, vx[:, :, :L].float()).to(torch.bfloat16)
-                    vsa_states[li] = M_doc.cpu()
-                x = blk(x)
+            router_key = F.normalize(emb_layer(x_in)[0].float().mean(dim=0).cpu(), dim=0)
+
+        states, kv_caches = VSARecurrentDecoder.blank_state(self.model, 1, self.device)
+        states, kv_caches, next_pos, traces = self.decoder.memorize(x_in, states, kv_caches, start_pos=0)
+
+        cpu_states = [s.cpu().to(torch.bfloat16) if s is not None else None for s in states]
+        cpu_kv = []
+        for item in kv_caches:
+            if isinstance(item, tuple):
+                cpu_kv.append((item[0].cpu(), item[1].cpu()))
+            elif isinstance(item, dict):
+                cpu_kv.append({k: v.cpu() for k, v in item.items()})
+            else:
+                cpu_kv.append(None)
+        cpu_traces = [[(p, k.cpu(), v.cpu()) for (p, k, v) in tr] for tr in traces]
 
         cart_path = self.bank_dir / f"{doc_name}.vsa"
         torch.save({
             "doc_name": doc_name,
             "router_key": router_key,
-            "vsa_states": vsa_states,
-            "token_ids": ids,
-            "n_tokens": L,
+            "vsa_states": cpu_states,
+            "kv_caches": cpu_kv,
+            "traces": cpu_traces,
+            "next_pos": next_pos,
+            "n_tokens": len(ids),
         }, cart_path)
         self.index[doc_name] = router_key
         return cart_path
@@ -105,29 +104,42 @@ class VSAMemoryBank:
         cart = torch.load(self.bank_dir / f"{best_name}.vsa", map_location="cpu", weights_only=False)
         route_ms = (time.perf_counter() - t0) * 1000.0
 
-        ctx_text = self.tokenizer.decode(cart["token_ids"], skip_special_tokens=True)
-        prompt = f"Context: {ctx_text}\nQuestion: {question}\nAnswer:"
-        ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-        prompt_len = len(ids)
-        pad_id = self.tokenizer.eos_token_id or 0
+        # Mount neural states onto GPU (NO raw document text in prompt!)
+        states = [s.to(self.device, dtype=torch.float32) if s is not None else None for s in cart["vsa_states"]]
+        kv_caches = []
+        for item in cart["kv_caches"]:
+            if isinstance(item, tuple):
+                kv_caches.append((item[0].to(self.device), item[1].to(self.device)))
+            elif isinstance(item, dict):
+                kv_caches.append({k: v.to(self.device) for k, v in item.items()})
+            else:
+                kv_caches.append(None)
+        traces = [[(p, k.to(self.device), v.to(self.device)) for (p, k, v) in tr] for tr in cart["traces"]]
+        doc_next_pos = int(cart["next_pos"])
 
-        for _ in range(max_new_tokens):
-            win = ids[-1024:]
-            w_len = len(win)
-            pad = (-w_len) % 32
-            x = torch.tensor([win + ([pad_id] * pad if pad else [])], dtype=torch.long, device=self.device)
-            with torch.autocast("cuda", torch.bfloat16, enabled=(self.device.type == "cuda")):
-                logits = self.model.lm_head(self.model(x)[0, w_len - 1]).float()
-            nxt = int(logits.argmax(dim=-1).item())
-            ids.append(nxt)
-            if nxt == self.tokenizer.eos_token_id or "\n" in self.tokenizer.decode([nxt]):
-                break
+        # Snapshot mounted VSA state before question tokens so we can test exact algebraic forget(traces)
+        mounted_vsa_copy = [s.clone() if s is not None else None for s in states]
 
-        answer = self.tokenizer.decode(ids[prompt_len:], skip_special_tokens=True).strip()
-        max_erase_residual = 0.0
-        for _, M_doc in cart["vsa_states"].items():
-            M_gpu = M_doc.to(self.device, dtype=torch.float32)
-            M_after_forget = M_gpu - M_gpu.clone()
-            max_erase_residual = max(max_erase_residual, float(M_after_forget.abs().max().item()))
+        q_prompt = f"Question: {question.strip()}\nAnswer:"
+        q_ids = torch.tensor([self.tokenizer.encode(q_prompt, add_special_tokens=False)], dtype=torch.long, device=self.device)
+        eos_ids = get_all_eos_ids(self.tokenizer)
 
-        return dict(cartridge=best_name, score=score, route_ms=route_ms, answer=answer, erase_residual=max_erase_residual)
+        gen_toks, _, _, _ = self.decoder.continue_generate(
+            q_ids, states, kv_caches, start_pos=doc_next_pos,
+            max_new_tokens=max_new_tokens, temperature=0.0, eos_ids=eos_ids,
+        )
+        answer = self.tokenizer.decode(gen_toks[0].tolist(), skip_special_tokens=True).strip().splitlines()[0].strip()
+
+        # D5 Fix: True algebraic unlearning via decoder.forget(traces, mounted_vsa_copy, doc_next_pos)
+        erased_states = self.decoder.forget(traces, mounted_vsa_copy, next_pos=doc_next_pos)
+        max_erase_residual = max(
+            float(s.abs().max().item()) for s in erased_states if s is not None
+        )
+
+        return dict(
+            cartridge=best_name,
+            score=score,
+            route_ms=route_ms,
+            answer=answer,
+            erase_residual=max_erase_residual,
+        )
