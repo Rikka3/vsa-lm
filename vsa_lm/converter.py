@@ -117,14 +117,14 @@ def convert_donor_model(
         sd[f"{p}.v_self_scale"] = torch.zeros(H, dtype=torch.float32)
 
         sd[f"{p}.v_conv.weight"] = torch.zeros(H * HD, 1, 8, dtype=dtype)
-     sd[f"{p}.local_q_gate"] = torch.zeros(H, HD, dtype=torch.float32)
-     sd[f"{p}.q_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
-     sd[f"{p}.k_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
-     if cfg.get("has_qwen35_lin", False):
-         sd[f"{p}.rope_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
-     else:
-         sd.setdefault(f"{p}.g_proj.weight", torch.zeros(H * HD, D, dtype=dtype))
-         sd[f"{p}.k_conv.weight"] = torch.zeros(H * HD, 1, 4, dtype=dtype)
+        sd[f"{p}.local_q_gate"] = torch.zeros(H, HD, dtype=torch.float32)
+        sd[f"{p}.q_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
+        sd[f"{p}.k_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
+        if cfg.get("has_qwen35_lin", False):
+            sd[f"{p}.rope_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
+        else:
+            sd.setdefault(f"{p}.g_proj.weight", torch.zeros(H * HD, D, dtype=dtype))
+            sd[f"{p}.k_conv.weight"] = torch.zeros(H * HD, 1, 4, dtype=dtype)
 
     stu.load_state_dict(sd, strict=True)
     n_params = sum(p.numel() for p in stu.parameters())
@@ -135,7 +135,7 @@ def convert_donor_model(
         "config": stu.config,
         "injection": {
             "donor": donor_id_or_dir,
-            "converter": "vsa_lm.converter v8-modular",
+            "converter": "vsa_lm.converter v9-rope-conv",
             "visual_sidecar_path": vis_path if n_vis > 0 else None,
         },
     }, tmp)
@@ -331,11 +331,17 @@ def heal_universal_model(
         raise ValueError("Pass --donor <repo_id> or use a checkpoint created by `python -m vsa_lm convert`")
 
     stu = UniversalVSALM(**stu_cfg)
-    stu.load_state_dict(ck["model"], strict=True)
-    stu.to(device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32)
+    # Use strict=False so upgraded VSA layers (e.g. rope_mix, v_conv) initialize cleanly on existing checkpoints!
+    stu.load_state_dict(ck["model"], strict=False)
+    fp32_keys = ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta",
+                 "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias")
     for name, p in stu.named_parameters():
-        if any(k in name for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix","rope_mix","A_log", "dt_bias")):
-            p.data = p.data.float()
+        if any(k in name for k in fp32_keys):
+            p.data = p.data.to(device, dtype=torch.float32)
+        else:
+            p.data = p.data.to(device, dtype=(torch.bfloat16 if device.type == "cuda" else torch.float32))
+    for b in stu.buffers():
+        b.data = b.data.to(device)
 
     n_params = sum(p.numel() for p in stu.parameters())
     T = int(stu_cfg["max_T"])
@@ -368,12 +374,12 @@ def heal_universal_model(
         work, donor_dir, donor_repo, max(data_tokens, int(tokens_budget * 1.05))
     )
     start_ppl, donor_ppl, start_kl, start_top1 = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
-    total_steps = max(1, math.ceil(tokens_budget / (bs * T)))
+    total_steps = max(start_step + 1, math.ceil(tokens_budget / (bs * T)))
 
     print("=" * 84)
     print(f"VSA-FASTDISTILL PURE-TEACHER HEALER: {donor_repo} (kd={kd})")
     print("=" * 84)
-    print(f"  Memory Mode    : {mode_str} ({n_params/1e9:.2f}B Student, Frozen-Backbone + E1..E7 Active)")
+    print(f"  Memory Mode    : {mode_str} ({n_params/1e9:.2f}B Student, RoPE+Conv+FrozenBackbone)")
     print(f"  Donor Eval PPL : {donor_ppl:.3f}  |  Student Start PPL: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x) | KL: {start_kl:.3f} | Top1: {start_top1:.1f}%")
     print(f"  Budget         : {tokens_budget/1e6:.1f}M Reasoning/Chat tokens ({total_steps} steps, resume={start_step})")
 
@@ -392,7 +398,7 @@ def heal_universal_model(
             p_.requires_grad_(False)
 
     opt_groups = [
-        {"params": vsa_conv, "weight_decay": 0.0, "lr_scale": 5.0},
+        {"params": vsa_conv, "weight_decay": 0.0, "lr_scale": 6.0},
         {"params": vsa_core, "weight_decay": 0.0, "lr_scale": 5.0},
         {"params": vsa_proj, "weight_decay": 0.0, "lr_scale": 1.0},
     ]
@@ -409,7 +415,7 @@ def heal_universal_model(
             prog = (s - stable_end) / max(1, total_steps - stable_end)
             m = 0.05 + 0.475 * (1.0 + math.cos(math.pi * min(1.0, prog)))
         if start_step > 0 and s >= start_step:
-            m *= min(1.0, (s - start_step + 1) / 100.0)
+            m = max(m, 0.5) * min(1.0, (s - start_step + 1) / 50.0)
         for g in opt.param_groups:
             g["lr"] = lr * m * g.get("lr_scale", 1.0)
 
