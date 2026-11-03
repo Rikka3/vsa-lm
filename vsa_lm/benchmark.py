@@ -87,8 +87,7 @@ def _score_choices(model, is_hf: bool, tok, prompt: str, choices: list[str],
 @torch.no_grad()
 def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 100) -> dict:
     out = {}
-
-    # 1. MMLU (cais/mmlu) — Standard 4-option prompt + full choice scoring
+# 1. MMLU (cais/mmlu)
     rows = _load_rows("cais/mmlu", "all", "test", limit)
     ok = 0
     for r in rows:
