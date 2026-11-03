@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VSA-LM · Fixed-state memory for language models</title>
+<meta name="description" content="VSA-LM replaces 75% of a Transformer's growing KV-cache attention with fixed-size decayed outer-product memory.">
+<meta name="theme-color" content="#0d0a08">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+  <a class="logo" href="#top"><i><b style="background:#FFD800"></b><b style="background:#FFAF00"></b><b style="background:#FF8205"></b><b style="background:#FFAF00"></b><b style="background:#FA500F"></b><b style="background:#E10500"></b><b style="background:#FF8205"></b><b style="background:#E10500"></b><b style="background:#7a1a05"></b></i>VSA-LM</a>
+  <ul>
+    <li><a href="#problem">Problem</a></li>
+    <li><a href="#how">How it works</a></li>
+    <li><a href="#race">Speed</a></li>
+    <li><a href="#forget">Forget</a></li>
+    <li><a href="#compare">Compare</a></li>
+    <li><a href="#start">Start</a></li>
+  </ul>
+</nav>
+<div class="xp"><b id="xpb"></b></div>
+<div class="lv" id="lv">LV 0</div>
+
+<header class="hero" id="top">
+  <canvas id="sky"></canvas>
+  <div class="hero-inner">
+    <p class="kicker">Open source · MIT · Linear attention</p>
+    <h1>VSA<span>-LM</span></h1>
+    <p class="lede">A language model that remembers in a <b>fixed-size block</b> instead of an ever-growing KV cache. 75% of attention layers fold the entire past into one D×D matrix per head.</p>
+    <div class="chips">
+      <span class="chip"><b>−75%</b> KV RAM</span>
+      <span class="chip"><b>2.43×</b> decode @ 64k</span>
+      <span class="chip"><b>&lt;1 ms</b> exact forget</span>
+      <span class="chip"><b>0 bytes</b> KV growth while thinking</span>
+    </div>
+    <a class="btn pri" href="https://github.com/Rikka3/vsa-lm">View on GitHub</a>
+    <a class="btn" href="https://huggingface.co/rikkathree/vsa-lm">Models on Hugging Face</a>
+  </div>
+  <div class="cue">SCROLL ▼</div>
+</header>
+<div class="stripe"></div>
+
+<section class="scrolly" id="problem" data-scene="kv" style="--len:380vh">
+  <div class="stage">
+    <div class="copy">
+      <div class="chap"><p class="kicker">Chapter 01 · The problem</p><h2>Every token leaves a brick behind</h2></div>
+      <div class="dots"></div>
+      <div class="steps">
+        <div class="step"><h3>A transformer never forgets</h3><p>For every token, every attention layer stores a <b>key</b> and a <b>value</b> vector. That pile is the <b>KV cache</b>, and it only ever grows. Scroll to feed it tokens.</p></div>
+        <div class="step"><h3>Memory grows linearly</h3><p>For Llama-3.2-1B the cache is <b>16 MB at 512 tokens</b> and <b>2,048 MB at 65,536</b>. Long chats, long documents and long reasoning traces all pay that rent.</p></div>
+        <div class="step"><h3>…and decoding slows down</h3><p>Each new token has to attend over the whole pile. Measured decode speed drops from <b>148 tok/s</b> to <b>51 tok/s</b> at 64k context.</p></div>
+      </div>
+    </div>
+    <div class="view"><canvas></canvas></div>
+  </div>
+</section>
+<div class="stripe"></div>
+
+<section class="scrolly" id="how" data-scene="vsa" style="--len:480vh">
+  <div class="stage">
+    <div class="copy">
+      <div class="chap"><p class="kicker">Chapter 02 · How VSA works</p><h2>Fold the past into one fixed block</h2></div>
+      <div class="dots"></div>
+      <div class="steps">
+        <div class="step"><h3>1 · Project</h3><p>Each incoming token is projected into a key <b>k</b> and a value <b>v</b>. VSA-LM uses positive, sharpened features plus an 8-tap causal local convolution.</p></div>
+        <div class="step"><h3>2 · Bind with an outer product</h3><p><b>k ⊗ v</b> turns two vectors into a D×D imprint of the token. Every cell is <code>k[i]·v[j]</code>.</p></div>
+        <div class="step"><h3>3 · Decay and add</h3><p><code>M_t = γ·M_(t−1) + k_t ⊗ v_t</code><br>Old imprints fade by γ while new ones are stacked on top. Learned multi-scale decay (<b>γ ∈ [0.50, 0.992]</b>) gives both short- and long-memory heads. <b>The matrix never gets bigger.</b></p></div>
+        <div class="step"><h3>4 · Read with the query</h3><p><code>y_t = (1−γ)/√D · M_t q_t</code><br>One matrix–vector product per token, however long the context is. That is <b>O(1) decode</b>, done in a fused Triton kernel.</p></div>
+      </div>
+    </div>
+    <div class="view"><canvas></canvas></div>
+  </div>
+</section>
+<div class="stripe"></div>
+
+<section class="scrolly" id="race" data-scene="race" style="--len:400vh">
+  <div class="stage">
+    <div class="copy">
+      <div class="chap"><p class="kicker">Chapter 03 · Head to head</p><h2>Same model family. Longer and longer context.</h2></div>
+      <div class="dots"></div>
+      <div class="steps">
+        <div class="step"><h3>Short context: a tie</h3><p>From 512 to 8k tokens both models decode at about <b>149 tok/s</b>, but VSA already carries a far smaller cache (<b>67 MB vs 256 MB</b> at 8k).</p></div>
+        <div class="step"><h3>32k: pulling away</h3><p>The transformer slows to <b>85.5 tok/s</b>. VSA-Llama holds <b>149.7 tok/s</b>, which is <b>1.75× faster</b>.</p></div>
+        <div class="step"><h3>64k: 2.43× faster, 4× smaller</h3><p><b>124.7 vs 51.4 tok/s</b> and <b>515 MB vs 2,048 MB</b> of cache (−74.9%). These are measured numbers for VSA-Llama-3.2-1B vs unquantized Llama-3.2-1B.</p></div>
+      </div>
+    </div>
+    <div class="view"><canvas></canvas></div>
+  </div>
+</section>
+<div class="stripe"></div>
+
+<section class="scrolly" id="hybrid" data-scene="tower" style="--len:340vh">
+  <div class="stage">
+    <div class="copy">
+      <div class="chap"><p class="kicker">Chapter 04 · The hybrid stack</p><h2>Three VSA layers for every softmax layer</h2></div>
+      <div class="dots"></div>
+      <div class="steps">
+        <div class="step"><h3>75% VSA · 25% softmax</h3><p>Every 4th layer keeps exact softmax attention as an anchor for precise recall. The other <b>three of every four</b> layers compress context into a fixed state, so only the teal layers' caches keep growing.</p></div>
+        <div class="step"><h3>Convert any donor model</h3><p>A Hugging Face model is surgically converted in about <b>20–30 seconds</b>, then healed with <b>VSA-FastDistill</b> from the donor. Supported donors: Llama, Qwen, DeepSeek-Distill, Mistral and SmolLM.</p></div>
+      </div>
+    </div>
+    <div class="view"><canvas></canvas></div>
+  </div>
+</section>
+<div class="stripe"></div>
+
+<section class="scrolly" id="forget" data-scene="forget" style="--len:400vh">
+  <div class="stage">
+    <div class="copy">
+      <div class="chap"><p class="kicker">Chapter 05 · Exact unlearning</p><h2>Memorize. Then subtract it back out.</h2></div>
+      <div class="dots"></div>
+      <div class="steps">
+        <div class="step"><h3>memorize(doc)</h3><p>A document is streamed into the live state. Each token adds its decayed <code>k⊗v</code> imprint into the <b>same</b> fixed matrix, with no new rows and no new cache.</p></div>
+        <div class="step"><h3>The state is linear</h3><p>M is a plain sum of outer products, so the model knows exactly how much each document contributed.</p></div>
+        <div class="step"><h3>forget(doc)</h3><p><code>M ← M − Σ γ^Δt · k_t ⊗ v_t</code><br>The document is removed surgically in <b>under 1 ms</b>, with <b>residual error below 1e-5</b>.</p></div>
+      </div>
+    </div>
+    <div class="view"><canvas></canvas></div>
+  </div>
+</section>
+<div class="stripe"></div>
+
+<section class="scrolly" id="cartridges" data-scene="cart" style="--len:400vh">
+  <div class="stage">
+    <div class="copy">
+      <div class="chap"><p class="kicker">Chapter 06 · VSAMemoryBank</p><h2>Context as cartridges on disk</h2></div>
+      <div class="dots"></div>
+      <div class="steps">
+        <div class="step"><h3>Encode to .vsa cartridges</h3><p>Documents or past chats are encoded into compact <code>.vsa</code> state files on your SSD. They take <b>0.00 MB</b> of idle GPU/CPU RAM.</p></div>
+        <div class="step"><h3>Route the query</h3><p>A question comes in, and the bank picks the right cartridge in <b>under 20 ms</b>.</p></div>
+        <div class="step"><h3>Mount, answer, unmount</h3><p>The state is mounted, the model answers, and the state is then algebraically erased: <b>4/4 exact secret retrieval</b> with a <b>0.0 erase residual</b>.</p></div>
+      </div>
+    </div>
+    <div class="view"><canvas></canvas></div>
+  </div>
+</section>
+<div class="stripe"></div>
+
+<section class="scrolly" id="think" data-scene="think" style="--len:340vh">
+  <div class="stage">
+    <div class="copy">
+      <div class="chap"><p class="kicker">Chapter 07 · OpenMythos latent thinking</p><h2>Think inside the block, not on the cache</h2></div>
+      <div class="dots"></div>
+      <div class="steps">
+        <div class="step"><h3>K recurrent passes</h3><p>Instead of writing out more chain-of-thought tokens, the model runs <b>K latent passes</b> entirely inside the fixed VSA state matrices. The softmax KV caches stay frozen.</p></div>
+        <div class="step"><h3>K = 0 → K = 4</h3><p>On VSA-DeepSeek-R1-Qwen-1.5B, answer CE loss falls from <b>1.218 to 0.274</b> and true-token confidence rises from <b>52.95% to 81.65%</b>. Memory growth during thinking is <b>0 bytes</b>.</p></div>
+      </div>
+    </div>
+    <div class="view"><canvas></canvas></div>
+  </div>
+</section>
+<div class="stripe"></div>
+
+<section class="sec reveal" id="compare">
+  <p class="kicker">Side by side</p>
+  <h2>Transformer vs VSA-LM</h2>
+  <p>VSA trades a little exactness in 75% of layers for constant memory, constant-time decode, and a state you can edit with arithmetic.</p>
+  <div class="scroll-x"><table class="inv">
+    <tr><th></th><th>Standard transformer</th><th>VSA-LM hybrid</th></tr>
+    <tr><td>Memory per new token</td><td>K and V appended in every layer</td><td class="w">Fixed D×D state in 75% of layers; only 25% grow</td></tr>
+    <tr><td>Decode cost</td><td>Attends over the whole history</td><td class="w">O(1) recurrent step in VSA layers</td></tr>
+    <tr><td>KV RAM @ 64k (1B)</td><td>2,048 MB</td><td class="w">515 MB (−74.9%)</td></tr>
+    <tr><td>Decode @ 64k (1B)</td><td>51.4 tok/s</td><td class="w">124.7 tok/s (2.43×)</td></tr>
+    <tr><td>Forget a document</td><td>No exact mechanism</td><td class="w">Algebraic subtraction, &lt;1 ms, residual &lt;1e-5</td></tr>
+    <tr><td>Extra reasoning</td><td>Every thought token grows the cache</td><td class="w">Latent passes, 0 bytes KV growth</td></tr>
+    <tr><td>Exact recall</td><td class="w">Every token kept verbatim</td><td>Compressed in VSA layers; softmax layers keep precision</td></tr>
+    <tr><td>Quality vs donor</td><td>Baseline</td><td>0.937× PPL (R1-Qwen-1.5B) · 1.213× PPL (Llama-1B)</td></tr>
+  </table></div>
+</section>
+
+<section class="sec reveal" id="models">
+  <p class="kicker">Inventory</p>
+  <h2>Pretrained &amp; converted models</h2>
+  <div class="grid3">
+    <div class="card"><h3>VSA-DeepSeek-R1-Qwen-1.5B</h3><div class="big">0.937×</div><p>Donor reasoning PPL (9.52 vs 10.16). 21 VSA + 7 softmax, 79.9% top-1 match, −74.6% KV RAM.</p><p style="margin-top:10px"><a href="https://huggingface.co/rikkathree/vsa-deepseek-r1-qwen-1.5b">Hugging Face →</a></p></div>
+    <div class="card"><h3>VSA-Llama-3.2-1B</h3><div class="big">2.43×</div><p>Faster decode at 64k. 12 VSA + 4 softmax, 97.1% ARC-Easy and 95.0% PIQA retained, −74.9% KV RAM.</p><p style="margin-top:10px"><a href="https://huggingface.co/rikkathree/vsa-llama-3.2-1b">Hugging Face →</a></p></div>
+    <div class="card"><h3>VSA-LM-100M (scratch)</h3><div class="big">47/48</div><p>Binder multi-doc recall. 6 VSA + 2 softmax trained from scratch; 0.996× donor PPL.</p><p style="margin-top:10px"><a href="https://huggingface.co/rikkathree/vsa-lm">Hugging Face →</a></p></div>
+  </div>
+</section>
+
+<section class="sec reveal" id="bench">
+  <p class="kicker">Measured · fused Triton O(1) decode kernel</p>
+  <h2>Speed &amp; memory scaling</h2>
+  <div class="scroll-x"><table class="inv">
+    <tr><th>Context</th><th>Llama-3.2-1B</th><th>VSA-Llama</th><th>Speedup</th><th>Llama cache</th><th>VSA cache</th><th>Saved</th></tr>
+    <tr><td>512</td><td>148.4 tok/s</td><td class="w">149.2 tok/s</td><td>1.01×</td><td>16 MB</td><td class="w">7 MB</td><td>56.2%</td></tr>
+    <tr><td>8,192</td><td>148.9 tok/s</td><td class="w">148.8 tok/s</td><td>1.00×</td><td>256 MB</td><td class="w">67 MB</td><td>73.8%</td></tr>
+    <tr><td>16,384</td><td>138.8 tok/s</td><td class="w">149.2 tok/s</td><td>1.08×</td><td>512 MB</td><td class="w">131 MB</td><td>74.4%</td></tr>
+    <tr><td>32,768</td><td>85.5 tok/s</td><td class="w">149.7 tok/s</td><td class="w">1.75×</td><td>1,024 MB</td><td class="w">259 MB</td><td>74.7%</td></tr>
+    <tr><td>65,536</td><td>51.4 tok/s</td><td class="w">124.7 tok/s</td><td class="w">2.43×</td><td>2,048 MB</td><td class="w">515 MB</td><td>74.9%</td></tr>
+  </table></div>
+</section>
+
+<section class="sec reveal" id="start">
+  <p class="kicker">Crafting table</p>
+  <h2>Quickstart</h2>
+<pre>git clone https://github.com/Rikka3/vsa-lm.git
+cd vsa-lm
+pip install -r requirements.txt
+
+<span class="c"># Train a 6-VSA + 2-Softmax hybrid from scratch</span>
+python -m vsa_lm train --run vsa --max-len 512</pre>
+<pre><span class="c"># Convert a donor model, then heal it</span>
+python -m vsa_lm convert --donor deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+    --out deepseek_vsa_init.pth --hybrid-every 4
+python -m vsa_lm heal --ckpt deepseek_vsa_init.pth \
+    --donor deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+    --out-prefix deepseek_vsa --tokens 60000000 --lr 1.5e-4 --kd 1.0</pre>
+  <a class="btn pri" href="https://github.com/Rikka3/vsa-lm">Read the full README</a>
+</section>
+
+<footer>
+  VSA-LM · MIT License · © 2026 Rikka3 · <a href="https://github.com/Rikka3/vsa-lm">github.com/Rikka3/vsa-lm</a><br>
+  Not affiliated with Mistral AI or Mojang.
+</footer>
+
+<script src="part1.js"></script>
+<script src="part2.js"></script>
+<script src="main.js"></script>
+</body>
+</html>
