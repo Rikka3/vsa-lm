@@ -116,13 +116,15 @@ def convert_donor_model(
         sd[f"{p}.head_pos_delta"] = torch.zeros(H, max_T, HD, dtype=torch.float32)
         sd[f"{p}.v_self_scale"] = torch.zeros(H, dtype=torch.float32)
 
-        if not cfg.get("has_qwen35_lin", False):
-            sd.setdefault(f"{p}.g_proj.weight", torch.zeros(H * HD, D, dtype=dtype))
-            sd[f"{p}.v_conv.weight"] = torch.zeros(H * HD, 1, 8, dtype=dtype)
-            sd[f"{p}.k_conv.weight"] = torch.zeros(H * HD, 1, 4, dtype=dtype)
-            sd[f"{p}.local_q_gate"] = torch.zeros(H, HD, dtype=torch.float32)
-            sd[f"{p}.q_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
-            sd[f"{p}.k_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
+        sd[f"{p}.v_conv.weight"] = torch.zeros(H * HD, 1, 8, dtype=dtype)
+     sd[f"{p}.local_q_gate"] = torch.zeros(H, HD, dtype=torch.float32)
+     sd[f"{p}.q_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
+     sd[f"{p}.k_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
+     if cfg.get("has_qwen35_lin", False):
+         sd[f"{p}.rope_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
+     else:
+         sd.setdefault(f"{p}.g_proj.weight", torch.zeros(H * HD, D, dtype=dtype))
+         sd[f"{p}.k_conv.weight"] = torch.zeros(H * HD, 1, 4, dtype=dtype)
 
     stu.load_state_dict(sd, strict=True)
     n_params = sum(p.numel() for p in stu.parameters())
@@ -332,7 +334,7 @@ def heal_universal_model(
     stu.load_state_dict(ck["model"], strict=True)
     stu.to(device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32)
     for name, p in stu.named_parameters():
-        if any(k in name for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "A_log", "dt_bias")):
+        if any(k in name for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix","rope_mix","A_log", "dt_bias")):
             p.data = p.data.float()
 
     n_params = sum(p.numel() for p in stu.parameters())
@@ -377,7 +379,7 @@ def heal_universal_model(
 
     vsa_conv, vsa_core, vsa_proj = [], [], []
     for n_, p_ in stu.named_parameters():
-        if any(k in n_ for k in ("v_conv", "k_conv", "conv1d", "local_q_gate", "q_relu_mix", "k_relu_mix")):
+        if any(k in n_ for k in ("v_conv", "k_conv", "conv1d", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix")):
             p_.requires_grad_(True)
             vsa_conv.append(p_)
         elif any(k in n_ for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale", "A_log", "dt_bias")):
