@@ -97,24 +97,62 @@ h1 span{color:var(--amber)}
 
 .stripe{height:16px;background:linear-gradient(90deg,var(--amber) 0%,var(--orange) 22%,var(--coral) 45%,var(--purple) 70%,var(--lilac) 88%,var(--cyan) 100%);border-top:3px solid #000;border-bottom:3px solid #000}
 
-/* BRAID-STYLE SCROLLYTELLING CONTAINER (Cards Left, Animation Right) */
+/* BRAID-STYLE SCROLLYTELLING CONTAINER */
 .scrolly-section{position:relative;padding:40px 0 60px}
 .scrolly-container{
   max-width:1400px;
   margin:0 auto;
   padding:0 5vw;
   display:grid;
-  grid-template-columns:minmax(320px,40%) 1fr;
   gap:4.5vw;
   align-items:start;
 }
 
-/* Scrolling Cards on Left */
+/* ODD SECTIONS (1, 3, 5, 7): Animation Box on LEFT, Cards on RIGHT */
+.scrolly-section:nth-of-type(odd) .scrolly-container{
+  grid-template-columns:1fr minmax(320px,40%);
+}
+.scrolly-section:nth-of-type(odd) .story-graphic{
+  grid-column:1;
+  grid-row:1;
+}
+.scrolly-section:nth-of-type(odd) .story-steps{
+  grid-column:2;
+  grid-row:1;
+}
+
+/* EVEN SECTIONS (2, 4, 6): Cards on LEFT, Animation Box on RIGHT */
+.scrolly-section:nth-of-type(even) .scrolly-container{
+  grid-template-columns:minmax(320px,40%) 1fr;
+}
+.scrolly-section:nth-of-type(even) .story-steps{
+  grid-column:1;
+  grid-row:1;
+}
+.scrolly-section:nth-of-type(even) .story-graphic{
+  grid-column:2;
+  grid-row:1;
+}
+
+/* Sticky Graphic */
+.story-graphic{
+  position:sticky;
+  top:84px;
+  height:min(76vh,630px);
+  background:#130e20;
+  border:4px solid #000;
+  box-shadow:inset 3px 3px 0 #2d1f46,inset -3px -3px 0 #07040d,8px 8px 0 #000;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+}
+.story-graphic canvas{width:100%;height:100%;display:block;image-rendering:pixelated}
+
+/* Scrolling Cards */
 .story-steps{
   display:flex;
   flex-direction:column;
   padding:12vh 0 34vh;
-  order:1;
 }
 .story-step{
   min-height:46vh;
@@ -160,21 +198,6 @@ h1 span{color:var(--amber)}
 .story-card b{color:var(--cream);font-weight:600}
 .story-card code,.sec code{font:20px var(--mono);color:var(--amber);background:rgba(0,0,0,.4);padding:1px 6px;border:1px solid #36264f}
 
-/* Sticky Graphic on Right */
-.story-graphic{
-  position:sticky;
-  top:84px;
-  height:min(76vh,630px);
-  background:#130e20;
-  border:4px solid #000;
-  box-shadow:inset 3px 3px 0 #2d1f46,inset -3px -3px 0 #07040d,8px 8px 0 #000;
-  display:flex;
-  flex-direction:column;
-  overflow:hidden;
-  order:2;
-}
-.story-graphic canvas{width:100%;height:100%;display:block;image-rendering:pixelated}
-
 /* REGULAR SECTIONS */
 .sec{max-width:1120px;margin:0 auto;padding:110px 5vw 60px}
 .sec .kicker{font:20px var(--mono);color:var(--amber);letter-spacing:1px;text-transform:uppercase}
@@ -200,9 +223,28 @@ footer{border-top:3px solid #000;background:#090610;padding:44px 5vw;text-align:
 footer a{color:var(--lilac)}
 
 @media (max-width:860px){
-  .scrolly-container{grid-template-columns:1fr;gap:18px;padding:20px 14px}
-  .story-graphic{position:sticky;top:64px;height:48vh;box-shadow:inset 3px 3px 0 #2d1f46,inset -3px -3px 0 #07040d,4px 4px 0 #000;z-index:20;order:1}
-  .story-steps{padding:10px 0 40px;order:2}
+  .scrolly-container{
+    display:flex !important;
+    flex-direction:column !important;
+    gap:18px;
+    padding:20px 14px;
+  }
+  .story-graphic{
+    grid-column:auto !important;
+    grid-row:auto !important;
+    order:1 !important;
+    position:sticky;
+    top:64px;
+    height:48vh;
+    box-shadow:inset 3px 3px 0 #2d1f46,inset -3px -3px 0 #07040d,4px 4px 0 #000;
+    z-index:20;
+  }
+  .story-steps{
+    grid-column:auto !important;
+    grid-row:auto !important;
+    order:2 !important;
+    padding:10px 0 40px;
+  }
   .story-step{min-height:auto;margin-bottom:34px}
 }
 </style>
@@ -247,9 +289,10 @@ footer a{color:var(--lilac)}
 </header>
 <div class="stripe"></div>
 
-<!-- 1. PROBLEM -->
+<!-- 1. PROBLEM (Box Left, Cards Right) -->
 <section class="scrolly-section" id="problem" data-scene="kv">
   <div class="scrolly-container">
+    <div class="story-graphic"><canvas></canvas></div>
     <div class="story-steps">
       <div class="story-step active">
         <div class="story-card">
@@ -273,12 +316,11 @@ footer a{color:var(--lilac)}
         </div>
       </div>
     </div>
-    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
 
-<!-- 2. HOW -->
+<!-- 2. HOW (Cards Left, Box Right) -->
 <section class="scrolly-section" id="how" data-scene="vsa">
   <div class="scrolly-container">
     <div class="story-steps">
@@ -316,9 +358,10 @@ footer a{color:var(--lilac)}
 </section>
 <div class="stripe"></div>
 
-<!-- 3. RACE -->
+<!-- 3. RACE (Box Left, Cards Right) -->
 <section class="scrolly-section" id="race" data-scene="race">
   <div class="scrolly-container">
+    <div class="story-graphic"><canvas></canvas></div>
     <div class="story-steps">
       <div class="story-step active">
         <div class="story-card">
@@ -342,12 +385,11 @@ footer a{color:var(--lilac)}
         </div>
       </div>
     </div>
-    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
 
-<!-- 4. HYBRID -->
+<!-- 4. HYBRID (Cards Left, Box Right) -->
 <section class="scrolly-section" id="hybrid" data-scene="tower">
   <div class="scrolly-container">
     <div class="story-steps">
@@ -371,9 +413,10 @@ footer a{color:var(--lilac)}
 </section>
 <div class="stripe"></div>
 
-<!-- 5. FORGET -->
+<!-- 5. FORGET (Box Left, Cards Right) -->
 <section class="scrolly-section" id="forget" data-scene="forget">
   <div class="scrolly-container">
+    <div class="story-graphic"><canvas></canvas></div>
     <div class="story-steps">
       <div class="story-step active">
         <div class="story-card">
@@ -397,12 +440,11 @@ footer a{color:var(--lilac)}
         </div>
       </div>
     </div>
-    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
 
-<!-- 6. CARTRIDGES -->
+<!-- 6. CARTRIDGES (Cards Left, Box Right) -->
 <section class="scrolly-section" id="cartridges" data-scene="cart">
   <div class="scrolly-container">
     <div class="story-steps">
@@ -433,9 +475,10 @@ footer a{color:var(--lilac)}
 </section>
 <div class="stripe"></div>
 
-<!-- 7. THINK -->
+<!-- 7. THINK (Box Left, Cards Right) -->
 <section class="scrolly-section" id="think" data-scene="think">
   <div class="scrolly-container">
+    <div class="story-graphic"><canvas></canvas></div>
     <div class="story-steps">
       <div class="story-step active">
         <div class="story-card">
@@ -452,7 +495,6 @@ footer a{color:var(--lilac)}
         </div>
       </div>
     </div>
-    <div class="story-graphic"><canvas></canvas></div>
   </div>
 </section>
 <div class="stripe"></div>
