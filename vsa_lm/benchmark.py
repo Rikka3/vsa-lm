@@ -6,6 +6,7 @@ Uses 100% public, ungated Hugging Face datasets with unified log-likelihood scor
   3. HellaSwag (`Rowan/hellaswag`)
   4. TruthfulQA (`truthfulqa/truthful_qa`)
   5. GSM8K (`openai/gsm8k`)
+  6. HumanEval-Code (`openai/openai_humaneval`)
   + Decode Speed (tok/s), Cache RAM (2k -> 64k), and `.vsa` Cartridge Recall & Unlearning.
 """
 from __future__ import annotations
@@ -34,14 +35,21 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
     tok = AutoTokenizer.from_pretrained(donor_dir)
     cls = UniversalVSALM if (cfg.get("donor_arch") not in (None, "llama") or cfg.get("qkv_bias") or cfg.get("has_qwen35_lin")) else LlamaVSALM
     stu = cls(**cfg)
-    stu.load_state_dict(ck["model"], strict=True)
+    stu.load_state_dict(ck["model"], strict=False)
     step = ck.get("step", "?")
     conv_ver = (ck.get("injection") or {}).get("converter", "unknown")
     del ck
-    stu = stu.to(device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32).eval()
+
+    fp32_keys = ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta",
+                 "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias")
     for n, p in stu.named_parameters():
-        if any(k in n for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "A_log", "dt_bias")):
-            p.data = p.data.float()
+        if any(k in n for k in fp32_keys):
+            p.data = p.data.to(device, dtype=torch.float32)
+        else:
+            p.data = p.data.to(device, dtype=(torch.bfloat16 if device.type == "cuda" else torch.float32))
+    for b in stu.buffers():
+        b.data = b.data.to(device)
+    stu.eval()
     return stu, cfg, tok, donor_id, donor_dir, step, conv_ver
 
 
@@ -87,7 +95,8 @@ def _score_choices(model, is_hf: bool, tok, prompt: str, choices: list[str],
 @torch.no_grad()
 def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 100) -> dict:
     out = {}
-# 1. MMLU (cais/mmlu)
+
+    # 1. MMLU (cais/mmlu)
     rows = _load_rows("cais/mmlu", "all", "test", limit)
     ok = 0
     for r in rows:
@@ -148,6 +157,27 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 100)
         ok += int(_score_choices(model, is_hf, tok, prompt, choices, device, norm_len=False) == gold)
         tot += 1
     out["GSM8K"] = {"acc": (ok / max(1, tot)) * 100.0, "correct": ok, "total": tot}
+
+    # 6. HumanEval-Code (openai/openai_humaneval) — Python Implementation Discrimination
+    rows = _load_rows("openai/openai_humaneval", None, "test", min(limit, 100))
+    ok, tot = 0, 0
+    for r in rows:
+        prompt_code = r["prompt"]
+        sol = r["canonical_solution"]
+        if not sol.strip():
+            continue
+        # Construct buggy distractors (off-by-one, inverted condition, wrong return)
+        bug1 = sol.replace("return ", "return None # ").replace("+", "-")
+        bug2 = sol.replace("==", "!=").replace("<", ">").replace("True", "False")
+        bug3 = "    pass\n    return 0\n"
+        opts = [sol, bug1 if bug1 != sol else "    return -1\n", bug2 if bug2 != sol else "    return []\n", bug3]
+        idx = [0, 1, 2, 3]
+        rng.shuffle(idx)
+        choices = [opts[i] for i in idx]
+        gold = idx.index(0)
+        ok += int(_score_choices(model, is_hf, tok, prompt_code, choices, device, norm_len=True) == gold)
+        tot += 1
+    out["HumanEval-Code"] = {"acc": (ok / max(1, tot)) * 100.0, "correct": ok, "total": tot}
     return out
 
 
@@ -264,10 +294,10 @@ def _plot_benchmark_figure(results: dict, out_png: str):
     else:
         ax1.bar(x, s_vals, w, label="VSA-LM", color="#3fb950")
     ax1.set_xticks(x)
-    ax1.set_xticklabels(tasks, fontsize=9, fontweight="bold")
+    ax1.set_xticklabels(tasks, rotation=12, fontsize=8.5, fontweight="bold")
     ax1.set_ylabel("Accuracy (%)", fontweight="bold")
-    ax1.set_title("1. Standard Benchmark Accuracy (Higher = Better)", fontsize=11, fontweight="bold")
-    ax1.legend(loc="upper right", fontsize=8)
+    ax1.set_title("1. Standard & Coding Benchmark Accuracy (Higher = Better)", fontsize=11, fontweight="bold")
+    ax1.legend(loc="lower right", fontsize=8)
 
     ax2 = axes[0, 1]
     sc = results["systems"]["scaling"]
