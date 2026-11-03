@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..surgery import _vsa_apply
+from ..surgery import LlamaRoPE, _vsa_apply
 
 
 class Qwen35ZeroCenteredRMSNorm(nn.Module):
@@ -58,6 +58,13 @@ class Qwen35PartialRoPE(nn.Module):
 
 
 class Qwen35VSAAttn(nn.Module):
+    """Exact VSA replacement for Qwen3_5GatedDeltaNet with:
+      - Pretrained in_proj_qkv + conv1d + silu + L2Norm(q, k) + in_proj_b write gate
+      - Learnable relative RoPE blend (`rope_mix`) so multi-choice options never collide
+      - Q/K positive feature sharpener (`q_relu_mix`, `k_relu_mix`)
+      - 8-tap causal depthwise local value conv (`v_conv` + `local_q_gate`) for local token binding
+    """
+
     def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32):
         super().__init__()
         D = cfg["dim"]
@@ -86,6 +93,8 @@ class Qwen35VSAAttn(nn.Module):
         self.norm = Qwen35RMSNormGated(HD, eps=eps)
         self.out_proj = nn.Linear(self.val_dim, D, bias=False)
 
+        self.rope = LlamaRoPE(HD, 10000.0)
+        self.rope_mix = nn.Parameter(torch.zeros(HV, 1, 1))
         self.pos_code = nn.Parameter(torch.ones(max_T, HD))
         self.log_gamma = nn.Parameter(torch.zeros(HV))
         eye = torch.eye(HD).unsqueeze(0).repeat(HV, 1, 1)
@@ -93,6 +102,12 @@ class Qwen35VSAAttn(nn.Module):
         self.v_head_mix = nn.Parameter(eye.clone())
         self.head_pos_delta = nn.Parameter(torch.zeros(HV, max_T, HD))
         self.v_self_scale = nn.Parameter(torch.zeros(HV))
+
+        self.v_conv = nn.Conv1d(HV * HD, HV * HD, kernel_size=8, padding=7, groups=HV * HD, bias=False)
+        nn.init.zeros_(self.v_conv.weight)
+        self.local_q_gate = nn.Parameter(torch.zeros(HV, HD))
+        self.q_relu_mix = nn.Parameter(torch.zeros(HV, 1, 1))
+        self.k_relu_mix = nn.Parameter(torch.zeros(HV, 1, 1))
 
     def gamma(self) -> torch.Tensor:
         return (0.9999 * torch.sigmoid(self.log_gamma)).clamp(1e-4, 0.9999).float()
@@ -111,6 +126,11 @@ class Qwen35VSAAttn(nn.Module):
         k = k.repeat_interleave(self.G, dim=2).transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
 
+        # Learnable relative RoPE blend (starts at 0.0 at Step 0, learns relative addressing!)
+        rmix = torch.tanh(self.rope_mix).view(1, self.H, 1, 1).to(q.dtype)
+        q = q + rmix * (self.rope(q) - q)
+        k = k + rmix * (self.rope(k) - k)
+
         T_use = min(T, self.pos_code.shape[0])
         pc = self.pos_code[:T_use].view(1, 1, T_use, self.HD).to(k.dtype)
         if T > T_use:
@@ -122,6 +142,9 @@ class Qwen35VSAAttn(nn.Module):
         if T <= self.head_pos_delta.shape[1]:
             kx = kx * (1.0 + 0.5 * torch.tanh(self.head_pos_delta[:, :T, :])).unsqueeze(0).to(kx.dtype)
         vx = torch.einsum("bhtd,hde->bhte", v, self.v_head_mix.to(v.dtype))
+
+        q = q + self.q_relu_mix.view(1, self.H, 1, 1).to(q.dtype) * F.relu(q)
+        kx = kx + self.k_relu_mix.view(1, self.H, 1, 1).to(kx.dtype) * F.relu(kx)
         return q, kx, vx
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -129,6 +152,13 @@ class Qwen35VSAAttn(nn.Module):
         q, kx, vx = self.extract_qkv(x)
         y = _vsa_apply(q, kx, vx, self.gamma(), self.chunk_size)
         y = y + self.v_self_scale.view(1, self.H, 1, 1).to(y.dtype) * vx
+
+        if hasattr(self, "v_conv"):
+            vx_flat = vx.permute(0, 1, 3, 2).reshape(B, self.H * self.HD, T)
+            v_loc = self.v_conv(vx_flat)[..., :T].view(B, self.H, self.HD, T).permute(0, 1, 3, 2)
+            q_mod = torch.sigmoid((q * self.local_q_gate.view(1, self.H, 1, self.HD).to(q.dtype)).sum(-1, keepdim=True))
+            y = y + (2.0 * q_mod) * v_loc
+
         y_flat = y.transpose(1, 2).reshape(-1, self.HD)
         z_flat = self.in_proj_z(x).reshape(-1, self.HD)
         return self.out_proj(self.norm(y_flat, z_flat).reshape(B, T, self.val_dim))
