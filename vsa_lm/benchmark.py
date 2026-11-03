@@ -36,12 +36,13 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
     stu = cls(**cfg)
     stu.load_state_dict(ck["model"], strict=True)
     step = ck.get("step", "?")
+    conv_ver = (ck.get("injection") or {}).get("converter", "unknown")
     del ck
     stu = stu.to(device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32).eval()
     for n, p in stu.named_parameters():
         if any(k in n for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "A_log", "dt_bias")):
             p.data = p.data.float()
-    return stu, cfg, tok, donor_id, donor_dir, step
+    return stu, cfg, tok, donor_id, donor_dir, step, conv_ver
 
 
 def _load_rows(repo: str, name: str | None, split: str, limit: int) -> list[dict]:
@@ -56,7 +57,8 @@ def _load_rows(repo: str, name: str | None, split: str, limit: int) -> list[dict
 
 
 @torch.no_grad()
-def _score_choices(model, is_hf: bool, tok, prompt: str, choices: list[str], device: torch.device) -> int:
+def _score_choices(model, is_hf: bool, tok, prompt: str, choices: list[str],
+                   device: torch.device, norm_len: bool = True) -> int:
     p_ids = tok.encode(prompt, add_special_tokens=False)
     pad_id = tok.eos_token_id or 0
     best_i, best_s = 0, -1e30
@@ -76,8 +78,9 @@ def _score_choices(model, is_hf: bool, tok, prompt: str, choices: list[str], dev
             else:
                 logits = model.lm_head(model(x)[0, L - 1 - c_len : L - 1]).float()
         ll = F.log_softmax(logits, dim=-1).gather(-1, torch.tensor(full[L - c_len : L], device=device).unsqueeze(-1)).sum().item()
-        if ll / max(1, len(c_str)) > best_s:
-            best_s, best_i = ll / max(1, len(c_str)), i
+        denom = max(1, len(c_str)) if norm_len else 1.0
+        if ll / denom > best_s:
+            best_s, best_i = ll / denom, i
     return best_i
 
 
@@ -85,9 +88,19 @@ def _score_choices(model, is_hf: bool, tok, prompt: str, choices: list[str], dev
 def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 100) -> dict:
     out = {}
 
-    # 1. MMLU (cais/mmlu)
+    # 1. MMLU (cais/mmlu) — Standard 4-option prompt + full choice scoring
     rows = _load_rows("cais/mmlu", "all", "test", limit)
-    ok = sum(int(_score_choices(model, is_hf, tok, f"Question: {r['question'].strip()}\nAnswer:", r["choices"], device) == int(r["answer"])) for r in rows)
+    ok = 0
+    for r in rows:
+        ch = r["choices"]
+        subj = r.get("subject", "general").replace("_", " ")
+        prompt = (
+            f"The following is a multiple-choice question about {subj}.\n"
+            f"Question: {r['question'].strip()}\n"
+            f"Options:\n- {ch[0]}\n- {ch[1]}\n- {ch[2]}\n- {ch[3]}\n"
+            f"Correct Answer:"
+        )
+        ok += int(_score_choices(model, is_hf, tok, prompt, ch, device, norm_len=True) == int(r["answer"]))
     out["MMLU"] = {"acc": (ok / len(rows)) * 100.0, "correct": ok, "total": len(rows)}
 
     # 2. ARC-Challenge (allenai/ai2_arc)
@@ -133,7 +146,7 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 100)
         choices = [opts[i] for i in idx]
         gold = idx.index(0)
         prompt = f"Question: {r['question'].strip()}\nStep-by-step reasoning: {cot}\nFinal Answer:"
-        ok += int(_score_choices(model, is_hf, tok, prompt, choices, device) == gold)
+        ok += int(_score_choices(model, is_hf, tok, prompt, choices, device, norm_len=False) == gold)
         tot += 1
     out["GSM8K"] = {"acc": (ok / max(1, tot)) * 100.0, "correct": ok, "total": tot}
     return out
@@ -305,13 +318,13 @@ def run_benchmark_suite(
     _purge_zombie_vram()
     t0 = time.perf_counter()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    stu, cfg, tok, donor_repo, donor_dir, step = _load_student(ckpt_path, donor_id, device)
+    stu, cfg, tok, donor_repo, donor_dir, step, conv_ver = _load_student(ckpt_path, donor_id, device)
 
     print("=" * 84)
-    print(f"VSA-LM BENCHMARK SUITE: {ckpt_path} (step {step}) vs {donor_repo}")
+    print(f"VSA-LM BENCHMARK SUITE: {ckpt_path} (step {step}, {conv_ver}) vs {donor_repo}")
     print("=" * 84, flush=True)
 
-    results = {"checkpoint": ckpt_path, "step": step, "donor": donor_repo, "student": {}, "teacher": {}, "systems": {}}
+    results = {"checkpoint": ckpt_path, "step": step, "converter": conv_ver, "donor": donor_repo, "student": {}, "teacher": {}, "systems": {}}
     results["student"] = _eval_model(stu, False, tok, device, limit=limit)
     for k, v in results["student"].items():
         print(f"  [VSA-LM] {k:<14}: {v['acc']:6.2f}% ({v['correct']}/{v['total']})", flush=True)
