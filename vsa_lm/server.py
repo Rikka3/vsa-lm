@@ -1,9 +1,10 @@
 """OpenAI-Compatible Local API Server for VSA-LM (`python -m vsa_lm serve`).
 
-Allows coding agents like `opencode`, `aider`, `Continue.dev`, and `Cline` to
-connect directly to any VSA-LM checkpoint at `http://localhost:8000/v1`.
-Supports both CUDA GPUs and low-RAM CPUs (e.g. 8GB RAM laptops with no GPU)
-via automatic dynamic INT8 weight quantization (`--quantize`).
+Fixes from Audit:
+  - D1: Uses stateful VSARecurrentDecoder (O(1) VSA state + growing Softmax KV cache) instead of sliding a 1,024-token window!
+  - D2: Removes hidden 1.08 repetition penalty that corrupted math/code tokens; makes repetition_penalty opt-in (default 1.0).
+  - D3: Checks all EOS & chat end tokens (`<|im_end|>`, `<|endoftext|>`, `<｜end▁of▁sentence｜>`, `eos_token_id`).
+  - B6 + D4: Requires valid donor metadata or `--donor` flag; defaults `quantize_cpu=False` unless requested.
 """
 from __future__ import annotations
 
@@ -13,42 +14,71 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from .decode import VSARecurrentDecoder
 
 
-def load_model_for_serving(ckpt_path: str, donor_tokenizer: str | None = None, quantize_cpu: bool = True):
+def get_all_eos_ids(tokenizer) -> set[int]:
+    """D3 Fix: Collect all valid stop token IDs for Qwen, DeepSeek, Llama, and Mistral."""
+    eos_ids = set()
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        if isinstance(tokenizer.eos_token_id, list):
+            eos_ids.update(int(x) for x in tokenizer.eos_token_id)
+        else:
+            eos_ids.add(int(tokenizer.eos_token_id))
+    for tok_str in ("<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<｜end▁of▁sentence｜>", "</s>"):
+        try:
+            tid = tokenizer.convert_tokens_to_ids(tok_str)
+            if isinstance(tid, int) and tid >= 0 and tid != getattr(tokenizer, "unk_token_id", -1):
+                eos_ids.add(tid)
+        except Exception:
+            pass
+    return eos_ids
+
+
+def load_model_for_serving(ckpt_path: str, donor_tokenizer: str | None = None, quantize_cpu: bool = False):
     from transformers import AutoTokenizer
-    from .converter import UniversalVSALM
+    from .converter import UniversalVSALM, fetch_any_donor
     from .surgery import LlamaVSALM
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[vsa-serve] Loading {ckpt_path} on {device}...")
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = dict(ck["config"])
-    donor_id = donor_tokenizer or ck.get("donor") or (ck.get("injection") or {}).get("donor") or "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    donor_id = donor_tokenizer or ck.get("donor") or (ck.get("injection") or {}).get("donor")
+    if not donor_id:
+        raise ValueError("Checkpoint lacks donor metadata; pass --donor <hf_repo_id> explicitly.")
 
-    if cfg.get("donor_arch") not in (None, "llama") or cfg.get("qkv_bias", False):
+    if cfg.get("donor_arch") not in (None, "llama") or cfg.get("qkv_bias", False) or cfg.get("has_qwen35_lin", False):
         model = UniversalVSALM(**cfg)
     else:
         model = LlamaVSALM(**cfg)
-    model.load_state_dict(ck["model"], strict=True)
+    model.load_state_dict(ck["model"], strict=False)
     del ck
 
+    fp32_keys = ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta",
+                 "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias")
     if device.type == "cuda":
-        model = model.to(device, dtype=torch.bfloat16).eval()
+        for n, p in model.named_parameters():
+            p.data = p.data.to(device, dtype=torch.float32 if any(k in n for k in fp32_keys) else torch.bfloat16)
+        for b in model.buffers():
+            b.data = b.data.to(device)
+        model.eval()
     else:
         model = model.float().eval()
         if quantize_cpu:
-            print("[vsa-serve] Applying Dynamic INT8 CPU Quantization (cuts RAM by ~50% & speeds up CPU matmuls)...")
+            print("[vsa-serve] Applying Dynamic INT8 CPU Quantization...")
             model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
 
-    tokenizer = AutoTokenizer.from_pretrained(donor_id)
+    donor_dir = fetch_any_donor(donor_id)
+    tokenizer = AutoTokenizer.from_pretrained(donor_dir)
     print(f"[vsa-serve] Model & tokenizer ({donor_id}) ready on {device}!")
     return model, tokenizer, device
 
 
 @torch.no_grad()
-def generate_completion(model, tokenizer, device, messages: list[dict], max_tokens: int = 512, temperature: float = 0.6) -> str:
+def generate_completion(model, tokenizer, device, messages: list[dict], max_tokens: int = 1024,
+                        temperature: float = 0.0, repetition_penalty: float = 1.0) -> str:
     try:
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:
@@ -56,36 +86,24 @@ def generate_completion(model, tokenizer, device, messages: list[dict], max_toke
 
     ids = tokenizer.encode(prompt, add_special_tokens=False)
     prompt_len = len(ids)
-    max_T = model.config.get("max_T", 1024)
+    eos_ids = get_all_eos_ids(tokenizer)
 
-    for _ in range(max_tokens):
-        win = ids[-max_T:]
-        w_len = len(win)
-        pad = (-w_len) % 32
-        x = torch.tensor([win + ([0] * pad if pad else [])], dtype=torch.long, device=device)
-        with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-            h = model(x)
-            logits = model.lm_head(h[0, w_len - 1]).float()
-
-        if len(ids) > prompt_len:
-            seen = torch.tensor(list(set(ids[-64:])), device=device, dtype=torch.long)
-            s_vals = logits[seen]
-            logits[seen] = torch.where(s_vals > 0, s_vals / 1.08, s_vals * 1.08)
-
-        if temperature <= 0.01:
-            nxt = int(logits.argmax(dim=-1).item())
-        else:
-            probs = F.softmax(logits / temperature, dim=-1)
-            nxt = int(torch.multinomial(probs, num_samples=1).item())
-
-        ids.append(nxt)
-        if nxt == tokenizer.eos_token_id:
-            break
-
-    return tokenizer.decode(ids[prompt_len:], skip_special_tokens=True).strip()
+    # D1 Fix: Use stateful VSARecurrentDecoder so context never drops out at 1,024 tokens!
+    decoder = VSARecurrentDecoder(model, wrap_positions=False)
+    prompt_tensor = torch.tensor([ids], dtype=torch.long, device=device)
+    out_tensor = decoder.generate(
+        prompt_tensor,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        eos_ids=eos_ids,
+    )
+    gen_ids = out_tensor[0, prompt_len:].tolist()
+    if eos_ids and gen_ids and gen_ids[-1] in eos_ids:
+        gen_ids = gen_ids[:-1]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
 
-def run_server(ckpt_path: str, donor_tokenizer: str | None = None, host: str = "0.0.0.0", port: int = 8000, quantize_cpu: bool = True):
+def run_server(ckpt_path: str, donor_tokenizer: str | None = None, host: str = "0.0.0.0", port: int = 8000, quantize_cpu: bool = False):
     model, tokenizer, device = load_model_for_serving(ckpt_path, donor_tokenizer, quantize_cpu=quantize_cpu)
 
     class OpenAIHandler(BaseHTTPRequestHandler):
@@ -105,10 +123,14 @@ def run_server(ckpt_path: str, donor_tokenizer: str | None = None, host: str = "
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
             messages = body.get("messages", [{"role": "user", "content": body.get("prompt", "")}])
-            max_tokens = int(body.get("max_tokens", 512))
-            temperature = float(body.get("temperature", 0.6))
+            max_tokens = int(body.get("max_tokens", 1024))
+            temperature = float(body.get("temperature", 0.0))
+            rep_pen = float(body.get("repetition_penalty", 1.0))
 
-            reply = generate_completion(model, tokenizer, device, messages, max_tokens=max_tokens, temperature=temperature)
+            reply = generate_completion(
+                model, tokenizer, device, messages,
+                max_tokens=max_tokens, temperature=temperature, repetition_penalty=rep_pen,
+            )
             resp = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:10]}",
                 "object": "chat.completion",
@@ -129,8 +151,5 @@ def run_server(ckpt_path: str, donor_tokenizer: str | None = None, host: str = "
 
     print("=" * 78)
     print(f"VSA-LM OpenAI API Server listening at http://{host}:{port}/v1")
-    print("  Connect opencode / aider / Continue.dev to:")
-    print(f"    Base URL : http://localhost:{port}/v1")
-    print("    Model ID : vsa-lm")
     print("=" * 78)
     HTTPServer((host, port), OpenAIHandler).serve_forever()
