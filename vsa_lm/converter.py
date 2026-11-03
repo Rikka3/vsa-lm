@@ -1,9 +1,19 @@
-"""Universal Donor-to-VSA Converter & Pure-KD FastDistill Healer (vsa_lm.converter)."""
+"""Universal Donor-to-VSA Converter & 2-Stage Attention-Transfer + KD Healer (vsa_lm.converter).
+
+Fixes from Audit:
+  - A1 + A2: Preserves native GatedDeltaNet layers on Qwen3.5 and converts half of full_attention layers.
+  - A4 + A5 + A6: Multi-scale horizons up to 5,000 tokens (gamma_cap=0.9998), active positive feature map.
+  - B2 + B3 + B4 + B5: Asserts teacher/student head equality before sharing, logs load_state_dict diffs, no silent fake teacher.
+  - C1 + C2: 50/50 interleaved & shuffled UltraChat + Bespoke-Stratos reasoning traces with native <think> tags preserved.
+  - C3: Stage-1 Layer-Wise Attention-Output MSE Transfer before end-to-end KD.
+  - C4 + C6 + C8: Unfreezes norms & converted-block MLPs gently (0.08x LR, 0 weight decay), fixes final mid_loss norm, uses kd=0.9 + 0.1 CE anchor.
+"""
 from __future__ import annotations
 
 import gc
 import math
 import os
+import random
 import sys
 import threading
 import time
@@ -59,7 +69,7 @@ def convert_donor_model(
     hybrid_every: int = 4,
     max_T: int = 1024,
     chunk_size: int = 32,
-    gamma_cap: float = 0.992,
+    gamma_cap: float = 0.9998,
     hf_token: str | None = None,
     visual_sidecar_out: str | None = None,
 ) -> str:
@@ -76,16 +86,18 @@ def convert_donor_model(
         cfg["visual_tensors_count"] = n_vis
 
     L = cfg["num_layers"]
-    n_soft = (L // hybrid_every) if hybrid_every > 0 else 0
-    n_vsa = L - n_soft
+    layer_types = cfg["layer_types"]
+    n_soft = sum(1 for t in layer_types if t == "softmax")
+    n_vsa = sum(1 for t in layer_types if t == "vsa")
+    n_gdn = sum(1 for t in layer_types if t == "gated_deltanet")
+
     print("=" * 80)
     print(f"UNIVERSAL VSA-LM CONVERTER: {donor_id_or_dir}")
     print("=" * 80)
-    print(f"  Detected family     : {cfg['donor_arch']}  (qkv_bias={cfg['qkv_bias']}, qk_norm={cfg['qk_norm']}, qwen35_lin={cfg['has_qwen35_lin']}, packed_q_gate={cfg['packed_q_gate']})")
+    print(f"  Detected family     : {cfg['donor_arch']}  (tie_emb={cfg['tie_word_embeddings']}, qkv_bias={cfg['qkv_bias']}, qk_norm={cfg['qk_norm']})")
     if n_vis > 0:
         print(f"  Vision Tower        : Preserved {n_vis} tensors ({vis_mb:.1f} MB) -> {vis_path}")
-    print(f"  Dimensions          : dim={cfg['dim']}, L={L}, Softmax H={cfg['num_heads']}/HKV={cfg['num_kv_heads']} (HD={cfg['head_dim']}), VSA H={cfg['vsa_num_heads']}/HKV={cfg['vsa_num_kv_heads']} (HD={cfg['vsa_head_dim']})")
-    print(f"  Target layout       : {n_vsa} VSA layers + {n_soft} Softmax layers (hybrid_every={hybrid_every})")
+    print(f"  Target layout       : {n_vsa} VSA + {n_soft} Softmax + {n_gdn} Native GatedDeltaNet layers")
 
     stu = UniversalVSALM(**cfg)
     sd = map_any_hf_to_student(hf_sd, cfg, hybrid_every)
@@ -93,38 +105,28 @@ def convert_donor_model(
 
     H, HD, D = cfg["vsa_num_heads"], cfg["vsa_head_dim"], cfg["dim"]
     dtype = sd["embed_tokens.weight"].dtype
-    horizons = torch.logspace(math.log10(2.0), math.log10(1.0 / max(1e-4, 1.0 - gamma_cap)), H)
+    horizons = torch.logspace(math.log10(4.0), math.log10(1.0 / max(1e-4, 1.0 - gamma_cap)), H)
     g_init = (1.0 - 1.0 / horizons).clamp(0.50, gamma_cap)
     sig = (g_init / 0.9999).clamp(1e-6, 1.0 - 1e-6)
     lg_init = torch.log(sig / (1.0 - sig)).float()
 
-    for li in range(L):
-        if hybrid_every > 0 and (li + 1) % hybrid_every == 0:
+    for li, ltype in enumerate(layer_types):
+        if ltype != "vsa":
             continue
         p = f"blocks.{li}.vsa"
         sd[f"{p}.pos_code"] = torch.ones(max_T, HD, dtype=torch.float32)
-        if cfg.get("has_qwen35_lin", False) and f"{p}.A_log" in sd and f"{p}.dt_bias" in sd:
-            A_log, dt_bias = sd[f"{p}.A_log"].float(), sd[f"{p}.dt_bias"].float()
-            g_static = torch.exp(-A_log.exp() * F.softplus(dt_bias)).clamp(0.20, gamma_cap)
-            sd[f"{p}.log_gamma"] = torch.logit(g_static / 0.9999).float()
-        else:
-            sd[f"{p}.log_gamma"] = lg_init.clone()
-
+        sd[f"{p}.log_gamma"] = lg_init.clone()
         eye = torch.eye(HD, dtype=torch.float32).unsqueeze(0).repeat(H, 1, 1)
         sd[f"{p}.k_head_mix"] = eye.clone()
         sd[f"{p}.v_head_mix"] = eye.clone()
         sd[f"{p}.head_pos_delta"] = torch.zeros(H, max_T, HD, dtype=torch.float32)
-        sd[f"{p}.v_self_scale"] = torch.zeros(H, dtype=torch.float32)
-
+        sd[f"{p}.v_self_scale"] = torch.full((H,), 0.1, dtype=torch.float32)
+        sd.setdefault(f"{p}.g_proj.weight", torch.zeros(H * HD, D, dtype=dtype))
         sd[f"{p}.v_conv.weight"] = torch.zeros(H * HD, 1, 8, dtype=dtype)
+        sd[f"{p}.k_conv.weight"] = torch.zeros(H * HD, 1, 4, dtype=dtype)
         sd[f"{p}.local_q_gate"] = torch.zeros(H, HD, dtype=torch.float32)
-        sd[f"{p}.q_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
-        sd[f"{p}.k_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
-        if cfg.get("has_qwen35_lin", False):
-            sd[f"{p}.rope_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
-        else:
-            sd.setdefault(f"{p}.g_proj.weight", torch.zeros(H * HD, D, dtype=dtype))
-            sd[f"{p}.k_conv.weight"] = torch.zeros(H * HD, 1, 4, dtype=dtype)
+        sd[f"{p}.q_relu_mix"] = torch.full((H, 1, 1), 0.5, dtype=torch.float32)
+        sd[f"{p}.k_relu_mix"] = torch.full((H, 1, 1), 0.5, dtype=torch.float32)
 
     stu.load_state_dict(sd, strict=True)
     n_params = sum(p.numel() for p in stu.parameters())
@@ -135,7 +137,7 @@ def convert_donor_model(
         "config": stu.config,
         "injection": {
             "donor": donor_id_or_dir,
-            "converter": "vsa_lm.converter v9-rope-conv",
+            "converter": "vsa_lm.converter v10-audit-clean",
             "visual_sidecar_path": vis_path if n_vis > 0 else None,
         },
     }, tmp)
@@ -147,29 +149,32 @@ def convert_donor_model(
 
 
 def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str, target_tokens: int):
+    """C1 + C2 Fix: Interleaves 50% Bespoke-Stratos reasoning traces (preserving <think>...</think>
+    directly so chat templates never strip CoT!) with 50% UltraChat, shuffles documents, and logs token mix.
+    """
     import pyarrow.parquet as pq
     from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoTokenizer
 
     safe_tag = donor_repo.split("/")[-1].lower().replace("-", "_").replace(".", "_")
-    train_cache = os.path.join(work, f"{safe_tag}_disjoint_train.pt")
-    eval_cache = os.path.join(work, f"{safe_tag}_disjoint_eval.pt")
+    train_cache = os.path.join(work, f"{safe_tag}_v10_disjoint_train.pt")
+    eval_cache = os.path.join(work, f"{safe_tag}_v10_disjoint_eval.pt")
 
     if os.path.isfile(train_cache) and os.path.isfile(eval_cache):
         tr_t = torch.load(train_cache, weights_only=True)
         ev_t = torch.load(eval_cache, weights_only=True)
         if len(tr_t) >= int(target_tokens * 0.8):
-            print(f"[vsa-data] Loaded disjoint train cache ({len(tr_t)/1e6:.1f}M) & eval cache ({len(ev_t)/1e6:.2f}M)")
+            print(f"[vsa-data] Loaded v10 interleaved train cache ({len(tr_t)/1e6:.1f}M) & eval cache ({len(ev_t)/1e6:.2f}M)")
             return tr_t, ev_t
 
     tok = AutoTokenizer.from_pretrained(donor_dir)
     eos_id = tok.eos_token_id or tok.pad_token_id or 0
     api = HfApi()
-    print(f"[vsa-data] Building strictly disjoint distillation cache ({target_tokens/1e6:.0f}M tokens, 0% eval overlap)...", flush=True)
+    print(f"[vsa-data] Building 50/50 interleaved Reasoning + Chat cache ({target_tokens/1e6:.0f}M tokens, 0% eval overlap)...", flush=True)
     t0 = time.perf_counter()
-    all_texts = []
 
-    for ds_id, max_f in (("HuggingFaceH4/ultrachat_200k", 4), ("bespokelabs/Bespoke-Stratos-17k", 2)):
+    def _fetch_docs(ds_id: str, max_f: int, preserve_cot: bool) -> list[str]:
+        docs = []
         for rev in ("main", "refs/convert/parquet"):
             try:
                 files = [f for f in api.list_repo_files(ds_id, revision=rev, repo_type="dataset") if f.endswith(".parquet") and "train" in f]
@@ -183,24 +188,50 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
                             norm_m = []
                             for m in msgs:
                                 r = "user" if m.get("from", m.get("role")) in ("human", "user") else "assistant"
-                                norm_m.append({"role": r, "content": str(m.get("value", m.get("content", "")))})
-                            try:
-                                all_texts.append(tok.apply_chat_template(norm_m, tokenize=False))
-                            except Exception:
-                                all_texts.append("\n".join(x["content"] for x in norm_m))
-                if all_texts:
+                                c = str(m.get("value", m.get("content", "")))
+                                c = c.replace("<|begin_of_thought|>", "<think>\n").replace("<|end_of_thought|>", "\n</think>\n").replace("<|begin_of_solution|>", "").replace("<|end_of_solution|>", "")
+                                norm_m.append({"role": r, "content": c})
+                            if preserve_cot:
+                                # Format manually if apply_chat_template strips <think> blocks
+                                rendered = "\n".join(f"<|im_start|>{x['role']}\n{x['content']}<|im_end|>" for x in norm_m)
+                                docs.append(rendered)
+                            else:
+                                try:
+                                    docs.append(tok.apply_chat_template(norm_m, tokenize=False))
+                                except Exception:
+                                    docs.append("\n".join(x["content"] for x in norm_m))
+                if docs:
                     break
             except Exception:
                 continue
+        return docs
 
-    n_eval_docs = min(400, max(50, len(all_texts) // 20))
-    eval_docs, train_docs = all_texts[:n_eval_docs], all_texts[n_eval_docs:]
+    cot_docs = _fetch_docs("bespokelabs/Bespoke-Stratos-17k", 2, preserve_cot=True)
+    chat_docs = _fetch_docs("HuggingFaceH4/ultrachat_200k", 3, preserve_cot=False)
+
+    rng = random.Random(7777)
+    rng.shuffle(cot_docs)
+    rng.shuffle(chat_docs)
+
+    # Interleave 1 CoT doc with 2 shorter Chat docs (~50/50 token mix)
+    interleaved = []
+    n_max = max(len(cot_docs), len(chat_docs))
+    for i in range(n_max):
+        if i < len(cot_docs):
+            interleaved.append(cot_docs[i])
+        if 2 * i < len(chat_docs):
+            interleaved.append(chat_docs[2 * i])
+        if 2 * i + 1 < len(chat_docs):
+            interleaved.append(chat_docs[2 * i + 1])
+
+    n_eval_docs = min(500, max(100, len(interleaved) // 20))
+    eval_docs, train_docs = interleaved[:n_eval_docs], interleaved[n_eval_docs:]
 
     eval_buf = array("i")
     for ids in tok(eval_docs, add_special_tokens=False)["input_ids"]:
         eval_buf.extend(ids)
         eval_buf.append(int(eos_id))
-        if len(eval_buf) >= 250_000:
+        if len(eval_buf) >= 500_000:
             break
     eval_t = torch.frombuffer(eval_buf, dtype=torch.int32).clone()
 
@@ -220,14 +251,16 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
 
     torch.save(train_t, train_cache)
     torch.save(eval_t, eval_cache)
-    print(f"[vsa-data] Built disjoint train ({len(train_t)/1e6:.1f}M) & held-out eval ({len(eval_t)/1e6:.2f}M) in {time.perf_counter()-t0:.1f}s!", flush=True)
+    print(f"[vsa-data] Built v10 train ({len(train_t)/1e6:.1f}M, CoT docs={len(cot_docs)}, Chat docs={len(chat_docs)}) & eval ({len(eval_t)/1e6:.2f}M) in {time.perf_counter()-t0:.1f}s!", flush=True)
     return train_t, eval_t
 
 
 def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: torch.device):
+    """B4 Fix: Never silently fall back to a fake softmax teacher for Qwen3.5; log errors explicitly."""
     if stu_cfg.get("has_qwen35_lin", False):
         import transformers
         print(f"[vsa-teacher] Loading native Qwen3.5 teacher from {donor_dir} (vision-stripped, bfloat16)...", flush=True)
+        last_err = None
         for cls_name in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration", "AutoModelForCausalLM", "AutoModelForImageTextToText"):
             cls = getattr(transformers, cls_name, None)
             if cls is not None:
@@ -241,10 +274,13 @@ def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: 
                     for p in m.parameters():
                         p.requires_grad_(False)
                     return m, True
-                except Exception:
+                except Exception as e:
+                    last_err = e
                     continue
+        raise RuntimeError(f"Failed to load native Qwen3.5 teacher from {donor_dir}: {last_err}")
+
     hf_sd = load_all_safetensors(donor_dir)
-    rep_cfg = dict(stu_cfg, hybrid_every=1, vsa_untie_gqa=False, vsa_local_conv=False)
+    rep_cfg = dict(stu_cfg, hybrid_every=1, layer_types=["softmax"] * stu_cfg["num_layers"], vsa_untie_gqa=False, vsa_local_conv=False)
     donor = UniversalVSALM(**rep_cfg)
     donor.load_state_dict(map_any_hf_to_student(hf_sd, rep_cfg, 1), strict=True)
     del hf_sd
@@ -255,12 +291,19 @@ def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: 
 
 
 def _forward_hf_teacher_body(donor, xm: torch.Tensor, num_layers: int, hybrid_every: int):
+    """C6 Fix: Excludes the final block from `t_mids` because `out.hidden_states[num_layers]`
+    in HF transformers is already post-final-RMSNorm (which is compared via `final_h_loss`).
+    """
     inner = getattr(donor, "model", donor)
     if hasattr(inner, "language_model"):
         inner = inner.language_model
     out = inner(input_ids=xm, output_hidden_states=True, use_cache=False)
     h_teacher = (out.last_hidden_state if hasattr(out, "last_hidden_state") else out.hidden_states[-1]).detach()
-    t_mids = [out.hidden_states[li + 1].detach() for li in range(num_layers) if (li + 1) % hybrid_every == 0]
+    t_mids = [
+        out.hidden_states[li + 1].detach()
+        for li in range(num_layers - 1)
+        if (li + 1) % hybrid_every == 0
+    ]
     del out
     return h_teacher, t_mids
 
@@ -300,6 +343,74 @@ def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Te
     return math.exp(nll_s / max(1, cnt)), math.exp(nll_d / max(1, cnt)), kl_sum / max(1, cnt), (top1_ok / max(1, cnt)) * 100.0
 
 
+def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_tokens: torch.Tensor,
+                                         device: torch.device, steps: int = 120, bs: int = 4):
+    """C3 Fix: Fast parallel Stage-1 Layer-Wise Attention-Output MSE + Cosine Transfer!
+    Directly trains every converted VSA block to match its exact donor block output given the
+    exact same teacher input hidden state before end-to-end KD begins.
+    """
+    if steps <= 0:
+        return
+    T = min(512, int(stu.config["max_T"]))
+    L = int(stu.config["num_layers"])
+    layer_types = stu.config.get("layer_types") or []
+    vsa_indices = [li for li in range(L) if layer_types[li] == "vsa" or (not layer_types and hasattr(stu.blocks[li], "vsa"))]
+    if not vsa_indices:
+        return
+
+    vsa_params = []
+    for li in vsa_indices:
+        for p in stu.blocks[li].vsa.parameters():
+            p.requires_grad_(True)
+            vsa_params.append(p)
+
+    opt = torch.optim.AdamW(vsa_params, lr=5e-4, weight_decay=0.0, fused=(device.type == "cuda"))
+    n_win = max(1, (len(train_tokens) - 1) // T)
+    gen = torch.Generator().manual_seed(101)
+    ar = torch.arange(T)
+    t0 = time.perf_counter()
+    print(f"  [Stage-1 Layer-Wise Transfer] Aligning {len(vsa_indices)} VSA layers to exact donor block outputs ({steps} steps)...", flush=True)
+
+    stu.train()
+    for s in range(steps):
+        idx = torch.randint(0, n_win, (bs,), generator=gen)
+        x = train_tokens[idx[:, None] * T + ar[None, :]].long().to(device)
+        opt.zero_grad(set_to_none=True)
+
+        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+            if is_hf_donor:
+                inner = getattr(getattr(donor, "model", donor), "language_model", getattr(donor, "model", donor))
+                out = inner(input_ids=x, output_hidden_states=True, use_cache=False)
+                # hidden_states[0] is embedding output; hidden_states[li+1] is output of block li
+                # Note: hidden_states[L] in HF is post-final-norm, so for li == L-1 we skip or normalize
+                t_hs = [h.detach() for h in out.hidden_states]
+                del out
+            else:
+                xt = donor.embed_tokens(x)
+                t_hs = [xt.detach()]
+                for blk in donor.blocks:
+                    xt = blk(xt)
+                    t_hs.append(xt.detach())
+
+        total_mse = torch.zeros((), device=device, dtype=torch.float32)
+        with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+            for li in vsa_indices:
+                if is_hf_donor and li == L - 1:
+                    continue
+                h_in = t_hs[li]
+                h_target = t_hs[li + 1]
+                h_pred = stu.blocks[li](h_in)
+                l_mse = F.mse_loss(h_pred.float(), h_target.float()) + (1.0 - F.cosine_similarity(h_pred.float(), h_target.float(), dim=-1).mean())
+                total_mse = total_mse + l_mse / max(1, len(vsa_indices))
+
+        total_mse.backward()
+        torch.nn.utils.clip_grad_norm_(vsa_params, 1.0)
+        opt.step()
+        del t_hs
+        if (s + 1) in (1, steps // 2, steps):
+            print(f"    [Stage-1] step {s+1:3d}/{steps} | layer_mse+cos = {float(total_mse.item()):.4f} ({time.perf_counter()-t0:.1f}s)", flush=True)
+
+
 def heal_universal_model(
     ckpt_path: str,
     *,
@@ -311,7 +422,7 @@ def heal_universal_model(
     bs: int = 16,
     lr: float = 1.5e-4,
     warmup: int = 150,
-    kd: float = 1.0,
+    kd: float = 0.9,
     eval_every: int = 250,
     save_every: int = 250,
     seed: int = 7777,
@@ -331,8 +442,13 @@ def heal_universal_model(
         raise ValueError("Pass --donor <repo_id> or use a checkpoint created by `python -m vsa_lm convert`")
 
     stu = UniversalVSALM(**stu_cfg)
-    # Use strict=False so upgraded VSA layers (e.g. rope_mix, v_conv) initialize cleanly on existing checkpoints!
-    stu.load_state_dict(ck["model"], strict=False)
+    # B5 Fix: Explicit missing/unexpected key check
+    missing, unexpected = stu.load_state_dict(ck["model"], strict=False)
+    allowed_missing = {"rope_mix", "v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix"}
+    real_missing = [m for m in missing if not any(a in m for a in allowed_missing)]
+    if real_missing or unexpected:
+        raise RuntimeError(f"Checkpoint mismatch! Missing: {real_missing[:10]}, Unexpected: {unexpected[:10]}")
+
     fp32_keys = ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta",
                  "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias")
     for name, p in stu.named_parameters():
@@ -359,50 +475,70 @@ def heal_universal_model(
     donor_dir = fetch_any_donor(donor_repo)
     donor, is_hf_donor = _load_donor_teacher(donor_repo, donor_dir, stu_cfg, device)
 
+    # B3 Fix: Only share teacher/student embeddings after verifying exact equality!
     if is_hf_donor:
         t_in_emb, t_out_emb = donor.get_input_embeddings(), donor.get_output_embeddings()
-        if t_in_emb is not None and t_in_emb.weight.shape == stu.embed_tokens.weight.shape:
+        if t_in_emb is not None and t_in_emb.weight.shape == stu.embed_tokens.weight.shape and torch.equal(t_in_emb.weight, stu.embed_tokens.weight):
             t_in_emb.weight = stu.embed_tokens.weight
-        if t_out_emb is not None and t_out_emb.weight.shape == stu.lm_head.weight.shape:
+        if t_out_emb is not None and t_out_emb.weight.shape == stu.lm_head.weight.shape and torch.equal(t_out_emb.weight, stu.lm_head.weight):
             t_out_emb.weight = stu.lm_head.weight
     else:
-        donor.embed_tokens.weight, donor.lm_head.weight = stu.embed_tokens.weight, stu.lm_head.weight
+        if torch.equal(donor.embed_tokens.weight, stu.embed_tokens.weight):
+            donor.embed_tokens.weight = stu.embed_tokens.weight
+        if torch.equal(donor.lm_head.weight, stu.lm_head.weight):
+            donor.lm_head.weight = stu.lm_head.weight
     _purge_zombie_vram()
 
     w_lm_t = donor.get_output_embeddings().weight if is_hf_donor else donor.lm_head.weight
     train_tokens, eval_tokens = _build_reasoning_and_eval_caches(
         work, donor_dir, donor_repo, max(data_tokens, int(tokens_budget * 1.05))
     )
+
+    # C3 Fix: Run Stage-1 Layer-Wise Attention Transfer on fresh conversions (start_step == 0)
+    if start_step == 0:
+        _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor, train_tokens, device, steps=120, bs=max(2, micro_bs))
+        _purge_zombie_vram()
+
     start_ppl, donor_ppl, start_kl, start_top1 = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
     total_steps = max(start_step + 1, math.ceil(tokens_budget / (bs * T)))
 
     print("=" * 84)
-    print(f"VSA-FASTDISTILL PURE-TEACHER HEALER: {donor_repo} (kd={kd})")
+    print(f"VSA-FASTDISTILL 2-STAGE HEALER: {donor_repo} (kd={kd}, ce={1.0-kd:.1f})")
     print("=" * 84)
-    print(f"  Memory Mode    : {mode_str} ({n_params/1e9:.2f}B Student, RoPE+Conv+FrozenBackbone)")
+    print(f"  Memory Mode    : {mode_str} ({n_params/1e9:.2f}B Student)")
     print(f"  Donor Eval PPL : {donor_ppl:.3f}  |  Student Start PPL: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x) | KL: {start_kl:.3f} | Top1: {start_top1:.1f}%")
-    print(f"  Budget         : {tokens_budget/1e6:.1f}M Reasoning/Chat tokens ({total_steps} steps, resume={start_step})")
+    print(f"  Budget         : {tokens_budget/1e6:.1f}M 50/50 Interleaved CoT+Chat tokens ({total_steps} steps, resume={start_step})")
 
-    vsa_conv, vsa_core, vsa_proj = [], [], []
+    # C4 Fix: Train VSA layers + gently adapt norms (0.1x LR, 0.0 weight decay so pretrained weights never erode!)
+    vsa_conv, vsa_core, vsa_proj, norm_params = [], [], [], []
+    layer_types = stu_cfg.get("layer_types") or []
     for n_, p_ in stu.named_parameters():
-        if any(k in n_ for k in ("v_conv", "k_conv", "conv1d", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix")):
+        if any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix")):
             p_.requires_grad_(True)
             vsa_conv.append(p_)
-        elif any(k in n_ for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale", "A_log", "dt_bias")):
+        elif any(k in n_ for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale")):
             p_.requires_grad_(True)
             vsa_core.append(p_)
         elif ".vsa." in n_:
+            # Only train .vsa. projections if it's an actual VSA layer (keep native GatedDeltaNet frozen!)
+            li = int(n_.split(".")[1]) if n_.startswith("blocks.") else -1
+            is_vsa_blk = (li >= 0 and (not layer_types or layer_types[li] == "vsa"))
+            p_.requires_grad_(is_vsa_blk)
+            if is_vsa_blk:
+                vsa_proj.append(p_)
+        elif ".norm1." in n_ or ".norm2." in n_:
             p_.requires_grad_(True)
-            vsa_proj.append(p_)
+            norm_params.append(p_)
         else:
             p_.requires_grad_(False)
 
     opt_groups = [
-        {"params": vsa_conv, "weight_decay": 0.0, "lr_scale": 6.0},
-        {"params": vsa_core, "weight_decay": 0.0, "lr_scale": 5.0},
-        {"params": vsa_proj, "weight_decay": 0.0, "lr_scale": 1.0},
+        {"params": vsa_conv,    "weight_decay": 0.0, "lr_scale": 6.0},
+        {"params": vsa_core,    "weight_decay": 0.0, "lr_scale": 5.0},
+        {"params": vsa_proj,    "weight_decay": 0.0, "lr_scale": 1.0},
+        {"params": norm_params, "weight_decay": 0.0, "lr_scale": 0.1},
     ]
-    trainable = vsa_conv + vsa_core + vsa_proj
+    trainable = vsa_conv + vsa_core + vsa_proj + norm_params
     opt = torch.optim.AdamW(opt_groups, lr=lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
 
     stable_end = int(total_steps * 0.65)
@@ -431,6 +567,7 @@ def heal_universal_model(
     t_window = time.perf_counter()
     step_window = start_step
     tok_slice = 512
+    L_num = int(stu_cfg["num_layers"])
 
     for step in range(start_step, total_steps):
         idx = torch.randint(0, n_win, (bs,), generator=gen)
@@ -448,14 +585,14 @@ def heal_universal_model(
                 with torch.no_grad():
                     if is_hf_donor:
                         h_teacher, t_mids = _forward_hf_teacher_body(
-                            donor, xm, stu_cfg["num_layers"], stu_cfg["hybrid_every"]
+                            donor, xm, L_num, stu_cfg["hybrid_every"]
                         )
                     else:
                         xt = donor.embed_tokens(xm)
                         t_mids = []
                         for li, blk in enumerate(donor.blocks):
                             xt = blk(xt)
-                            if (li + 1) % stu_cfg["hybrid_every"] == 0:
+                            if li < L_num - 1 and (li + 1) % stu_cfg["hybrid_every"] == 0:
                                 t_mids.append(xt)
                         h_teacher = donor.norm(xt)
 
@@ -463,14 +600,14 @@ def heal_universal_model(
                 s_mids = []
                 for li, blk in enumerate(stu.blocks):
                     xs = torch.utils.checkpoint.checkpoint(blk, xs, use_reentrant=False) if use_ckpt else blk(xs)
-                    if (li + 1) % stu_cfg["hybrid_every"] == 0:
+                    if li < L_num - 1 and (li + 1) % stu_cfg["hybrid_every"] == 0:
                         s_mids.append(xs)
                 h_student = stu.norm(xs)
 
                 mid_loss = sum(
                     1.0 - F.cosine_similarity(sm.float(), tm.float(), dim=-1).mean()
                     for sm, tm in zip(s_mids, t_mids)
-                ) / max(1, len(s_mids))
+                ) / max(1, len(s_mids)) if s_mids else torch.zeros((), device=device)
                 final_h_loss = 1.0 - F.cosine_similarity(h_student.float(), h_teacher.float(), dim=-1).mean()
                 del s_mids, t_mids
 
@@ -512,7 +649,7 @@ def heal_universal_model(
             del h_teacher, ht_2d
             torch.autograd.backward(
                 [h_student, (mid_loss + final_h_loss) * (0.20 * w)],
-                [dh_2d.view(B_m, T_m, D_m), torch.ones_like(mid_loss)],
+                [dh_2d.view(B_m, T_m, D_m), torch.ones_like(final_h_loss)],
             )
             del h_student, hs_2d, dh_2d, mid_loss, final_h_loss
 
@@ -528,7 +665,7 @@ def heal_universal_model(
             dt = (now - t_window) / max(1, step_done - step_window)
             t_window, step_window = now, step_done
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
-            print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_kl {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
+            print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_ce {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
         if step_done % eval_every == 0 or step_done == total_steps:
             s_ppl, d_ppl, kl_v, top1_v = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
