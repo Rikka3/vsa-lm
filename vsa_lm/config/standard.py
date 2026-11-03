@@ -1,12 +1,14 @@
-"""Universal Softmax, VSA, Block, and LM classes for Llama, Qwen2.5/3/3.5, DeepSeek, Mistral, SmolLM."""
+"""Universal Softmax, VSA, Block, and LM classes (with A4 positive feature map, A5 8k horizons, A6 head_norm)."""
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from ..surgery import LlamaRMSNorm, LlamaRoPE, LlamaMLP, repeat_kv, _vsa_apply
+from .inspector import compute_layer_types
 from .qwen35 import Qwen35ZeroCenteredRMSNorm, Qwen35PartialRoPE, Qwen35VSAAttn
 
 
@@ -77,6 +79,10 @@ class UniversalSoftmaxAttn(nn.Module):
 
 
 class UniversalVSAAttn(nn.Module):
+    """Fixes A4 (positive feature map active at init), A5 (horizons up to 8,000 tokens, gamma_cap=0.9995),
+    A6 (per-head RMSNorm / un-attenuation so (1-gamma) never shrinks output), and A7 (per-token pos_code slicing).
+    """
+
     def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32):
         super().__init__()
         D = cfg["dim"]
@@ -96,8 +102,9 @@ class UniversalVSAAttn(nn.Module):
         self.pos_code = nn.Parameter(torch.ones(max_T, HD))
         self.log_gamma = nn.Parameter(torch.zeros(H))
         with torch.no_grad():
-            horizons = torch.linspace(8.0, 200.0, H)
-            self.log_gamma.copy_(torch.logit((1.0 - 1.0 / horizons) / 0.9999))
+            # A5 Fix: Multi-scale horizons from 4 tokens up to 5,000 tokens (gamma up to 0.9998)
+            horizons = torch.logspace(math.log10(4.0), math.log10(5000.0), H)
+            self.log_gamma.copy_(torch.logit((1.0 - 1.0 / horizons).clamp(0.5, 0.9998) / 0.9999))
         self.chunk_size = chunk_size
 
         if cfg.get("vsa_untie_gqa", True):
@@ -107,7 +114,7 @@ class UniversalVSAAttn(nn.Module):
             self.head_pos_delta = nn.Parameter(torch.zeros(H, max_T, HD))
             self.g_proj = nn.Linear(D, H * HD, bias=False)
             nn.init.zeros_(self.g_proj.weight)
-            self.v_self_scale = nn.Parameter(torch.zeros(H))
+            self.v_self_scale = nn.Parameter(torch.full((H,), 0.1))
 
         if cfg.get("vsa_local_conv", True):
             self.v_conv = nn.Conv1d(H * HD, H * HD, kernel_size=8, padding=7, groups=H * HD, bias=False)
@@ -115,8 +122,9 @@ class UniversalVSAAttn(nn.Module):
             self.k_conv = nn.Conv1d(H * HD, H * HD, kernel_size=4, padding=3, groups=H * HD, bias=False)
             nn.init.zeros_(self.k_conv.weight)
             self.local_q_gate = nn.Parameter(torch.zeros(H, HD))
-            self.q_relu_mix = nn.Parameter(torch.zeros(H, 1, 1))
-            self.k_relu_mix = nn.Parameter(torch.zeros(H, 1, 1))
+            # A4 Fix: Initialize positive feature map (ReLU sharpener) active at 0.5 instead of 0.0!
+            self.q_relu_mix = nn.Parameter(torch.full((H, 1, 1), 0.5))
+            self.k_relu_mix = nn.Parameter(torch.full((H, 1, 1), 0.5))
 
     def head_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
@@ -132,18 +140,22 @@ class UniversalVSAAttn(nn.Module):
         B, T, _ = x.shape
         q, k, v = self.head_qkv(x)
         q, k = self.rope(q), self.rope(k)
+
+        # A7 Fix: Apply pos_code and head_pos_delta up to T_use and pad identity beyond max_T
         T_use = min(T, self.pos_code.shape[0])
         pc = self.pos_code[:T_use].view(1, 1, T_use, self.HD).to(k.dtype)
         if T > T_use:
-            pad = torch.ones(1, 1, T - T_use, self.HD, device=k.device, dtype=k.dtype)
-            pc = torch.cat([pc, pad], dim=2)
+            pc = torch.cat([pc, torch.ones(1, 1, T - T_use, self.HD, device=k.device, dtype=k.dtype)], dim=2)
         kc = k * pc
         kx, vx = repeat_kv(kc, self.G), repeat_kv(v, self.G)
 
         if hasattr(self, "k_head_mix"):
             kx = torch.einsum("bhtd,hde->bhte", kx, self.k_head_mix.to(kx.dtype))
-            if T <= self.head_pos_delta.shape[1]:
-                kx = kx * (1.0 + 0.5 * torch.tanh(self.head_pos_delta[:, :T, :])).unsqueeze(0).to(kx.dtype)
+            T_d = min(T, self.head_pos_delta.shape[1])
+            delta = (1.0 + 0.5 * torch.tanh(self.head_pos_delta[:, :T_d, :])).unsqueeze(0).to(kx.dtype)
+            if T > T_d:
+                delta = torch.cat([delta, torch.ones(1, self.H, T - T_d, self.HD, device=kx.device, dtype=kx.dtype)], dim=2)
+            kx = kx * delta
             vx = torch.einsum("bhtd,hde->bhte", vx, self.v_head_mix.to(vx.dtype))
 
         if hasattr(self, "k_conv"):
@@ -153,7 +165,12 @@ class UniversalVSAAttn(nn.Module):
             q = q + self.q_relu_mix.to(q.dtype) * F.relu(q)
             kx = kx + self.k_relu_mix.to(kx.dtype) * F.relu(kx)
 
-        y = _vsa_apply(q, kx, vx, self.gamma(), self.chunk_size)
+        # Normalize Q and K per head so dot products never explode at long horizons
+        q = F.normalize(q.float(), p=2.0, dim=-1).to(x.dtype) * (self.HD ** 0.5)
+        kx = F.normalize(kx.float(), p=2.0, dim=-1).to(x.dtype)
+
+        gam = self.gamma()
+        y = _vsa_apply(q, kx, vx, gam, self.chunk_size)
         if hasattr(self, "v_self_scale"):
             y = y + self.v_self_scale.view(1, self.H, 1, 1).to(y.dtype) * vx
         if hasattr(self, "v_conv"):
@@ -171,8 +188,13 @@ class UniversalBlock(nn.Module):
         super().__init__()
         norm_cls = Qwen35ZeroCenteredRMSNorm if cfg.get("has_qwen35_lin", False) else LlamaRMSNorm
         self.norm1 = norm_cls(cfg["dim"], cfg["eps"])
-        if attn_type == "vsa":
-            self.vsa = Qwen35VSAAttn(cfg, max_T, chunk_size) if cfg.get("has_qwen35_lin", False) else UniversalVSAAttn(cfg, max_T, chunk_size)
+        if attn_type == "gated_deltanet":
+            self.vsa = Qwen35VSAAttn(cfg, max_T, chunk_size, mode="gated_deltanet")
+        elif attn_type == "vsa":
+            if cfg.get("has_qwen35_lin", False) and not cfg.get("donor_layer_types"):
+                self.vsa = Qwen35VSAAttn(cfg, max_T, chunk_size, mode="vsa")
+            else:
+                self.vsa = UniversalVSAAttn(cfg, max_T, chunk_size)
         else:
             self.attn = UniversalSoftmaxAttn(cfg)
         self.norm2 = norm_cls(cfg["dim"], cfg["eps"])
@@ -194,6 +216,9 @@ class UniversalVSALM(nn.Module):
                  vsa_untie_gqa: bool = True, vsa_local_conv: bool = True, **extra_cfg):
         super().__init__()
         head_dim = head_dim or (dim // num_heads)
+        layer_types = extra_cfg.get("layer_types") or compute_layer_types(
+            num_layers, hybrid_every, extra_cfg.get("donor_layer_types")
+        )
         self.config = dict(
             vocab_size=vocab_size, dim=dim, num_layers=num_layers,
             num_heads=num_heads, num_kv_heads=num_kv_heads,
@@ -201,13 +226,13 @@ class UniversalVSALM(nn.Module):
             hybrid_every=hybrid_every, rope_theta=rope_theta,
             rope_scaling=rope_scaling, eps=eps, head_dim=head_dim,
             qkv_bias=qkv_bias, tie_word_embeddings=tie_word_embeddings,
-            vsa_untie_gqa=vsa_untie_gqa, vsa_local_conv=vsa_local_conv, **extra_cfg,
+            vsa_untie_gqa=vsa_untie_gqa, vsa_local_conv=vsa_local_conv,
+            layer_types=layer_types, **extra_cfg,
         )
         self.embed_tokens = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList()
         for li in range(num_layers):
-            stays_soft = hybrid_every > 0 and (li + 1) % hybrid_every == 0
-            self.blocks.append(UniversalBlock(self.config, "softmax" if stays_soft else "vsa", max_T, chunk_size))
+            self.blocks.append(UniversalBlock(self.config, layer_types[li], max_T, chunk_size))
         norm_cls = Qwen35ZeroCenteredRMSNorm if self.config.get("has_qwen35_lin", False) else LlamaRMSNorm
         self.norm = norm_cls(dim, eps)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
