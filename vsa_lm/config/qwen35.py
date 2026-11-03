@@ -58,13 +58,6 @@ class Qwen35PartialRoPE(nn.Module):
 
 
 class Qwen35VSAAttn(nn.Module):
-    """Exact VSA replacement for Qwen3_5GatedDeltaNet with:
-      - Pretrained in_proj_qkv + conv1d + silu + L2Norm(q, k) + in_proj_b write gate
-      - Learnable relative RoPE blend (`rope_mix`) so multi-choice options never collide
-      - Q/K positive feature sharpener (`q_relu_mix`, `k_relu_mix`)
-      - 8-tap causal depthwise local value conv (`v_conv` + `local_q_gate`) for local token binding
-    """
-
     def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32):
         super().__init__()
         D = cfg["dim"]
@@ -93,7 +86,7 @@ class Qwen35VSAAttn(nn.Module):
         self.norm = Qwen35RMSNormGated(HD, eps=eps)
         self.out_proj = nn.Linear(self.val_dim, D, bias=False)
 
-        self.rope = LlamaRoPE(HD, 10000.0)
+        self.rope = LlamaRoPE(HD, 10000.0, None)
         self.rope_mix = nn.Parameter(torch.zeros(HV, 1, 1))
         self.pos_code = nn.Parameter(torch.ones(max_T, HD))
         self.log_gamma = nn.Parameter(torch.zeros(HV))
@@ -126,7 +119,6 @@ class Qwen35VSAAttn(nn.Module):
         k = k.repeat_interleave(self.G, dim=2).transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
 
-        # Learnable relative RoPE blend (starts at 0.0 at Step 0, learns relative addressing!)
         rmix = torch.tanh(self.rope_mix).view(1, self.H, 1, 1).to(q.dtype)
         q = q + rmix * (self.rope(q) - q)
         k = k + rmix * (self.rope(k) - k)
