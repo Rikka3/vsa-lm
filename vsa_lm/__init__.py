@@ -1,22 +1,38 @@
-"""VSA-LM: fixed-state linear-attention language models with exact memory editing."""
-from .model import VSALanguageModel
-from .decode import VSARecurrentDecoder
-from .functional import VSAChunkFunction, vsa_parallel_attention
-from .surgery import LlamaVSALM, scan_checkpoint
-from .converter import UniversalVSALM, convert_donor_model
-from .thinking import OpenMythosEngine, LatentThinkController
-from .train import auto_fit_hardware
+"""Modular model family configurations and attention layers for VSA-LM."""
+from .inspector import (
+    fetch_any_donor,
+    load_all_safetensors,
+    inspect_donor_config,
+    map_any_hf_to_student,
+)
+from .qwen35 import (
+    Qwen35ZeroCenteredRMSNorm,
+    Qwen35RMSNormGated,
+    Qwen35PartialRoPE,
+    Qwen35VSAAttn,
+    preserve_visual_tower,
+    reattach_visual_tower,
+)
+from .standard import (
+    UniversalSoftmaxAttn,
+    UniversalVSAAttn,
+    UniversalBlock,
+    UniversalVSALM,
+)
 
 __all__ = [
-    "VSALanguageModel",
-    "LlamaVSALM",
+    "fetch_any_donor",
+    "load_all_safetensors",
+    "inspect_donor_config",
+    "map_any_hf_to_student",
+    "Qwen35ZeroCenteredRMSNorm",
+    "Qwen35RMSNormGated",
+    "Qwen35PartialRoPE",
+    "Qwen35VSAAttn",
+    "preserve_visual_tower",
+    "reattach_visual_tower",
+    "UniversalSoftmaxAttn",
+    "UniversalVSAAttn",
+    "UniversalBlock",
     "UniversalVSALM",
-    "VSARecurrentDecoder",
-    "OpenMythosEngine",
-    "LatentThinkController",
-    "VSAChunkFunction",
-    "vsa_parallel_attention",
-    "auto_fit_hardware",
-    "convert_donor_model",
-    "scan_checkpoint",
 ]
