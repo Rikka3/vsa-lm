@@ -97,7 +97,7 @@ class Qwen35VSAAttn(nn.Module):
     def gamma(self) -> torch.Tensor:
         return (0.9999 * torch.sigmoid(self.log_gamma)).clamp(1e-4, 0.9999).float()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
         mixed_qkv = self.in_proj_qkv(x).transpose(1, 2)
         mixed_qkv = F.silu(self.conv1d(mixed_qkv)[..., :T]).transpose(1, 2)
@@ -122,7 +122,11 @@ class Qwen35VSAAttn(nn.Module):
         if T <= self.head_pos_delta.shape[1]:
             kx = kx * (1.0 + 0.5 * torch.tanh(self.head_pos_delta[:, :T, :])).unsqueeze(0).to(kx.dtype)
         vx = torch.einsum("bhtd,hde->bhte", v, self.v_head_mix.to(v.dtype))
+        return q, kx, vx
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        q, kx, vx = self.extract_qkv(x)
         y = _vsa_apply(q, kx, vx, self.gamma(), self.chunk_size)
         y = y + self.v_self_scale.view(1, self.H, 1, 1).to(y.dtype) * vx
         y_flat = y.transpose(1, 2).reshape(-1, self.HD)
