@@ -6,7 +6,11 @@ import torch.nn.functional as F
 
 from .functional import vsa_parallel_attention, fused_vsa_recurrent_step
 from .model import _rope
-from .surgery import repeat_kv
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return x
+    B, H, T, HD = x.shape
+    return x[:, :, None, :, :].expand(B, H, n_rep, T, HD).reshape(B, H * n_rep, T, HD)
 
 
 class VSARecurrentDecoder:
