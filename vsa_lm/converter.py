@@ -770,11 +770,15 @@ def heal_universal_model(
 
         if step_done % save_every == 0 or step_done == total_steps:
             tmp = out_ckpt + ".tmp"
-            # Save model weights in bf16 on disk for compact checkpoint size while keeping fp32 params in fp32
-            save_sd = {k: (v.cpu() if any(f in k for f in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm")) else v.cpu().to(torch.bfloat16)) for k, v in stu.state_dict().items()}
-            torch.save({"model": save_sd, "opt": opt.state_dict(), "step": step_done,
+            opt_ckpt = os.path.join(work, f"{out_prefix}_optim.pth")
+            save_sd = {k: (v.cpu().float() if any(f in k for f in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm")) else v.cpu().to(torch.bfloat16)) for k, v in stu.state_dict().items()}
+            torch.save({"model": save_sd, "step": step_done,
                         "config": stu_cfg, "injection": ck.get("injection", {})}, tmp)
             os.replace(tmp, out_ckpt)
+            if step_done < total_steps:
+                torch.save(opt.state_dict(), opt_ckpt)
+            elif os.path.isfile(opt_ckpt):
+                os.remove(opt_ckpt)
             if hf_repo and (step_done % 500 == 0 or step_done == total_steps):
                 def _up(p, r):
                     try:
