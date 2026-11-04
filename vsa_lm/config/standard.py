@@ -1,4 +1,4 @@
-"""Universal Softmax, VSA, Block, and LM classes (with A4 positive feature map, A5 8k horizons, A6 head_norm)."""
+"""Universal Softmax, VSA, Block, and LM classes."""
 from __future__ import annotations
 
 import math
@@ -79,10 +79,6 @@ class UniversalSoftmaxAttn(nn.Module):
 
 
 class UniversalVSAAttn(nn.Module):
-    """Fixes A4 (positive feature map active at init), A5 (horizons up to 8,000 tokens, gamma_cap=0.9995),
-    A6 (per-head RMSNorm / un-attenuation so (1-gamma) never shrinks output), and A7 (per-token pos_code slicing).
-    """
-
     def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32):
         super().__init__()
         D = cfg["dim"]
@@ -102,9 +98,8 @@ class UniversalVSAAttn(nn.Module):
         self.pos_code = nn.Parameter(torch.ones(max_T, HD))
         self.log_gamma = nn.Parameter(torch.zeros(H))
         with torch.no_grad():
-            # A5 Fix: Multi-scale horizons from 4 tokens up to 5,000 tokens (gamma up to 0.9998)
-            horizons = torch.logspace(math.log10(4.0), math.log10(5000.0), H)
-            self.log_gamma.copy_(torch.logit((1.0 - 1.0 / horizons).clamp(0.5, 0.9998) / 0.9999))
+            horizons = torch.logspace(math.log10(4.0), math.log10(2000.0), H)
+            self.log_gamma.copy_(torch.logit((1.0 - 1.0 / horizons).clamp(0.5, 0.9995) / 0.9999))
         self.chunk_size = chunk_size
 
         if cfg.get("vsa_untie_gqa", True):
@@ -114,7 +109,7 @@ class UniversalVSAAttn(nn.Module):
             self.head_pos_delta = nn.Parameter(torch.zeros(H, max_T, HD))
             self.g_proj = nn.Linear(D, H * HD, bias=False)
             nn.init.zeros_(self.g_proj.weight)
-            self.v_self_scale = nn.Parameter(torch.full((H,), 0.1))
+            self.v_self_scale = nn.Parameter(torch.zeros(H))
 
         if cfg.get("vsa_local_conv", True):
             self.v_conv = nn.Conv1d(H * HD, H * HD, kernel_size=8, padding=7, groups=H * HD, bias=False)
@@ -122,9 +117,8 @@ class UniversalVSAAttn(nn.Module):
             self.k_conv = nn.Conv1d(H * HD, H * HD, kernel_size=4, padding=3, groups=H * HD, bias=False)
             nn.init.zeros_(self.k_conv.weight)
             self.local_q_gate = nn.Parameter(torch.zeros(H, HD))
-            # A4 Fix: Initialize positive feature map (ReLU sharpener) active at 0.5 instead of 0.0!
-            self.q_relu_mix = nn.Parameter(torch.full((H, 1, 1), 0.5))
-            self.k_relu_mix = nn.Parameter(torch.full((H, 1, 1), 0.5))
+            self.q_relu_mix = nn.Parameter(torch.zeros(H, 1, 1))
+            self.k_relu_mix = nn.Parameter(torch.zeros(H, 1, 1))
 
     def head_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
@@ -141,7 +135,6 @@ class UniversalVSAAttn(nn.Module):
         q, k, v = self.head_qkv(x)
         q, k = self.rope(q), self.rope(k)
 
-        # A7 Fix: Apply pos_code and head_pos_delta up to T_use and pad identity beyond max_T
         T_use = min(T, self.pos_code.shape[0])
         pc = self.pos_code[:T_use].view(1, 1, T_use, self.HD).to(k.dtype)
         if T > T_use:
@@ -164,10 +157,6 @@ class UniversalVSAAttn(nn.Module):
             kx = kx + k_loc
             q = q + self.q_relu_mix.to(q.dtype) * F.relu(q)
             kx = kx + self.k_relu_mix.to(kx.dtype) * F.relu(kx)
-
-        # Normalize Q and K per head so dot products never explode at long horizons
-        q = F.normalize(q.float(), p=2.0, dim=-1).to(x.dtype) * (self.HD ** 0.5)
-        kx = F.normalize(kx.float(), p=2.0, dim=-1).to(x.dtype)
 
         gam = self.gamma()
         y = _vsa_apply(q, kx, vx, gam, self.chunk_size)
