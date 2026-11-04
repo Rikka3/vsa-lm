@@ -118,6 +118,9 @@ class VSARecurrentDecoder:
                 q = q + ly.q_relu_mix.to(q.dtype) * F.relu(q)
                 kx = kx + ly.k_relu_mix.to(kx.dtype) * F.relu(kx)
 
+            q = F.normalize(q.float(), p=2.0, dim=-1).to(x.dtype) * (HD ** 0.5)
+            kx = F.normalize(kx.float(), p=2.0, dim=-1).to(x.dtype)
+
             gam = ly.gamma()
             qf, kf, vf = q.float(), (write_scale * kx.float()), vx.float()
             M = states[li]
@@ -181,3 +184,142 @@ class VSARecurrentDecoder:
 
         if self.is_universal:
             hidden = None
+            pos = start_pos
+            for t in range(T):
+                hidden, states, kv_caches = self.step(ids[:, t : t + 1], pos, states, kv_caches)
+                pos += 1
+            return hidden, states, kv_caches
+
+        x = m.embed(ids)
+        for li, block in enumerate(m.blocks):
+            layer, q, k, v, g = self._proj(block, block.norm1(x), B, T)
+            if hasattr(block, "vsa"):
+                HD = layer.HD
+                if getattr(layer, "use_rope", False):
+                    q, k = _rope(q), _rope(k)
+                k = k * (layer.effective_pos_code(T, k.dtype) if hasattr(layer, "effective_pos_code") else layer.pos_code[:T].view(1, 1, T, HD).to(k.dtype))
+                gamma = self._gamma(layer)
+                y = vsa_parallel_attention(q.float(), k.float(), v.float(), gamma)
+                if getattr(layer, "head_norm", None) is not None:
+                    y = layer.head_norm(y.to(x.dtype))
+                w = gamma.view(1, layer.H, 1) ** torch.arange(T - 1, -1, -1, device=x.device, dtype=torch.float32)
+                states[li] = torch.einsum("bhte,bhtd->bhed", k.float() * w.unsqueeze(-1), v.float())
+            else:
+                q, k = _rope(q), _rope(k)
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                kv_caches[li] = (k, v)
+            y = (y.to(x.dtype) * g).transpose(1, 2).reshape(B, T, -1)
+            x = x + layer.to_out(y)
+            u = block.ffn_up(block.norm2(x))
+            hu = block.ffn_up.out_features // 2
+            x = x + block.ffn_down(F.silu(u[..., :hu]) * u[..., hu:])
+        return m.norm_f(x)[:, -1:], states, kv_caches
+
+    @torch.no_grad()
+    def step(self, token: torch.Tensor, pos: int, states, kv_caches, record=None, write_scale: float = 1.0):
+        m = self.model
+        if self.is_universal:
+            with torch.autocast("cuda", torch.bfloat16, enabled=token.is_cuda):
+                x = m.embed_tokens(token)
+                for li, blk in enumerate(m.blocks):
+                    x = self._step_universal_block(li, blk, x, pos, states, kv_caches, record=record, write_scale=write_scale)
+                return m.norm(x), states, kv_caches
+
+        x = m.embed(token)
+        B = x.shape[0]
+        for li, block in enumerate(m.blocks):
+            layer, q, k, v, g = self._proj(block, block.norm1(x), B, 1)
+            if hasattr(block, "vsa"):
+                H, HD = layer.H, layer.HD
+                if getattr(layer, "use_rope", False):
+                    q, k = _rope(q, pos), _rope(k, pos)
+                if hasattr(layer, "effective_pos_code"):
+                    if pos < layer.pos_code.shape[0]:
+                        pc = layer.effective_pos_code(pos + 1, k.dtype)[:, :, pos : pos + 1, :]
+                    elif self.wrap_positions:
+                        p = pos % layer.pos_code.shape[0]
+                        pc = layer.effective_pos_code(p + 1, k.dtype)[:, :, p : p + 1, :]
+                    else:
+                        pc = torch.ones(1, 1, 1, HD, device=k.device, dtype=k.dtype)
+                    k = k * pc
+                else:
+                    p = pos % layer.pos_code.shape[0] if self.wrap_positions else min(pos, layer.pos_code.shape[0] - 1)
+                    k = k * (layer.pos_code[p].view(1, 1, 1, HD).to(k.dtype) if pos < layer.pos_code.shape[0] or self.wrap_positions else 1.0)
+                gamma = self._gamma(layer)
+                omg = (1.0 - gamma).view(1, H, 1, 1)
+                qf, kf, vf = q.float(), k.float(), v.float()
+                M = states[li]
+                carry = torch.einsum("bhed,bhe->bhd", M, qf.squeeze(2))
+                y = (gamma.view(1, H, 1, 1) * carry.unsqueeze(2) + write_scale * (qf * kf).sum(-1, keepdim=True) * vf) * omg / (HD ** 0.5)
+                if getattr(layer, "head_norm", None) is not None:
+                    y = layer.head_norm(y.to(x.dtype))
+                states[li] = gamma.view(1, H, 1, 1) * M + write_scale * torch.einsum("bhe,bhd->bhed", kf.squeeze(2), vf.squeeze(2))
+                if record is not None:
+                    record[li].append((pos, (write_scale * kf.squeeze(2)[0]).clone(), vf.squeeze(2)[0].clone()))
+            else:
+                q, k = _rope(q, pos), _rope(k, pos)
+                pk, pv = kv_caches[li]
+                pk, pv = torch.cat([pk, k], dim=2), torch.cat([pv, v], dim=2)
+                kv_caches[li] = (pk, pv)
+                y = F.scaled_dot_product_attention(q, pk, pv)
+            y = (y.to(x.dtype) * g).transpose(1, 2).reshape(B, 1, -1)
+            x = x + layer.to_out(y)
+            u = block.ffn_up(block.norm2(x))
+            hu = block.ffn_up.out_features // 2
+            x = x + block.ffn_down(F.silu(u[..., :hu]) * u[..., hu:])
+        return m.norm_f(x), states, kv_caches
+
+    @torch.no_grad()
+    def generate(self, prompt: torch.Tensor, max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, eos_ids: set[int] | None = None):
+        out = prompt.clone()
+        x, states, kv = self.prefill(out)
+        logits = self.model.lm_head(x)[:, -1, :].float()
+        pos = prompt.shape[1] - 1
+        for _ in range(max_new_tokens):
+            nxt = self._sample(logits, temperature, top_k)
+            out = torch.cat([out, nxt], dim=1)
+            if eos_ids and int(nxt[0, 0].item()) in eos_ids:
+                break
+            pos += 1
+            x, states, kv = self.step(nxt, pos, states, kv)
+            logits = self.model.lm_head(x)[:, -1, :].float()
+        return out
+
+    @torch.no_grad()
+    def continue_generate(self, ids: torch.Tensor, states, kv_caches, start_pos: int,
+                          max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, eos_ids: set[int] | None = None):
+        out, pos, logits = [], start_pos, None
+        for t in range(ids.shape[1]):
+            x, states, kv_caches = self.step(ids[:, t : t + 1], pos, states, kv_caches)
+            logits = self.model.lm_head(x)[:, -1, :].float()
+            pos += 1
+        for _ in range(max_new_tokens):
+            nxt = self._sample(logits, temperature, top_k)
+            out.append(nxt)
+            if eos_ids and int(nxt[0, 0].item()) in eos_ids:
+                break
+            x, states, kv_caches = self.step(nxt, pos, states, kv_caches)
+            logits = self.model.lm_head(x)[:, -1, :].float()
+            pos += 1
+        toks = torch.cat(out, dim=1) if out else torch.empty(ids.shape[0], 0, dtype=torch.long, device=ids.device)
+        return toks, states, kv_caches, pos
+
+    @torch.no_grad()
+    def memorize(self, ids: torch.Tensor, states, kv_caches, start_pos: int):
+        traces = [[] for _ in self.model.blocks]
+        pos = start_pos
+        for t in range(ids.shape[1]):
+            _, states, kv_caches = self.step(ids[:, t : t + 1], pos, states, kv_caches, record=traces)
+            pos += 1
+        return states, kv_caches, pos, traces
+
+    @torch.no_grad()
+    def forget(self, traces, states, next_pos: int):
+        for li, trace in enumerate(traces):
+            if not trace:
+                continue
+            gamma = self._gamma(self.model.blocks[li].vsa)
+            for (p, k, v) in trace:
+                w = gamma.view(-1, 1, 1) ** float(next_pos - 1 - p)
+                states[li] -= w * torch.einsum("he,hd->hed", k, v).unsqueeze(0)
+        return states
