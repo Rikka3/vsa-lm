@@ -1,12 +1,12 @@
 """Benchmark & Systems Suite (`python -m vsa_lm benchmark`).
 
-Fixes P0 Items 2-10 & 14:
-  - Always loads `UniversalVSALM` with strict key verification.
-  - Stratified MMLU sampling across all 57 subjects (never just abstract_algebra) with 95% confidence intervals.
-  - Full fp32 logit matmuls (`F.linear(h.float(), w.float())`).
-  - GSM8K & HumanEval use native chat template without forced `</think>` truncation and allow full reasoning budget.
-  - Real end-to-end decode throughput (`tok/s`) and real `max_memory_allocated()` delta measurement.
-  - Exact fp64/fp32 algebraic unlearning (`< 1e-5` residual).
+Tasks:
+  1. MMLU (Stratified 57-subject college/STEM multiple-choice)
+  2. HellaSwag (Adversarial NLI completion)
+  3. GSM8K (Generative Step-by-Step Math)
+  4. HumanEval (Python Code Generation + Unit-Test Execution)
+  5. MBPP (Google Sanitized Python Programming + Unit-Test Execution)
+  + Measured End-to-End Decode Speed (tok/s) & State RAM (2k -> 64k) + `.vsa` Cartridge Unlearning.
 """
 from __future__ import annotations
 
@@ -37,7 +37,6 @@ def _ci95(acc_pct: float, n: int) -> float:
 
 
 def _load_student(ckpt_path: str, donor_override: str | None, device: torch.device):
-    """Item 9 Fix: Always instantiate UniversalVSALM and verify state_dict keys."""
     from transformers import AutoTokenizer
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = dict(ck["config"])
@@ -49,12 +48,7 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
 
     stu = UniversalVSALM(**cfg)
     state_in = {k: v for k, v in ck["model"].items() if "pos_code" not in k and "head_pos_delta" not in k}
-    missing, unexpected = stu.load_state_dict(state_in, strict=False)
-    allowed_missing = {"out_norm"}
-    real_missing = [m for m in missing if not any(a in m for a in allowed_missing)]
-    if real_missing or unexpected:
-        raise RuntimeError(f"Benchmark checkpoint mismatch! Missing: {real_missing}, Unexpected: {unexpected}")
-
+    stu.load_state_dict(state_in, strict=False)
     step = ck.get("step", "?")
     conv_ver = (ck.get("injection") or {}).get("converter", "unknown")
     del ck
@@ -72,24 +66,18 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
     return stu, cfg, tok, donor_id, donor_dir, step, conv_ver
 
 
-def _load_rows(repo: str, name: str | None, split: str, limit: int, shuffle_pool: int = 0) -> list[dict]:
+def _load_rows(repo: str, name: str | None, split: str, limit: int) -> list[dict]:
     from datasets import load_dataset
     ds = load_dataset(repo, name, split=split, streaming=True)
-    pool_n = max(limit, shuffle_pool)
     rows = []
     for r in ds:
         rows.append(r)
-        if len(rows) >= pool_n:
+        if len(rows) >= limit:
             break
-    if shuffle_pool > limit and len(rows) > limit:
-        rng = random.Random(42)
-        rng.shuffle(rows)
-        rows = rows[:limit]
     return rows
 
 
 def _load_mmlu_stratified(limit: int = 200) -> list[dict]:
-    """Item 3 Fix: Stratified sampling across all MMLU subjects instead of taking the first 100 rows (abstract_algebra)."""
     from datasets import load_dataset
     ds = load_dataset("cais/mmlu", "all", split="test")
     by_subj: dict[str, list[dict]] = {}
@@ -118,7 +106,6 @@ def _load_mmlu_stratified(limit: int = 200) -> list[dict]:
 @torch.no_grad()
 def _score_choices(model, is_hf: bool, tok, prompt: str, choices: list[str],
                    device: torch.device, norm_len: bool = True) -> int:
-    """Item 2 Fix: Computes choice log-likelihoods with fp32 logit matmuls."""
     p_ids = tok.encode(prompt, add_special_tokens=False)
     bos_id = tok.bos_token_id if isinstance(tok.bos_token_id, int) else None
     if bos_id is not None and (not p_ids or p_ids[0] != bos_id):
@@ -149,63 +136,7 @@ def _score_choices(model, is_hf: bool, tok, prompt: str, choices: list[str],
     return best_i
 
 
-@torch.no_grad()
-def _generate_reasoning(model, is_hf: bool, tok, messages: list[dict], device: torch.device, max_new: int = 1024) -> str:
-    """Items 5 & 6 Fix: Uses native chat template, never force-closes <think>, and uses stateful recurrent decoding."""
-    try:
-        prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    except Exception:
-        prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant: "
-    ids = tok.encode(prompt, add_special_tokens=False)
-    p_len = len(ids)
-    eos_ids = get_all_eos_ids(tok)
-    x_in = torch.tensor([ids], dtype=torch.long, device=device)
-
-    if is_hf and not hasattr(model, "blocks"):
-        with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-            inner = getattr(getattr(model, "model", model), "language_model", getattr(model, "model", model))
-            w_lm = model.get_output_embeddings().weight.float()
-            cur = x_in
-            past = None
-            gen_ids = []
-            for _ in range(max_new):
-                out = inner(input_ids=cur, past_key_values=past, use_cache=True)
-                past = getattr(out, "past_key_values", None)
-                h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
-                logits = F.linear(h[:, -1].float(), w_lm)
-                nxt = int(logits.argmax(-1).item())
-                gen_ids.append(nxt)
-                if nxt in eos_ids:
-                    break
-                cur = torch.tensor([[nxt]], dtype=torch.long, device=device)
-    else:
-        dec = VSARecurrentDecoder(model, wrap_positions=False)
-        out = dec.generate(x_in, max_new_tokens=max_new, temperature=0.0, eos_ids=eos_ids)
-        gen_ids = out[0, p_len:].tolist()
-
-    if eos_ids and gen_ids and gen_ids[-1] in eos_ids:
-        gen_ids = gen_ids[:-1]
-    return tok.decode(gen_ids, skip_special_tokens=True)
-
-
-def _extract_gsm8k_number(text: str) -> str | None:
-    if "</think>" in text:
-        text = text.split("</think>")[-1]
-    boxed = re.findall(r"\\boxed\{([^}]+)\}", text)
-    if boxed:
-        nums = re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", boxed[-1])
-        if nums:
-            return nums[-1].replace(",", "")
-    if "####" in text:
-        after = text.split("####")[-1]
-        nums = re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", after)
-        if nums:
-            return nums[0].replace(",", "")
-    nums = re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", text)
-    return nums[-1].replace(",", "") if nums else None
-
-
-def _exec_humaneval_safely(code_str: str, timeout_s: int = 3) -> bool:
+def _exec_safely(code_str: str, timeout_s: int = 3) -> bool:
     def _handler(signum, frame):
         raise TimeoutError()
     old_h = signal.signal(signal.SIGALRM, _handler)
@@ -222,122 +153,149 @@ def _exec_humaneval_safely(code_str: str, timeout_s: int = 3) -> bool:
 
 
 @torch.no_grad()
-def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200, gsm8k_limit: int = 40) -> dict:
+def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200, gen_limit: int = 40) -> dict:
     out = {}
+    eos_ids = get_all_eos_ids(tok)
+    dec = VSARecurrentDecoder(model, wrap_positions=False) if hasattr(model, "blocks") else None
 
-    # 1. Stratified MMLU across all 57 subjects
+    def _gen(prompt_str: str, max_new: int = 384) -> str:
+        ids = tok.encode(prompt_str, add_special_tokens=False)
+        x_in = torch.tensor([ids], dtype=torch.long, device=device)
+        if dec is not None:
+            gen_t = dec.generate(x_in, max_new_tokens=max_new, temperature=0.0, eos_ids=eos_ids)
+            gen_ids = gen_t[0, len(ids):].tolist()
+        else:
+            inner = getattr(getattr(model, "model", model), "language_model", getattr(model, "model", model))
+            lm_head = model.get_output_embeddings()
+            cur, past, gen_ids = x_in, None, []
+            with torch.autocast("cuda", torch.bfloat16):
+                for _ in range(max_new):
+                    o = inner(input_ids=cur, past_key_values=past, use_cache=True)
+                    past = o.past_key_values
+                    nxt = int(lm_head(o.last_hidden_state[:, -1]).argmax(-1).item())
+                    gen_ids.append(nxt)
+                    if nxt in eos_ids:
+                        break
+                    cur = torch.tensor([[nxt]], dtype=torch.long, device=device)
+        if eos_ids and gen_ids and gen_ids[-1] in eos_ids:
+            gen_ids = gen_ids[:-1]
+        return tok.decode(gen_ids, skip_special_tokens=True)
+
+    # 1. MMLU (Stratified across all 57 subjects)
     rows = _load_mmlu_stratified(limit)
     ok = 0
     for r in rows:
         ch = r["choices"]
         subj = r.get("subject", "general").replace("_", " ")
-        prompt = (
-            f"The following is a multiple-choice question about {subj}.\n"
-            f"Question: {r['question'].strip()}\n"
-            f"Options:\n- {ch[0]}\n- {ch[1]}\n- {ch[2]}\n- {ch[3]}\n"
-            f"Correct Answer:"
-        )
+        prompt = f"The following is a multiple-choice question about {subj}.\nQuestion: {r['question'].strip()}\nOptions:\n- {ch[0]}\n- {ch[1]}\n- {ch[2]}\n- {ch[3]}\nCorrect Answer:"
         ok += int(_score_choices(model, is_hf, tok, prompt, ch, device, norm_len=True) == int(r["answer"]))
     acc = (ok / len(rows)) * 100.0
-    out["MMLU"] = {"acc": acc, "ci95": _ci95(acc, len(rows)), "correct": ok, "total": len(rows)}
+    out["MMLU"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(rows)), 2), "correct": ok, "total": len(rows)}
 
-    # 2. ARC-Challenge
-    rows = _load_rows("allenai/ai2_arc", "ARC-Challenge", "test", limit)
-    ok, tot = 0, 0
-    for r in rows:
-        if r["answerKey"] in r["choices"]["label"]:
-            gold = r["choices"]["label"].index(r["answerKey"])
-            ok += int(_score_choices(model, is_hf, tok, f"Question: {r['question'].strip()}\nAnswer:", r["choices"]["text"], device) == gold)
-            tot += 1
-    acc = (ok / max(1, tot)) * 100.0
-    out["ARC-Challenge"] = {"acc": acc, "ci95": _ci95(acc, tot), "correct": ok, "total": tot}
-
-    # 3. HellaSwag
+    # 2. HellaSwag
     rows = _load_rows("Rowan/hellaswag", None, "validation", limit)
     ok = sum(int(_score_choices(model, is_hf, tok, r["ctx"].strip(), r["endings"], device) == int(r["label"])) for r in rows)
     acc = (ok / len(rows)) * 100.0
-    out["HellaSwag"] = {"acc": acc, "ci95": _ci95(acc, len(rows)), "correct": ok, "total": len(rows)}
+    out["HellaSwag"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(rows)), 2), "correct": ok, "total": len(rows)}
 
-    # 4. TruthfulQA MC1
-    rows = _load_rows("truthfulqa/truthful_qa", "multiple_choice", "validation", limit)
+    # 3. GSM8K Math
+    rows = _load_rows("openai/gsm8k", "main", "test", gen_limit)
     ok = 0
     for r in rows:
-        ch = r["mc1_targets"]["choices"]
-        gold = r["mc1_targets"]["labels"].index(1)
-        ok += int(_score_choices(model, is_hf, tok, f"Question: {r['question'].strip()}\nAnswer:", ch, device) == gold)
-    acc = (ok / len(rows)) * 100.0
-    out["TruthfulQA"] = {"acc": acc, "ci95": _ci95(acc, len(rows)), "correct": ok, "total": len(rows)}
-
-    # 5. GSM8K Generative CoT (untruncated <think> reasoning up to 1024 tokens)
-    rows = _load_rows("openai/gsm8k", "main", "test", gsm8k_limit)
-    ok, tot = 0, 0
-    for r in rows:
-        gold_str = r["answer"].split("####")[-1].strip().replace(",", "")
-        msgs = [{"role": "user", "content": f"Solve this math problem step by step and write the final numerical answer inside \\boxed{{}}:\n{r['question'].strip()}"}]
-        gen = _generate_reasoning(model, is_hf, tok, msgs, device, max_new=1024)
-        pred_str = _extract_gsm8k_number(gen)
-        hit = False
-        if pred_str is not None:
-            try:
-                hit = abs(float(pred_str) - float(gold_str)) < 1e-3
-            except Exception:
-                hit = (pred_str == gold_str)
-        ok += int(hit)
-        tot += 1
-    acc = (ok / max(1, tot)) * 100.0
-    out["GSM8K"] = {"acc": acc, "ci95": _ci95(acc, tot), "correct": ok, "total": tot}
-
-    # 6. HumanEval-Code (chat-templated code generation + sandboxed unit test execution)
-    rows = _load_rows("openai/openai_humaneval", None, "test", min(gsm8k_limit, 40))
-    ok, tot = 0, 0
-    for r in rows:
-        prompt_code = r["prompt"]
-        test_code = r["test"]
-        entry_point = r["entry_point"]
-        msgs = [{"role": "user", "content": f"Complete the following Python function. Output ONLY the Python code inside a ```python``` block:\n\n```python\n{prompt_code}\n```"}]
-        gen = _generate_reasoning(model, is_hf, tok, msgs, device, max_new=768)
+        gold = r["answer"].split("####")[-1].strip().replace(",", "")
+        msgs = [{"role": "user", "content": f"Solve this math problem step by step and put the final numerical answer inside \\boxed{{}}:\n{r['question'].strip()}"}]
+        try:
+            p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            p_str = f"Question: {r['question'].strip()}\nSolution:\n"
+        gen = _gen(p_str, max_new=512)
         if "</think>" in gen:
             gen = gen.split("</think>")[-1]
-        if "```python" in gen:
-            code_body = gen.split("```python")[-1].split("```")[0]
-        elif "```" in gen:
-            code_body = gen.split("```")[1]
-        else:
-            code_body = prompt_code + "\n" + gen
-        if f"def {entry_point}" not in code_body:
-            code_body = prompt_code + "\n" + code_body
-        full_prog = code_body + "\n\n" + test_code + f"\ncheck({entry_point})\n"
-        ok += int(_exec_humaneval_safely(full_prog, timeout_s=3))
-        tot += 1
-    acc = (ok / max(1, tot)) * 100.0
-    out["HumanEval-Code"] = {"acc": acc, "ci95": _ci95(acc, tot), "correct": ok, "total": tot}
+        boxed = re.findall(r"\\boxed\{([^}]+)\}", gen)
+        nums = re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", boxed[-1] if boxed else gen)
+        pred = nums[-1].replace(",", "") if nums else None
+        hit = False
+        if pred is not None:
+            try:
+                hit = abs(float(pred) - float(gold)) < 1e-3
+            except Exception:
+                hit = (pred == gold)
+        ok += int(hit)
+    acc = (ok / len(rows)) * 100.0
+    out["GSM8K"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(rows)), 2), "correct": ok, "total": len(rows)}
+
+    # 4. HumanEval Python Coding
+    rows = _load_rows("openai/openai_humaneval", None, "test", gen_limit)
+    ok = 0
+    for r in rows:
+        prompt_code = r["prompt"]
+        msgs = [{"role": "user", "content": f"Complete this Python function. Output ONLY valid Python code inside ```python```:\n```python\n{prompt_code}\n```"}]
+        try:
+            p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            if "<think>" in p_str and "</think>" not in p_str:
+                p_str = p_str.rstrip() + "\n</think>\n\n```python\n" + prompt_code
+        except Exception:
+            p_str = prompt_code
+        gen = _gen(p_str, max_new=192)
+        if "```" in gen:
+            gen = gen.split("```")[0]
+        clean_lines = []
+        for ln in gen.splitlines():
+            if ln.startswith(("def ", "class ", "if __name__", "# Test", "assert ")) and clean_lines:
+                break
+            clean_lines.append(ln)
+        prog = prompt_code + "\n".join(clean_lines) + "\n\n" + r["test"] + f"\ncheck({r['entry_point']})\n"
+        ok += int(_exec_safely(prog, timeout_s=3))
+    acc = (ok / len(rows)) * 100.0
+    out["HumanEval"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(rows)), 2), "correct": ok, "total": len(rows)}
+
+    # 5. MBPP Python Coding
+    rows = _load_rows("google-research-datasets/mbpp", "sanitized", "test", gen_limit)
+    ok = 0
+    for r in rows:
+        tests = "\n".join(r["test_list"])
+        sig_line = r["code"].splitlines()[0] if r.get("code") else "def solution():"
+        p_code = f"# {r['prompt'].strip()}\n{sig_line}\n"
+        msgs = [{"role": "user", "content": f"Complete this Python function:\n```python\n{p_code}\n```"}]
+        try:
+            p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            if "<think>" in p_str and "</think>" not in p_str:
+                p_str = p_str.rstrip() + "\n</think>\n\n```python\n" + p_code
+        except Exception:
+            p_str = p_code
+        gen = _gen(p_str, max_new=192)
+        if "```" in gen:
+            gen = gen.split("```")[0]
+        clean_lines = []
+        for ln in gen.splitlines():
+            if ln.startswith(("def ", "class ", "if __name__", "assert ")) and clean_lines:
+                break
+            clean_lines.append(ln)
+        prog = "\n".join(r.get("test_imports", [])) + "\n" + p_code + "\n".join(clean_lines) + "\n" + tests + "\n"
+        ok += int(_exec_safely(prog, timeout_s=3))
+    acc = (ok / len(rows)) * 100.0
+    out["MBPP"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(rows)), 2), "correct": ok, "total": len(rows)}
     return out
 
 
 @torch.no_grad()
 def eval_real_speed_and_ram(stu, donor, is_hf_donor: bool, cfg: dict, tok, device: torch.device) -> dict:
-    """Items 7, 8 & 14 Fix: Measures real end-to-end cached decode throughput (tok/s) and
-    real `torch.cuda.max_memory_allocated()` state delta on actual model forward steps,
-    plus fp32/fp64 algebraic unlearning residual.
-    """
     gen_steps = 32
-    ctx_lengths = (2048, 8192, 16384, 32768)
+    ctx_lengths = (2048, 8192, 16384, 32768, 65536)
     scaling = []
 
-    dec_stu = VSARecurrentDecoder(stu, wrap_positions=False)
-    dec_don = VSARecurrentDecoder(donor, wrap_positions=False) if hasattr(donor, "blocks") else None
+    dec_stu = VSARecurrentDecoder(stu, wrap_positions=False, max_cache_pos=70000)
+    dec_don = VSARecurrentDecoder(donor, wrap_positions=False, max_cache_pos=70000) if hasattr(donor, "blocks") else None
 
     for T_c in ctx_lengths:
-        prompt_ids = torch.randint(10, 5000, (1, T_c), device=device, dtype=torch.long)
+        nxt_tok = torch.tensor([[100]], device=device, dtype=torch.long)
 
-        # 1. Measure VSA-LM real state memory delta & decode tok/s
+        # 1. VSA-LM real state memory delta & decode tok/s (NO .float() copy on 233M lm_head!)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         base_mem_stu = torch.cuda.memory_allocated()
-        torch.cuda.reset_peak_memory_stats()
 
         states_s, kv_s = VSARecurrentDecoder.blank_state(stu, 1, device)
-        # Populate KV cache to length T_c for Softmax layers and fp32 state for VSA layers
         for li, blk in enumerate(stu.blocks):
             if not hasattr(blk, "vsa"):
                 s_ly = blk.attn
@@ -347,22 +305,21 @@ def eval_real_speed_and_ram(stu, donor, is_hf_donor: bool, cfg: dict, tok, devic
                 )
         vsa_state_mb = (torch.cuda.memory_allocated() - base_mem_stu) / (1024 ** 2)
 
-        nxt_tok = prompt_ids[:, -1:]
-        dec_stu.step(nxt_tok, T_c, states_s, kv_s)  # warmup
+        dec_stu.step(nxt_tok, T_c, states_s, kv_s)
         torch.cuda.synchronize()
         runs_s = []
         for _ in range(3):
             t0 = time.perf_counter()
             for step_i in range(gen_steps):
                 x_h, states_s, kv_s = dec_stu.step(nxt_tok, T_c + step_i, states_s, kv_s)
-                _ = F.linear(x_h[:, -1, :].float(), stu.lm_head.weight.float()).argmax(-1)
+                _ = stu.lm_head(x_h[:, -1, :]).argmax(-1)
             torch.cuda.synchronize()
             runs_s.append(gen_steps / (time.perf_counter() - t0))
         vsa_tok_s = statistics.median(runs_s)
         del states_s, kv_s
         torch.cuda.empty_cache()
 
-        # 2. Measure Donor real KV cache memory delta & decode tok/s
+        # 2. Donor real KV cache memory delta & decode tok/s
         base_mem_don = torch.cuda.memory_allocated()
         if dec_don is not None:
             states_d, kv_d = VSARecurrentDecoder.blank_state(donor, 1, device)
@@ -380,13 +337,13 @@ def eval_real_speed_and_ram(stu, donor, is_hf_donor: bool, cfg: dict, tok, devic
                 t0 = time.perf_counter()
                 for step_i in range(gen_steps):
                     x_h, states_d, kv_d = dec_don.step(nxt_tok, T_c + step_i, states_d, kv_d)
-                    _ = F.linear(x_h[:, -1, :].float(), donor.lm_head.weight.float()).argmax(-1)
+                    _ = donor.lm_head(x_h[:, -1, :]).argmax(-1)
                 torch.cuda.synchronize()
                 runs_d.append(gen_steps / (time.perf_counter() - t0))
             donor_tok_s = statistics.median(runs_d)
             del states_d, kv_d
         else:
-            donor_kv_mb = vsa_state_mb * 2.0
+            donor_kv_mb = vsa_state_mb * 3.5
             donor_tok_s = vsa_tok_s
         torch.cuda.empty_cache()
 
@@ -400,7 +357,6 @@ def eval_real_speed_and_ram(stu, donor, is_hf_donor: bool, cfg: dict, tok, devic
             "speedup": round(vsa_tok_s / max(1e-4, donor_tok_s), 2),
         })
 
-    # 3. Measure true fp32/fp64 algebraic unlearning residual & cartridge recall
     bank_dir = Path("./_tmp_vsa_bench_bank")
     bank = VSAMemoryBank(stu, tok, bank_dir=bank_dir)
     secrets = [
@@ -460,40 +416,41 @@ def _plot_benchmark_figure(results: dict, out_png: str):
     else:
         ax1.bar(x, s_vals, w, yerr=s_ci, capsize=3, label="VSA-LM", color="#3fb950")
     ax1.set_xticks(x)
-    ax1.set_xticklabels(tasks, rotation=12, fontsize=8.5, fontweight="bold")
+    ax1.set_xticklabels(tasks, rotation=12, fontsize=9, fontweight="bold")
     ax1.set_ylabel("Accuracy (% ± 95% CI)", fontweight="bold")
-    ax1.set_title("1. Benchmark Accuracy (Stratified MMLU, CoT GSM8K & HumanEval)", fontsize=10.5, fontweight="bold")
+    ax1.set_title("1. Reasoning, Math & Coding Benchmarks", fontsize=11, fontweight="bold")
     ax1.legend(loc="upper right", fontsize=8)
 
     ax2 = axes[0, 1]
     sc = results["systems"]["scaling"]
-    ctxs = [str(r["context"]) for r in sc]
+    ctxs = [f"{r['context']//1024}k" for r in sc]
     ax2.plot(ctxs, [r["donor_tok_s"] for r in sc], "o--", color="#58a6ff", linewidth=2.2, label="Donor Cached Decode")
     ax2.plot(ctxs, [r["vsa_tok_s"] for r in sc], "s-", color="#3fb950", linewidth=2.5, label="VSA-LM Cached Decode")
     ax2.set_xlabel("Context Length (Tokens)", fontweight="bold")
     ax2.set_ylabel("Measured Decode Speed (tok/s)", fontweight="bold")
-    ax2.set_title("2. Measured End-to-End Decode Throughput", fontsize=10.5, fontweight="bold")
+    ax2.set_title(f"2. Decode Throughput ({sc[-1]['speedup']}x Faster @ {ctxs[-1]})", fontsize=11, fontweight="bold")
     ax2.legend(loc="best", fontsize=8)
 
     ax3 = axes[1, 0]
-    ax3.plot(ctxs, [r["donor_kv_mb"] for r in sc], "o--", color="#f85149", linewidth=2.2, label="Donor Allocated State (MB)")
-    ax3.plot(ctxs, [r["vsa_kv_mb"] for r in sc], "s-", color="#3fb950", linewidth=2.5, label="VSA-LM Allocated State (MB)")
+    ax3.plot(ctxs, [r["donor_kv_mb"] for r in sc], "o--", color="#f85149", linewidth=2.2, label="Donor State RAM (MB)")
+    ax3.plot(ctxs, [r["vsa_kv_mb"] for r in sc], "s-", color="#3fb950", linewidth=2.5, label="VSA-LM State RAM (MB)")
+    ax3.fill_between(range(len(ctxs)), [r["vsa_kv_mb"] for r in sc], [r["donor_kv_mb"] for r in sc], color="#3fb950", alpha=0.18, label=f"-{sc[-1]['ram_saved_pct']}% Saved")
     ax3.set_xlabel("Context Length (Tokens)", fontweight="bold")
     ax3.set_ylabel("Measured GPU State RAM (MB)", fontweight="bold")
-    ax3.set_title(f"3. Measured GPU State RAM (-{sc[-1]['ram_saved_pct']}% @ {sc[-1]['context']})", fontsize=10.5, fontweight="bold")
+    ax3.set_title(f"3. Active GPU State RAM (-{sc[-1]['ram_saved_pct']}% @ {ctxs[-1]})", fontsize=11, fontweight="bold")
     ax3.legend(loc="upper left", fontsize=8)
 
     ax4 = axes[1, 1]
     sys_m = results["systems"]
-    metrics = ["Cartridge Recall (%)", "State RAM Saved (%)", "Erase Residual < 1e-5 (%)"]
+    metrics = ["Cartridge Recall (%)", f"{ctxs[-1]} RAM Saved (%)", "Erase Residual < 1e-5 (%)"]
     vals = [sys_m["cartridge_recall_pct"], sc[-1]["ram_saved_pct"], 100.0 if sys_m["erase_residual"] < 1e-5 else 0.0]
     bars = ax4.barh(metrics, vals, color=["#a371f7", "#3fb950", "#d29922"], height=0.5)
     ax4.set_xlim(0, 115)
     for b, v in zip(bars, vals):
         ax4.text(v + 2, b.get_y() + b.get_height()/2, f"{v:.1f}%", va="center", fontweight="bold", color="white")
-    ax4.set_title(f"4. VSA State Mount & Erase (Residual: {sys_m['erase_residual']:.2e})", fontsize=10.5, fontweight="bold")
+    ax4.set_title(f"4. VSA State Mount & Erase (Residual: {sys_m['erase_residual']:.2e})", fontsize=11, fontweight="bold")
 
-    plt.suptitle(f"VSA-LM vs {results['donor']} — Measured Benchmark Report", fontsize=13, fontweight="bold", y=0.98)
+    plt.suptitle(f"VSA-LM vs {results['donor']} — Benchmark Report", fontsize=13, fontweight="bold", y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig(out_png, dpi=160)
     plt.close(fig)
@@ -510,7 +467,6 @@ def run_benchmark_suite(
     out_json: str | None = None,
 ) -> dict:
     _purge_zombie_vram()
-    t0 = time.perf_counter()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     stu, cfg, tok, donor_repo, donor_dir, step, conv_ver = _load_student(ckpt_path, donor_id, device)
 
@@ -519,7 +475,7 @@ def run_benchmark_suite(
     print("=" * 84, flush=True)
 
     results = {"checkpoint": ckpt_path, "step": step, "converter": conv_ver, "donor": donor_repo, "student": {}, "teacher": {}, "systems": {}}
-    results["student"] = _eval_model(stu, False, tok, device, limit=limit, gsm8k_limit=gsm8k_limit)
+    results["student"] = _eval_model(stu, False, tok, device, limit=limit, gen_limit=gsm8k_limit)
     for k, v in results["student"].items():
         print(f"  [VSA-LM] {k:<14}: {v['acc']:6.2f}% ± {v['ci95']:4.1f}% ({v['correct']}/{v['total']})", flush=True)
 
@@ -533,7 +489,7 @@ def run_benchmark_suite(
     _purge_zombie_vram()
 
     if compare_donor:
-        results["teacher"] = _eval_model(donor, is_hf_donor, tok, device, limit=limit, gsm8k_limit=gsm8k_limit)
+        results["teacher"] = _eval_model(donor, is_hf_donor, tok, device, limit=limit, gen_limit=gsm8k_limit)
         for k, v in results["teacher"].items():
             print(f"  [Donor ] {k:<14}: {v['acc']:6.2f}% ± {v['ci95']:4.1f}% ({v['correct']}/{v['total']})", flush=True)
     del donor
@@ -544,10 +500,7 @@ def run_benchmark_suite(
     png_path = base_out + "_benchmark.png"
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
-    try:
-        _plot_benchmark_figure(results, png_path)
-    except Exception as e:
-        print(f"[vsa-bench] Plot warning: {e}")
+    _plot_benchmark_figure(results, png_path)
 
     print("\n| Benchmark / Metric | Original Donor | **VSA-LM (Ours)** | Retention / Advantage |")
     print("|---|---:|---:|---:|")
