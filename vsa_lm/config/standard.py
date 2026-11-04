@@ -157,6 +157,8 @@ class UniversalVSAAttn(nn.Module):
             kx = kx + k_loc
             q = q + self.q_relu_mix.to(q.dtype) * F.relu(q)
             kx = kx + self.k_relu_mix.to(kx.dtype) * F.relu(kx)
+            q = F.normalize(q.float(), p=2.0, dim=-1).to(x.dtype) * (self.HD ** 0.5)
+        kx = F.normalize(kx.float(), p=2.0, dim=-1).to(x.dtype)
 
         gam = self.gamma()
         y = _vsa_apply(q, kx, vx, gam, self.chunk_size)
