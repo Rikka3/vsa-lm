@@ -1,4 +1,4 @@
-"""Ultra-fast O(1)-state recurrent decoder with single-matmul QKV+G projection and fused Triton step."""
+"""O(1)-state recurrent decoder with StaticKV, enable_gqa=True SDPA, and parallel state-emitting prefill."""
 from __future__ import annotations
 
 import torch
@@ -19,6 +19,29 @@ def _apply_cached_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) ->
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     return x * cos + torch.cat((-x2, x1), dim=-1) * sin
+
+
+class StaticKV:
+    """Preallocated KV cache eliminating per-token torch.cat allocations."""
+
+    def __init__(self, B: int, HKV: int, Tmax: int, HD: int, dev, dt=torch.bfloat16):
+        self.k = torch.empty(B, HKV, Tmax, HD, device=dev, dtype=dt)
+        self.v = torch.empty_like(self.k)
+        self.n = 0
+
+    def append(self, k_new: torch.Tensor, v_new: torch.Tensor):
+        L = k_new.shape[2]
+        if self.n + L > self.k.shape[2]:
+            new_max = max(self.n + L + 1024, self.k.shape[2] * 2)
+            nk = torch.empty(self.k.shape[0], self.k.shape[1], new_max, self.k.shape[3], device=self.k.device, dtype=self.k.dtype)
+            nv = torch.empty_like(nk)
+            nk[:, :, :self.n] = self.k[:, :, :self.n]
+            nv[:, :, :self.n] = self.v[:, :, :self.n]
+            self.k, self.v = nk, nv
+        self.k[:, :, self.n : self.n + L] = k_new
+        self.v[:, :, self.n : self.n + L] = v_new
+        self.n += L
+        return self.k[:, :, :self.n], self.v[:, :, :self.n]
 
 
 class VSARecurrentDecoder:
@@ -59,7 +82,6 @@ class VSARecurrentDecoder:
                 ly._cached_kr = ly.k_relu_mix.detach().float().view(-1) if hasattr(ly, "k_relu_mix") else torch.zeros_like(gam)
                 ly._cached_nw = ly.out_norm.weight.detach().float() if hasattr(ly, "out_norm") else None
 
-                # Pre-fold v_proj + repeat_kv + v_head_mix AND pack [q_proj, k_proj, v_fused] into ONE matmul!
                 if hasattr(ly, "v_head_mix") and hasattr(ly, "v_proj"):
                     wv = ly.v_proj.weight.detach().to(torch.float32).view(HKV, HD, -1)
                     wv_rep = wv[:, None, :, :].expand(HKV, G, HD, -1).reshape(H, HD, -1)
@@ -86,7 +108,6 @@ class VSARecurrentDecoder:
                     ly._v_conv_active = bool(ly.v_conv.weight.abs().max().item() > 1e-4)
                     ly._g_active = bool(hasattr(ly, "g_proj") and ly.g_proj.weight.abs().max().item() > 1e-4)
             else:
-                # Pack Softmax [q_proj, k_proj, v_proj] into ONE matmul as well for fair speed comparison
                 if hasattr(ly, "q_proj") and not getattr(ly, "packed_q_gate", False):
                     wq = ly.q_proj.weight.detach().to(dt)
                     wk = ly.k_proj.weight.detach().to(dt)
@@ -111,7 +132,7 @@ class VSARecurrentDecoder:
         return vsa_bytes, kv_per_token
 
     @staticmethod
-    def blank_state(model, batch_size: int, device):
+    def blank_state(model, batch_size: int, device, max_kv_len: int = 4096):
         states, kv_caches = [None] * len(model.blocks), [None] * len(model.blocks)
         dt = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
         for li, blk in enumerate(model.blocks):
@@ -126,10 +147,7 @@ class VSARecurrentDecoder:
             else:
                 s = blk.attn if hasattr(blk, "attn") else blk.softmax_attn
                 hk = getattr(s, "HKV", s.H)
-                kv_caches[li] = (
-                    torch.zeros(batch_size, hk, 0, s.HD, device=device, dtype=dt),
-                    torch.zeros(batch_size, hk, 0, s.HD, device=device, dtype=dt),
-                )
+                kv_caches[li] = StaticKV(batch_size, hk, max_kv_len, s.HD, device, dt=dt)
         return states, kv_caches
 
     def _gamma(self, layer):
@@ -145,10 +163,19 @@ class VSARecurrentDecoder:
         return layer, q, k, v, g
 
     @staticmethod
-    def _sample(logits, temperature: float, top_k: int = 40):
+    def _sample(logits, temperature: float, top_k: int = 40, top_p: float = 0.95):
         if temperature <= 1e-5:
             return logits.argmax(-1, keepdim=True)
-        topv, topi = torch.topk(logits / temperature, min(top_k, logits.size(-1)), dim=-1)
+        probs = F.softmax(logits.float() / temperature, dim=-1)
+        if top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+            cum_probs = torch.cumsum(sorted_probs, dim=-1)
+            mask = cum_probs - sorted_probs > top_p
+            sorted_probs[mask] = 0.0
+            sorted_probs.div_(sorted_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12))
+            next_idx = torch.multinomial(sorted_probs, 1)
+            return sorted_indices.gather(-1, next_idx)
+        topv, topi = torch.topk(logits.float() / temperature, min(top_k, logits.size(-1)), dim=-1)
         return topi.gather(-1, torch.multinomial(F.softmax(topv, -1), 1))
 
     def _step_universal_block(self, li: int, blk, x: torch.Tensor, pos: int, states, kv_caches, record=None, write_scale: float = 1.0):
@@ -234,10 +261,19 @@ class VSARecurrentDecoder:
                 gate = None
                 q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
 
-            pk, pv = kv_caches[li]
-            pk, pv = torch.cat([pk, k.to(pk.dtype)], dim=2), torch.cat([pv, v.to(pv.dtype)], dim=2)
-            kv_caches[li] = (pk, pv)
-            y = F.scaled_dot_product_attention(q, repeat_kv(pk.to(q.dtype), ly.G), repeat_kv(pv.to(q.dtype), ly.G))
+            # P5 Fix: StaticKV + enable_gqa=True (zero torch.cat copy, zero 6x repeat_kv expansion!)
+            cache_obj = kv_caches[li]
+            if isinstance(cache_obj, StaticKV):
+                pk, pv = cache_obj.append(k, v)
+            else:
+                pk, pv = cache_obj
+                pk, pv = torch.cat([pk, k.to(pk.dtype)], dim=2), torch.cat([pv, v.to(pv.dtype)], dim=2)
+                kv_caches[li] = (pk, pv)
+            try:
+                y = F.scaled_dot_product_attention(q, pk, pv, enable_gqa=(ly.G > 1))
+            except TypeError:
+                y = F.scaled_dot_product_attention(q, repeat_kv(pk, ly.G), repeat_kv(pv, ly.G))
+
             if gate is not None:
                 y_out = y.transpose(1, 2).reshape(B, 1, H * HD) * torch.sigmoid(gate)
             elif getattr(ly, "g_proj", None) is not None:
@@ -249,11 +285,11 @@ class VSARecurrentDecoder:
         return x + blk.mlp(blk.norm2(x))
 
     @torch.no_grad()
-    def prefill(self, ids: torch.Tensor, states=None, kv_caches=None, start_pos: int = 0):
+    def prefill(self, ids: torch.Tensor, states=None, kv_caches=None, start_pos: int = 0, max_kv_len: int | None = None):
         m = self.model
         B, T = ids.shape
         if states is None or kv_caches is None:
-            states, kv_caches = self.blank_state(m, B, ids.device)
+            states, kv_caches = self.blank_state(m, B, ids.device, max_kv_len=max(max_kv_len or 4096, start_pos + T + 1024))
         if self.is_universal:
             hidden = None
             pos = start_pos
@@ -279,7 +315,7 @@ class VSARecurrentDecoder:
             else:
                 q, k = _rope(q), _rope(k)
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-                kv_caches[li] = (k, v)
+                kv_caches[li].append(k, v)
             y = (y.to(x.dtype) * g).transpose(1, 2).reshape(B, T, -1)
             x = x + layer.to_out(y)
             u = block.ffn_up(block.norm2(x))
@@ -330,9 +366,7 @@ class VSARecurrentDecoder:
                     record[li].append((pos, (write_scale * kf.squeeze(2)[0]).clone(), vf.squeeze(2)[0].clone()))
             else:
                 q, k = _rope(q, pos), _rope(k, pos)
-                pk, pv = kv_caches[li]
-                pk, pv = torch.cat([pk, k], dim=2), torch.cat([pv, v], dim=2)
-                kv_caches[li] = (pk, pv)
+                pk, pv = kv_caches[li].append(k, v)
                 y = F.scaled_dot_product_attention(q, pk, pv)
             y = (y.to(x.dtype) * g).transpose(1, 2).reshape(B, 1, -1)
             x = x + layer.to_out(y)
@@ -342,13 +376,13 @@ class VSARecurrentDecoder:
         return m.norm_f(x), states, kv_caches
 
     @torch.no_grad()
-    def generate(self, prompt: torch.Tensor, max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, eos_ids: set[int] | None = None):
+    def generate(self, prompt: torch.Tensor, max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, top_p: float = 0.95, eos_ids: set[int] | None = None):
         out = prompt.clone()
-        x, states, kv = self.prefill(out)
+        x, states, kv = self.prefill(out, max_kv_len=prompt.shape[1] + max_new_tokens + 64)
         logits = self.model.lm_head(x[:, -1, :])
         pos = prompt.shape[1] - 1
         for _ in range(max_new_tokens):
-            nxt = self._sample(logits, temperature, top_k)
+            nxt = self._sample(logits, temperature, top_k=top_k, top_p=top_p)
             out = torch.cat([out, nxt], dim=1)
             if eos_ids and int(nxt[0, 0].item()) in eos_ids:
                 break
@@ -359,14 +393,14 @@ class VSARecurrentDecoder:
 
     @torch.no_grad()
     def continue_generate(self, ids: torch.Tensor, states, kv_caches, start_pos: int,
-                          max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, eos_ids: set[int] | None = None):
+                          max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, top_p: float = 0.95, eos_ids: set[int] | None = None):
         out, pos, logits = [], start_pos, None
         for t in range(ids.shape[1]):
             x, states, kv_caches = self.step(ids[:, t : t + 1], pos, states, kv_caches)
             logits = self.model.lm_head(x[:, -1, :])
             pos += 1
         for _ in range(max_new_tokens):
-            nxt = self._sample(logits, temperature, top_k)
+            nxt = self._sample(logits, temperature, top_k=top_k, top_p=top_p)
             out.append(nxt)
             if eos_ids and int(nxt[0, 0].item()) in eos_ids:
                 break
