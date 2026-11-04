@@ -1,4 +1,4 @@
-"""Fast O(1)-state recurrent decoder for UniversalVSALM and VSALanguageModel."""
+"""Ultra-fast O(1)-state recurrent decoder with pre-computed RoPE tables and fused Triton step."""
 from __future__ import annotations
 
 import torch
@@ -15,31 +15,69 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return x[:, :, None, :, :].expand(B, H, n_rep, T, HD).reshape(B, H * n_rep, T, HD)
 
 
+def _apply_cached_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+
+
 class VSARecurrentDecoder:
-    def __init__(self, model, wrap_positions: bool = False):
+    def __init__(self, model, wrap_positions: bool = False, max_cache_pos: int = 65536):
         self.model = model.eval()
         self.wrap_positions = wrap_positions
         self.max_T = model.config["max_T"]
         self.is_universal = hasattr(model, "embed_tokens")
-        self._prepare_fast_weights()
+        self._prepare_fast_decode_tables(max_cache_pos)
 
-    def _prepare_fast_weights(self):
-        """Pre-caches flattened conv weights and gamma tensors on GPU to eliminate per-step overhead."""
+    @torch.no_grad()
+    def _prepare_fast_decode_tables(self, max_pos: int):
         if not self.is_universal:
             return
+        device = next(self.model.parameters()).device
+        dt = torch.bfloat16 if device.type == "cuda" else torch.float32
+        t = torch.arange(max_pos, device=device, dtype=torch.float32)
+
+        # Precompute shared RoPE cos/sin tables once per distinct (HD, inv_freq)
+        rope_cache = {}
         for blk in self.model.blocks:
+            ly = blk.vsa if hasattr(blk, "vsa") else blk.attn
+            if hasattr(ly, "rope") and hasattr(ly.rope, "inv_freq"):
+                key = (ly.HD, id(ly.rope.inv_freq))
+                if key not in rope_cache:
+                    freqs = torch.outer(t, ly.rope.inv_freq.to(device))
+                    emb = torch.cat((freqs, freqs), dim=-1)
+                    rope_cache[key] = (emb.cos().to(dt), emb.sin().to(dt))
+                ly._rope_cos, ly._rope_sin = rope_cache[key]
+
             if hasattr(blk, "vsa"):
-                ly = blk.vsa
-                H, HD = ly.H, ly.HD
+                H, HKV, HD, G = ly.H, ly.HKV, ly.HD, ly.G
                 gam = ly.gamma().detach()
                 ly._cached_gam = gam
                 ly._cached_omg = (1.0 - gam) / (HD ** 0.5)
                 ly._cached_vself = ly.v_self_scale.detach().float() if hasattr(ly, "v_self_scale") else torch.zeros_like(gam)
+                ly._cached_qr = ly.q_relu_mix.detach().float().view(-1) if hasattr(ly, "q_relu_mix") else torch.zeros_like(gam)
+                ly._cached_kr = ly.k_relu_mix.detach().float().view(-1) if hasattr(ly, "k_relu_mix") else torch.zeros_like(gam)
+                ly._cached_nw = ly.out_norm.weight.detach().float() if hasattr(ly, "out_norm") else None
+
+                # Pre-fold GQA repeat_kv + v_head_mix into v_proj so V needs 0 repeat_kv and 0 matmul per step!
+                if hasattr(ly, "v_head_mix") and hasattr(ly, "v_proj"):
+                    wv = ly.v_proj.weight.detach().to(torch.float32).view(HKV, HD, -1)
+                    wv_rep = wv[:, None, :, :].expand(HKV, G, HD, -1).reshape(H, HD, -1)
+                    # vx = v @ v_head_mix -> wv_fused = v_head_mix^T @ wv_rep
+                    vm_T = ly.v_head_mix.detach().to(torch.float32).transpose(1, 2)
+                    ly._wv_fused = torch.bmm(vm_T, wv_rep).reshape(H * HD, -1).to(dt)
+                    if ly.v_proj.bias is not None:
+                        bv = ly.v_proj.bias.detach().to(torch.float32).view(HKV, 1, HD).expand(HKV, G, HD).reshape(H, 1, HD)
+                        ly._bv_fused = torch.bmm(bv, ly.v_head_mix.detach().to(torch.float32)).reshape(H * HD).to(dt)
+                    else:
+                        ly._bv_fused = None
+
                 if hasattr(ly, "k_conv"):
-                    ly._k_conv_w = ly.k_conv.weight.detach().view(1, H, 1, HD, 4)
-                    ly._v_conv_w = ly.v_conv.weight.detach().view(1, H, 1, HD, 8)
-                    ly._k_conv_active = bool(ly.k_conv.weight.abs().max().item() > 1e-7)
-                    ly._v_conv_active = bool(ly.v_conv.weight.abs().max().item() > 1e-7)
+                    ly._k_conv_w = ly.k_conv.weight.detach().to(dt).view(1, H, 1, HD, 4)
+                    ly._v_conv_w = ly.v_conv.weight.detach().to(dt).view(1, H, 1, HD, 8)
+                    ly._k_conv_active = bool(ly.k_conv.weight.abs().max().item() > 1e-6)
+                    ly._v_conv_active = bool(ly.v_conv.weight.abs().max().item() > 1e-6)
+                    ly._g_active = bool(hasattr(ly, "g_proj") and ly.g_proj.weight.abs().max().item() > 1e-6)
 
     @staticmethod
     def state_bytes(model):
@@ -100,66 +138,56 @@ class VSARecurrentDecoder:
         h = blk.norm1(x)
         if hasattr(blk, "vsa"):
             ly = blk.vsa
-            H, HD = ly.H, ly.HD
-            q, k, v = ly.head_qkv(h)
-            q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
+            H, HKV, HD, G = ly.H, ly.HKV, ly.HD, ly.G
+            q = ly.q_proj(h).view(B, 1, H, HD).transpose(1, 2)
+            k = ly.k_proj(h).view(B, 1, HKV, HD).transpose(1, 2)
+            if hasattr(ly, "_wv_fused"):
+                vx = F.linear(h, ly._wv_fused, ly._bv_fused).view(B, 1, H, HD).transpose(1, 2)
+            else:
+                vx = repeat_kv(ly.v_proj(h).view(B, 1, HKV, HD).transpose(1, 2), G)
 
-            if hasattr(ly, "pos_code"):
-                T_max = ly.pos_code.shape[0]
-                if pos < T_max:
-                    k = k * ly.pos_code[pos].view(1, 1, 1, HD).to(k.dtype)
-            kx, vx = repeat_kv(k, ly.G), repeat_kv(v, ly.G)
+            if hasattr(ly, "_rope_cos") and pos < ly._rope_cos.shape[0]:
+                cos = ly._rope_cos[pos].view(1, 1, 1, HD)
+                sin = ly._rope_sin[pos].view(1, 1, 1, HD)
+                q = _apply_cached_rope(q, cos, sin)
+                k = _apply_cached_rope(k, cos, sin)
+            else:
+                q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
+
+            if hasattr(ly, "pos_code") and pos < ly.pos_code.shape[0]:
+                k = k * ly.pos_code[pos].view(1, 1, 1, HD).to(k.dtype)
+            kx = repeat_kv(k, G)
 
             if hasattr(ly, "k_head_mix"):
                 kx = torch.matmul(kx, ly.k_head_mix.to(kx.dtype))
                 if hasattr(ly, "head_pos_delta") and pos < ly.head_pos_delta.shape[1]:
                     kx = kx * (1.0 + 0.5 * torch.tanh(ly.head_pos_delta[:, pos : pos + 1, :])).unsqueeze(0).to(kx.dtype)
-                vx = torch.matmul(vx, ly.v_head_mix.to(vx.dtype))
+                if not hasattr(ly, "_wv_fused"):
+                    vx = torch.matmul(vx, ly.v_head_mix.to(vx.dtype))
 
-            if hasattr(ly, "k_conv") and isinstance(kv_caches[li], dict):
-                if getattr(ly, "_k_conv_active", True):
-                    k_in = torch.cat([kv_caches[li]["k_buf"], kx.unsqueeze(-1)], dim=-1)
-                    kv_caches[li]["k_buf"] = k_in[..., -3:]
-                    kx = kx + (k_in * ly._k_conv_w.to(kx.dtype)).sum(dim=-1)
-                q = q + ly.q_relu_mix.to(q.dtype) * F.relu(q)
-                kx = kx + ly.k_relu_mix.to(kx.dtype) * F.relu(kx)
-
-            # Match training forward pass normalization
-            if not hasattr(ly, "out_norm"):
-                q = F.normalize(q.float(), p=2.0, dim=-1).to(x.dtype) * (HD ** 0.5)
-                kx = F.normalize(kx.float(), p=2.0, dim=-1).to(x.dtype)
-
-            gam = ly._cached_gam
-            omg_scale = ly._cached_omg
-            zero_vs = torch.zeros_like(gam)
+            if hasattr(ly, "k_conv") and isinstance(kv_caches[li], dict) and getattr(ly, "_k_conv_active", False):
+                k_in = torch.cat([kv_caches[li]["k_buf"], kx.unsqueeze(-1)], dim=-1)
+                kv_caches[li]["k_buf"] = k_in[..., -3:]
+                kx = kx + (k_in * ly._k_conv_w).sum(dim=-1)
 
             if record is not None:
                 record[li].append((pos, kx.detach().clone(), vx.detach().clone()))
 
-            if x.is_cuda and write_scale == 1.0:
-                vself_arg = zero_vs if hasattr(ly, "out_norm") else ly._cached_vself
-                y = fused_vsa_recurrent_step(q.contiguous(), kx.contiguous(), vx.contiguous(), states[li], gam, omg_scale, vself_arg)
-                if hasattr(ly, "out_norm"):
-                    y = ly.out_norm(y) + ly.v_self_scale.view(1, H, 1, 1).to(y.dtype) * vx
-            else:
-                qf, kf, vf = q.float(), (write_scale * kx.float()), vx.float()
-                M_new = gam.view(1, H, 1, 1) * states[li].float() + torch.einsum("bhe,bhd->bhed", kf.squeeze(2), vf.squeeze(2))
-                states[li] = M_new
-                carry = torch.einsum("bhed,bhe->bhd", M_new, qf.squeeze(2)).unsqueeze(2)
-                y = (carry * omg_scale.view(1, H, 1, 1)).to(x.dtype)
-                if hasattr(ly, "out_norm"):
-                    y = ly.out_norm(y)
-                if hasattr(ly, "v_self_scale"):
-                    y = y + ly.v_self_scale.view(1, H, 1, 1).to(y.dtype) * vx
+            # Single-launch Fused Triton O(1) Step (fuses ReLU + L2-norm + M update + out_norm + v_self_scale!)
+            y = fused_vsa_recurrent_step(
+                q.contiguous(), kx.contiguous(), vx.contiguous(),
+                states[li], ly._cached_gam, ly._cached_omg, ly._cached_vself,
+                q_relu=ly._cached_qr, k_relu=ly._cached_kr, norm_w=ly._cached_nw,
+            )
 
-            if hasattr(ly, "v_conv") and isinstance(kv_caches[li], dict) and getattr(ly, "_v_conv_active", True):
+            if hasattr(ly, "v_conv") and isinstance(kv_caches[li], dict) and getattr(ly, "_v_conv_active", False):
                 v_in = torch.cat([kv_caches[li]["v_buf"], vx.unsqueeze(-1)], dim=-1)
                 kv_caches[li]["v_buf"] = v_in[..., -7:]
-                v_loc = (v_in * ly._v_conv_w.to(vx.dtype)).sum(dim=-1)
+                v_loc = (v_in * ly._v_conv_w).sum(dim=-1)
                 q_mod = torch.sigmoid((q * ly.local_q_gate.view(1, H, 1, HD).to(q.dtype)).sum(-1, keepdim=True))
                 y = y + (2.0 * q_mod) * v_loc
 
-            if hasattr(ly, "g_proj"):
+            if getattr(ly, "_g_active", False):
                 y = y * (2.0 * torch.sigmoid(ly.g_proj(h).view(B, 1, H, HD).transpose(1, 2)))
             x = x + ly.o_proj(y.transpose(1, 2).reshape(B, 1, H * HD))
         else:
@@ -173,10 +201,17 @@ class VSARecurrentDecoder:
                 if ly.q_norm is not None:
                     q, k = ly.q_norm(q), ly.k_norm(k)
                 q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
             else:
                 q, k, v = ly.head_qkv(h)
                 gate = None
-            q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
+                if hasattr(ly, "_rope_cos") and pos < ly._rope_cos.shape[0]:
+                    cos = ly._rope_cos[pos].view(1, 1, 1, HD)
+                    sin = ly._rope_sin[pos].view(1, 1, 1, HD)
+                    q = _apply_cached_rope(q, cos, sin)
+                    k = _apply_cached_rope(k, cos, sin)
+                else:
+                    q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
             pk, pv = kv_caches[li]
             pk, pv = torch.cat([pk, k.to(pk.dtype)], dim=2), torch.cat([pv, v.to(pv.dtype)], dim=2)
             kv_caches[li] = (pk, pv)
@@ -331,14 +366,10 @@ class VSARecurrentDecoder:
 
     @torch.no_grad()
     def forget(self, traces, states, next_pos: int, kv_caches=None, pre_kv_lens: list[int] | None = None):
-        """Replays exact Triton kernel recurrent accumulation over `traces` and subtracts from `states[li]`."""
         for li, trace in enumerate(traces):
             if not trace:
                 continue
             ly = self.model.blocks[li].vsa
-            gam = self._gamma(ly).to(states[li].device)
-            omg = (1.0 - gam) / (ly.HD ** 0.5)
-            z_vs = torch.zeros_like(gam)
             M_doc = torch.zeros_like(states[li])
             last_p = trace[-1][0]
             for (p, k, v) in trace:
@@ -347,9 +378,13 @@ class VSARecurrentDecoder:
                 if kt.ndim == 2:
                     kt = kt.unsqueeze(0).unsqueeze(2)
                     vt = vt.unsqueeze(0).unsqueeze(2)
-                fused_vsa_recurrent_step(kt, kt, vt, M_doc, gam, omg, z_vs)
+                fused_vsa_recurrent_step(
+                    kt.contiguous(), kt.contiguous(), vt.contiguous(),
+                    M_doc, ly._cached_gam, ly._cached_omg, ly._cached_vself,
+                    q_relu=ly._cached_qr, k_relu=ly._cached_kr, norm_w=ly._cached_nw,
+                )
             rem_steps = float(next_pos - 1 - last_p)
             if rem_steps > 0:
-                M_doc = M_doc * (gam.view(1, -1, 1, 1) ** rem_steps)
+                M_doc = M_doc * (ly._cached_gam.view(1, -1, 1, 1) ** rem_steps)
             states[li] = states[li] - M_doc
         return states
