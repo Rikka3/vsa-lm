@@ -64,12 +64,19 @@ class VSAChunkFunction(torch.autograd.Function):
 
 def fused_vsa_recurrent_step(q: torch.Tensor, kx: torch.Tensor, vx: torch.Tensor,
                              M: torch.Tensor, gam: torch.Tensor, omg_scale: torch.Tensor,
-                             v_self: torch.Tensor) -> torch.Tensor:
+                             v_self: torch.Tensor, q_relu: torch.Tensor | None = None,
+                             k_relu: torch.Tensor | None = None, norm_w: torch.Tensor | None = None) -> torch.Tensor:
     """Launch the Fused Triton O(1) VSA recurrent decode step kernel."""
     B, H, _, D = q.shape
     out = torch.empty_like(q)
+    z_h = torch.zeros_like(gam)
+    qr = q_relu.view(-1) if q_relu is not None else z_h
+    kr = k_relu.view(-1) if k_relu is not None else z_h
+    has_norm = norm_w is not None
+    nw = norm_w if has_norm else z_h
     vsa_recurrent_step_kernel[(B * H,)](
-        q, kx, vx, M, out, gam, omg_scale, v_self, H=H, D=D, num_warps=4
+        q, kx, vx, M, out, gam, omg_scale, v_self, qr, kr, nw,
+        HAS_NORM=has_norm, H=H, D=D, num_warps=4,
     )
     return out
 
