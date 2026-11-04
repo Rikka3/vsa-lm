@@ -1,6 +1,8 @@
 """O(1)-state recurrent decoder supporting both scratch VSALanguageModel and converted UniversalVSALM."""
 from __future__ import annotations
 
+from .functional import vsa_parallel_attention, fused_vsa_recurrent_step
+
 import torch
 import torch.nn.functional as F
 
@@ -100,15 +102,18 @@ class VSARecurrentDecoder:
                 kx = kx + ly.k_relu_mix.to(kx.dtype) * F.relu(kx)
 
             gam = ly.gamma()
-            qf, kf, vf = q.float(), (write_scale * kx.float()), vx.float()
-            M = states[li].float()
-            M_new = gam.view(1, H, 1, 1) * M + torch.einsum("bhe,bhd->bhed", kf.squeeze(2), vf.squeeze(2))
-            states[li] = M_new
             if record is not None:
-                record[li].append((pos, kf.squeeze(2)[0].clone(), vf.squeeze(2)[0].clone()))
-
-            carry = torch.einsum("bhed,bhe->bhd", M_new, qf.squeeze(2)).unsqueeze(2)
-            y = (carry * (1.0 - gam).view(1, H, 1, 1) / (HD ** 0.5)).to(x.dtype)
+                record[li].append((pos, (write_scale * kx.float()).squeeze(2)[0].detach().cpu(), vx.float().squeeze(2)[0].detach().cpu()))
+            if x.is_cuda and write_scale == 1.0 and states[li].dtype == torch.float32:
+                omg_scale = (1.0 - gam) / (HD ** 0.5)
+                zero_vs = torch.zeros_like(gam)
+                y = fused_vsa_recurrent_step(q.contiguous(), kx.contiguous(), vx.contiguous(), states[li], gam, omg_scale, zero_vs)
+            else:
+                qf, kf, vf = q.float(), (write_scale * kx.float()), vx.float()
+                M_new = gam.view(1, H, 1, 1) * states[li].float() + torch.einsum("bhe,bhd->bhed", kf.squeeze(2), vf.squeeze(2))
+                states[li] = M_new
+                carry = torch.einsum("bhed,bhe->bhd", M_new, qf.squeeze(2)).unsqueeze(2)
+                y = (carry * (1.0 - gam).view(1, H, 1, 1) / (HD ** 0.5)).to(x.dtype)
             if hasattr(ly, "out_norm"):
                 y = ly.out_norm(y)
             if hasattr(ly, "v_self_scale"):
