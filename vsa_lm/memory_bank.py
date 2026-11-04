@@ -126,9 +126,9 @@ class VSAMemoryBank:
         )
         answer = self.tokenizer.decode(gen_toks[0].tolist(), skip_special_tokens=True).strip().splitlines()[0].strip()
 
-        # Re-mount doc + question, then erase doc via forget() and compare against M_without_doc!
-        st_both, kv_both = [s.to(self.device, dtype=torch.float32) if s is not None else None for s in cart["vsa_states"]], [
-            ({k: v.to(self.device) for k, v in item.items()} if isinstance(item, dict) else StaticKV(1, 2, 256, 128, self.device))
+        st_both = [s.to(self.device, dtype=torch.float32) if s is not None else None for s in cart["vsa_states"]]
+        kv_both = [
+            ({k: torch.zeros_like(v, device=self.device) for k, v in item.items()} if isinstance(item, dict) else StaticKV(1, 2, 256, 128, self.device))
             for item in cart["kv_caches"]
         ]
         for t in range(q_ids.shape[1]):
