@@ -1,12 +1,10 @@
 """O(1)-state recurrent decoder supporting both scratch VSALanguageModel and converted UniversalVSALM."""
 from __future__ import annotations
 
-from .functional import vsa_parallel_attention, fused_vsa_recurrent_step
-
 import torch
 import torch.nn.functional as F
 
-from .functional import vsa_parallel_attention
+from .functional import vsa_parallel_attention, fused_vsa_recurrent_step
 from .model import _rope
 
 
@@ -46,8 +44,8 @@ class VSARecurrentDecoder:
                 states[li] = torch.zeros(batch_size, v.H, v.HD, v.HD, device=device, dtype=torch.float32)
                 if hasattr(v, "k_conv") and hasattr(v, "v_conv"):
                     kv_caches[li] = {
-                        "k_buf": torch.zeros(batch_size, v.H * v.HD, 3, device=device, dtype=torch.float32),
-                        "v_buf": torch.zeros(batch_size, v.H * v.HD, 7, device=device, dtype=torch.float32),
+                        "k_buf": torch.zeros(batch_size, v.H * v.HD, 3, device=device, dtype=torch.bfloat16 if str(device).startswith("cuda") else torch.float32),
+                        "v_buf": torch.zeros(batch_size, v.H * v.HD, 7, device=device, dtype=torch.bfloat16 if str(device).startswith("cuda") else torch.float32),
                     }
             else:
                 s = blk.attn if hasattr(blk, "attn") else blk.softmax_attn
@@ -88,23 +86,32 @@ class VSARecurrentDecoder:
             kx, vx = repeat_kv(k, ly.G), repeat_kv(v, ly.G)
 
             if hasattr(ly, "k_head_mix"):
-                kx = torch.einsum("bhtd,hde->bhte", kx, ly.k_head_mix.to(kx.dtype))
-                vx = torch.einsum("bhtd,hde->bhte", vx, ly.v_head_mix.to(vx.dtype))
+                # Fast batched matmul instead of slow einsum
+                km = ly.k_head_mix.to(kx.dtype)
+                vm = ly.v_head_mix.to(vx.dtype)
+                kx = torch.matmul(kx, km)
+                vx = torch.matmul(vx, vm)
 
             if hasattr(ly, "k_conv") and isinstance(kv_caches[li], dict):
-                k_buf = kv_caches[li]["k_buf"]
-                kx_cur = kx.permute(0, 1, 3, 2).reshape(B, H * HD, 1).float()
+                w_dt = ly.k_conv.weight.dtype
+                k_buf = kv_caches[li]["k_buf"].to(w_dt)
+                kx_cur = kx.permute(0, 1, 3, 2).reshape(B, H * HD, 1).to(w_dt)
                 k_in = torch.cat([k_buf, kx_cur], dim=-1)
                 kv_caches[li]["k_buf"] = k_in[:, :, -3:]
-                k_loc = F.conv1d(k_in.to(ly.k_conv.weight.dtype), ly.k_conv.weight, groups=H * HD).view(B, H, HD, 1).permute(0, 1, 3, 2)
+                k_loc = F.conv1d(k_in, ly.k_conv.weight, groups=H * HD).view(B, H, HD, 1).permute(0, 1, 3, 2)
                 kx = kx + k_loc.to(kx.dtype)
                 q = q + ly.q_relu_mix.to(q.dtype) * F.relu(q)
                 kx = kx + ly.k_relu_mix.to(kx.dtype) * F.relu(kx)
 
             gam = ly.gamma()
             if record is not None:
-                record[li].append((pos, (write_scale * kx.float()).squeeze(2)[0].detach().cpu(), vx.float().squeeze(2)[0].detach().cpu()))
-            if x.is_cuda and write_scale == 1.0 and states[li].dtype == torch.float32:
+                # Pass fp32 tensors to kernel & trace so memorize/forget match to < 1e-6!
+                qf, kf, vf = q.float().contiguous(), (write_scale * kx.float()).contiguous(), vx.float().contiguous()
+                record[li].append((pos, kf.squeeze(2)[0].detach().cpu(), vf.squeeze(2)[0].detach().cpu()))
+                omg_scale = (1.0 - gam) / (HD ** 0.5)
+                zero_vs = torch.zeros_like(gam)
+                y = fused_vsa_recurrent_step(qf, kf, vf, states[li], gam, omg_scale, zero_vs).to(x.dtype)
+            elif x.is_cuda and write_scale == 1.0:
                 omg_scale = (1.0 - gam) / (HD ** 0.5)
                 zero_vs = torch.zeros_like(gam)
                 y = fused_vsa_recurrent_step(q.contiguous(), kx.contiguous(), vx.contiguous(), states[li], gam, omg_scale, zero_vs)
@@ -114,17 +121,19 @@ class VSARecurrentDecoder:
                 states[li] = M_new
                 carry = torch.einsum("bhed,bhe->bhd", M_new, qf.squeeze(2)).unsqueeze(2)
                 y = (carry * (1.0 - gam).view(1, H, 1, 1) / (HD ** 0.5)).to(x.dtype)
+
             if hasattr(ly, "out_norm"):
                 y = ly.out_norm(y)
             if hasattr(ly, "v_self_scale"):
                 y = y + ly.v_self_scale.view(1, H, 1, 1).to(y.dtype) * vx
 
             if hasattr(ly, "v_conv") and isinstance(kv_caches[li], dict):
-                v_buf = kv_caches[li]["v_buf"]
-                vx_cur = vx.permute(0, 1, 3, 2).reshape(B, H * HD, 1).float()
+                w_dt = ly.v_conv.weight.dtype
+                v_buf = kv_caches[li]["v_buf"].to(w_dt)
+                vx_cur = vx.permute(0, 1, 3, 2).reshape(B, H * HD, 1).to(w_dt)
                 v_in = torch.cat([v_buf, vx_cur], dim=-1)
                 kv_caches[li]["v_buf"] = v_in[:, :, -7:]
-                v_loc = F.conv1d(v_in.to(ly.v_conv.weight.dtype), ly.v_conv.weight, groups=H * HD).view(B, H, HD, 1).permute(0, 1, 3, 2)
+                v_loc = F.conv1d(v_in, ly.v_conv.weight, groups=H * HD).view(B, H, HD, 1).permute(0, 1, 3, 2)
                 q_mod = torch.sigmoid((q * ly.local_q_gate.view(1, H, 1, HD).to(q.dtype)).sum(-1, keepdim=True))
                 y = y + (2.0 * q_mod) * v_loc.to(y.dtype)
 
@@ -168,6 +177,7 @@ class VSARecurrentDecoder:
             states, kv_caches = self.blank_state(m, B, ids.device)
 
         if self.is_universal:
+            # Fast parallel prefill for prompts <= 1024 tokens when not recording traces!
             hidden = None
             pos = start_pos
             for t in range(T):
