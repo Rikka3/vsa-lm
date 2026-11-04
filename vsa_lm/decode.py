@@ -1,4 +1,4 @@
-"""O(1)-state recurrent decoder supporting both scratch VSALanguageModel and converted UniversalVSALM / LlamaVSALM."""
+"""O(1)-state recurrent decoder supporting both scratch VSALanguageModel and converted UniversalVSALM."""
 from __future__ import annotations
 
 import torch
@@ -75,21 +75,6 @@ class VSARecurrentDecoder:
         topv, topi = torch.topk(logits / temperature, min(top_k, logits.size(-1)), dim=-1)
         return topi.gather(-1, torch.multinomial(F.softmax(topv, -1), 1))
 
-    def _pos_code_step(self, layer, pos: int, dtype: torch.dtype, device) -> tuple[torch.Tensor, torch.Tensor | None]:
-        HD = layer.HD
-        T_max = layer.pos_code.shape[0]
-        if pos < T_max:
-            pc = layer.pos_code[pos].view(1, 1, 1, HD).to(dtype)
-            delta = (1.0 + 0.5 * torch.tanh(layer.head_pos_delta[:, pos : pos + 1, :])).unsqueeze(0).to(dtype) if hasattr(layer, "head_pos_delta") else None
-        elif self.wrap_positions:
-            p = pos % T_max
-            pc = layer.pos_code[p].view(1, 1, 1, HD).to(dtype)
-            delta = (1.0 + 0.5 * torch.tanh(layer.head_pos_delta[:, p : p + 1, :])).unsqueeze(0).to(dtype) if hasattr(layer, "head_pos_delta") else None
-        else:
-            pc = torch.ones(1, 1, 1, HD, device=device, dtype=dtype)
-            delta = None
-        return pc, delta
-
     def _step_universal_block(self, li: int, blk, x: torch.Tensor, pos: int, states, kv_caches, record=None, write_scale: float = 1.0):
         B = x.shape[0]
         h = blk.norm1(x)
@@ -98,14 +83,10 @@ class VSARecurrentDecoder:
             H, HD = ly.H, ly.HD
             q, k, v = ly.head_qkv(h)
             q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
-            pc, delta = self._pos_code_step(ly, pos, k.dtype, k.device)
-            kc = k * pc
-            kx, vx = repeat_kv(kc, ly.G), repeat_kv(v, ly.G)
+            kx, vx = repeat_kv(k, ly.G), repeat_kv(v, ly.G)
 
             if hasattr(ly, "k_head_mix"):
                 kx = torch.einsum("bhtd,hde->bhte", kx, ly.k_head_mix.to(kx.dtype))
-                if delta is not None:
-                    kx = kx * delta
                 vx = torch.einsum("bhtd,hde->bhte", vx, ly.v_head_mix.to(vx.dtype))
 
             if hasattr(ly, "k_conv") and isinstance(kv_caches[li], dict):
@@ -118,12 +99,9 @@ class VSARecurrentDecoder:
                 q = q + ly.q_relu_mix.to(q.dtype) * F.relu(q)
                 kx = kx + ly.k_relu_mix.to(kx.dtype) * F.relu(kx)
 
-            q = F.normalize(q.float(), p=2.0, dim=-1).to(x.dtype) * (HD ** 0.5)
-            kx = F.normalize(kx.float(), p=2.0, dim=-1).to(x.dtype)
-
             gam = ly.gamma()
             qf, kf, vf = q.float(), (write_scale * kx.float()), vx.float()
-            M = states[li]
+            M = states[li].float()
             M_new = gam.view(1, H, 1, 1) * M + torch.einsum("bhe,bhd->bhed", kf.squeeze(2), vf.squeeze(2))
             states[li] = M_new
             if record is not None:
@@ -131,6 +109,8 @@ class VSARecurrentDecoder:
 
             carry = torch.einsum("bhed,bhe->bhd", M_new, qf.squeeze(2)).unsqueeze(2)
             y = (carry * (1.0 - gam).view(1, H, 1, 1) / (HD ** 0.5)).to(x.dtype)
+            if hasattr(ly, "out_norm"):
+                y = ly.out_norm(y)
             if hasattr(ly, "v_self_scale"):
                 y = y + ly.v_self_scale.view(1, H, 1, 1).to(y.dtype) * vx
 
@@ -273,7 +253,7 @@ class VSARecurrentDecoder:
     def generate(self, prompt: torch.Tensor, max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, eos_ids: set[int] | None = None):
         out = prompt.clone()
         x, states, kv = self.prefill(out)
-        logits = self.model.lm_head(x)[:, -1, :].float()
+        logits = F.linear(x[:, -1, :].float(), self.model.lm_head.weight.float())
         pos = prompt.shape[1] - 1
         for _ in range(max_new_tokens):
             nxt = self._sample(logits, temperature, top_k)
@@ -282,7 +262,7 @@ class VSARecurrentDecoder:
                 break
             pos += 1
             x, states, kv = self.step(nxt, pos, states, kv)
-            logits = self.model.lm_head(x)[:, -1, :].float()
+            logits = F.linear(x[:, -1, :].float(), self.model.lm_head.weight.float())
         return out
 
     @torch.no_grad()
@@ -291,7 +271,7 @@ class VSARecurrentDecoder:
         out, pos, logits = [], start_pos, None
         for t in range(ids.shape[1]):
             x, states, kv_caches = self.step(ids[:, t : t + 1], pos, states, kv_caches)
-            logits = self.model.lm_head(x)[:, -1, :].float()
+            logits = F.linear(x[:, -1, :].float(), self.model.lm_head.weight.float())
             pos += 1
         for _ in range(max_new_tokens):
             nxt = self._sample(logits, temperature, top_k)
@@ -299,7 +279,7 @@ class VSARecurrentDecoder:
             if eos_ids and int(nxt[0, 0].item()) in eos_ids:
                 break
             x, states, kv_caches = self.step(nxt, pos, states, kv_caches)
-            logits = self.model.lm_head(x)[:, -1, :].float()
+            logits = F.linear(x[:, -1, :].float(), self.model.lm_head.weight.float())
             pos += 1
         toks = torch.cat(out, dim=1) if out else torch.empty(ids.shape[0], 0, dtype=torch.long, device=ids.device)
         return toks, states, kv_caches, pos
@@ -314,12 +294,19 @@ class VSARecurrentDecoder:
         return states, kv_caches, pos, traces
 
     @torch.no_grad()
-    def forget(self, traces, states, next_pos: int):
+    def forget(self, traces, states, next_pos: int, kv_caches=None, pre_kv_lens: list[int] | None = None):
         for li, trace in enumerate(traces):
             if not trace:
                 continue
-            gamma = self._gamma(self.model.blocks[li].vsa)
+            gamma = self._gamma(self.model.blocks[li].vsa).double()
+            acc = torch.zeros_like(states[li], dtype=torch.float64)
             for (p, k, v) in trace:
                 w = gamma.view(-1, 1, 1) ** float(next_pos - 1 - p)
-                states[li] -= w * torch.einsum("he,hd->hed", k, v).unsqueeze(0)
+                acc += w * torch.einsum("he,hd->hed", k.double(), v.double()).unsqueeze(0)
+            states[li] = (states[li].double() - acc).float()
+        if kv_caches is not None and pre_kv_lens is not None:
+            for li, item in enumerate(kv_caches):
+                if isinstance(item, tuple):
+                    L0 = pre_kv_lens[li]
+                    kv_caches[li] = (item[0][:, :, :L0, :], item[1][:, :, :L0, :])
         return states
