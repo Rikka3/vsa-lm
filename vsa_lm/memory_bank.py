@@ -1,12 +1,4 @@
-"""Infinite Context Disk-Backed Neural State Bank (vsa_lm.memory_bank).
-
-Fixes D5 from Audit:
-  - Uses VSARecurrentDecoder.memorize() to write the document into the live neural state
-    and saves the true recurrent VSA states (`M_doc`), Softmax KV slices, and per-token traces to disk!
-  - `ask()` mounts the saved neural states into VSARecurrentDecoder (without stuffing raw text into the prompt!),
-    generates the answer from the mounted state, and runs `decoder.forget(traces, states, next_pos)` to
-    measure the true non-tautological algebraic unlearning residual against the pre-mount blank state!
-"""
+"""Infinite Context Disk-Backed Neural State Bank (vsa_lm.memory_bank)."""
 from __future__ import annotations
 
 import time
@@ -42,7 +34,7 @@ class VSAMemoryBank:
     @torch.no_grad()
     def memorize_to_disk(self, doc_name: str, text: str) -> Path:
         emb_layer = self.model.embed_tokens if hasattr(self.model, "embed_tokens") else self.model.embed
-        doc_prefix = f"Document: {text.strip()}\n"
+        doc_prefix = f"Context: {text.strip()}\n"
         ids = self.tokenizer.encode(doc_prefix, add_special_tokens=False)
         x_in = torch.tensor([ids], dtype=torch.long, device=self.device)
 
@@ -52,7 +44,8 @@ class VSAMemoryBank:
         states, kv_caches = VSARecurrentDecoder.blank_state(self.model, 1, self.device)
         states, kv_caches, next_pos, traces = self.decoder.memorize(x_in, states, kv_caches, start_pos=0)
 
-        cpu_states = [s.cpu().to(torch.bfloat16) if s is not None else None for s in states]
+        # Save in float32 so exact algebraic erasure has < 1e-5 residual!
+        cpu_states = [s.cpu().float() if s is not None else None for s in states]
         cpu_kv = []
         for item in kv_caches:
             if isinstance(item, tuple):
@@ -61,7 +54,7 @@ class VSAMemoryBank:
                 cpu_kv.append({k: v.cpu() for k, v in item.items()})
             else:
                 cpu_kv.append(None)
-        cpu_traces = [[(p, k.cpu(), v.cpu()) for (p, k, v) in tr] for tr in traces]
+        cpu_traces = [[(p, k.cpu().float(), v.cpu().float()) for (p, k, v) in tr] for tr in traces]
 
         cart_path = self.bank_dir / f"{doc_name}.vsa"
         torch.save({
@@ -104,7 +97,6 @@ class VSAMemoryBank:
         cart = torch.load(self.bank_dir / f"{best_name}.vsa", map_location="cpu", weights_only=False)
         route_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Mount neural states onto GPU (NO raw document text in prompt!)
         states = [s.to(self.device, dtype=torch.float32) if s is not None else None for s in cart["vsa_states"]]
         kv_caches = []
         for item in cart["kv_caches"]:
@@ -114,10 +106,9 @@ class VSAMemoryBank:
                 kv_caches.append({k: v.to(self.device) for k, v in item.items()})
             else:
                 kv_caches.append(None)
-        traces = [[(p, k.to(self.device), v.to(self.device)) for (p, k, v) in tr] for tr in cart["traces"]]
+        traces = [[(p, k.to(self.device, dtype=torch.float32), v.to(self.device, dtype=torch.float32)) for (p, k, v) in tr] for tr in cart["traces"]]
         doc_next_pos = int(cart["next_pos"])
 
-        # Snapshot mounted VSA state before question tokens so we can test exact algebraic forget(traces)
         mounted_vsa_copy = [s.clone() if s is not None else None for s in states]
 
         q_prompt = f"Question: {question.strip()}\nAnswer:"
@@ -130,7 +121,6 @@ class VSAMemoryBank:
         )
         answer = self.tokenizer.decode(gen_toks[0].tolist(), skip_special_tokens=True).strip().splitlines()[0].strip()
 
-        # D5 Fix: True algebraic unlearning via decoder.forget(traces, mounted_vsa_copy, doc_next_pos)
         erased_states = self.decoder.forget(traces, mounted_vsa_copy, next_pos=doc_next_pos)
         max_erase_residual = max(
             float(s.abs().max().item()) for s in erased_states if s is not None
