@@ -1,4 +1,4 @@
-"""O(1)-state recurrent decoder supporting both scratch VSALanguageModel and converted UniversalVSALM."""
+"""Fast O(1)-state recurrent decoder for UniversalVSALM and VSALanguageModel."""
 from __future__ import annotations
 
 import torch
@@ -21,6 +21,25 @@ class VSARecurrentDecoder:
         self.wrap_positions = wrap_positions
         self.max_T = model.config["max_T"]
         self.is_universal = hasattr(model, "embed_tokens")
+        self._prepare_fast_weights()
+
+    def _prepare_fast_weights(self):
+        """Pre-caches flattened conv weights and gamma tensors on GPU to eliminate per-step overhead."""
+        if not self.is_universal:
+            return
+        for blk in self.model.blocks:
+            if hasattr(blk, "vsa"):
+                ly = blk.vsa
+                H, HD = ly.H, ly.HD
+                gam = ly.gamma().detach()
+                ly._cached_gam = gam
+                ly._cached_omg = (1.0 - gam) / (HD ** 0.5)
+                ly._cached_vself = ly.v_self_scale.detach().float() if hasattr(ly, "v_self_scale") else torch.zeros_like(gam)
+                if hasattr(ly, "k_conv"):
+                    ly._k_conv_w = ly.k_conv.weight.detach().view(1, H, 1, HD, 4)
+                    ly._v_conv_w = ly.v_conv.weight.detach().view(1, H, 1, HD, 8)
+                    ly._k_conv_active = bool(ly.k_conv.weight.abs().max().item() > 1e-7)
+                    ly._v_conv_active = bool(ly.v_conv.weight.abs().max().item() > 1e-7)
 
     @staticmethod
     def state_bytes(model):
@@ -38,26 +57,27 @@ class VSARecurrentDecoder:
     @staticmethod
     def blank_state(model, batch_size: int, device):
         states, kv_caches = [None] * len(model.blocks), [None] * len(model.blocks)
+        dt = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
         for li, blk in enumerate(model.blocks):
             if hasattr(blk, "vsa"):
                 v = blk.vsa
                 states[li] = torch.zeros(batch_size, v.H, v.HD, v.HD, device=device, dtype=torch.float32)
                 if hasattr(v, "k_conv") and hasattr(v, "v_conv"):
                     kv_caches[li] = {
-                        "k_buf": torch.zeros(batch_size, v.H * v.HD, 3, device=device, dtype=torch.bfloat16 if str(device).startswith("cuda") else torch.float32),
-                        "v_buf": torch.zeros(batch_size, v.H * v.HD, 7, device=device, dtype=torch.bfloat16 if str(device).startswith("cuda") else torch.float32),
+                        "k_buf": torch.zeros(batch_size, v.H, 1, v.HD, 3, device=device, dtype=dt),
+                        "v_buf": torch.zeros(batch_size, v.H, 1, v.HD, 7, device=device, dtype=dt),
                     }
             else:
                 s = blk.attn if hasattr(blk, "attn") else blk.softmax_attn
                 hk = getattr(s, "HKV", s.H)
                 kv_caches[li] = (
-                    torch.zeros(batch_size, hk, 0, s.HD, device=device, dtype=torch.bfloat16 if str(device).startswith("cuda") else torch.float32),
-                    torch.zeros(batch_size, hk, 0, s.HD, device=device, dtype=torch.bfloat16 if str(device).startswith("cuda") else torch.float32),
+                    torch.zeros(batch_size, hk, 0, s.HD, device=device, dtype=dt),
+                    torch.zeros(batch_size, hk, 0, s.HD, device=device, dtype=dt),
                 )
         return states, kv_caches
 
     def _gamma(self, layer):
-        return layer.gamma()
+        return getattr(layer, "_cached_gam", None) or layer.gamma()
 
     def _proj(self, blk, h, B, T):
         layer = blk.vsa if hasattr(blk, "vsa") else blk.softmax_attn
@@ -83,59 +103,61 @@ class VSARecurrentDecoder:
             H, HD = ly.H, ly.HD
             q, k, v = ly.head_qkv(h)
             q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
+
+            if hasattr(ly, "pos_code"):
+                T_max = ly.pos_code.shape[0]
+                if pos < T_max:
+                    k = k * ly.pos_code[pos].view(1, 1, 1, HD).to(k.dtype)
             kx, vx = repeat_kv(k, ly.G), repeat_kv(v, ly.G)
 
             if hasattr(ly, "k_head_mix"):
-                # Fast batched matmul instead of slow einsum
-                km = ly.k_head_mix.to(kx.dtype)
-                vm = ly.v_head_mix.to(vx.dtype)
-                kx = torch.matmul(kx, km)
-                vx = torch.matmul(vx, vm)
+                kx = torch.matmul(kx, ly.k_head_mix.to(kx.dtype))
+                if hasattr(ly, "head_pos_delta") and pos < ly.head_pos_delta.shape[1]:
+                    kx = kx * (1.0 + 0.5 * torch.tanh(ly.head_pos_delta[:, pos : pos + 1, :])).unsqueeze(0).to(kx.dtype)
+                vx = torch.matmul(vx, ly.v_head_mix.to(vx.dtype))
 
             if hasattr(ly, "k_conv") and isinstance(kv_caches[li], dict):
-                w_dt = ly.k_conv.weight.dtype
-                k_buf = kv_caches[li]["k_buf"].to(w_dt)
-                kx_cur = kx.permute(0, 1, 3, 2).reshape(B, H * HD, 1).to(w_dt)
-                k_in = torch.cat([k_buf, kx_cur], dim=-1)
-                kv_caches[li]["k_buf"] = k_in[:, :, -3:]
-                k_loc = F.conv1d(k_in, ly.k_conv.weight, groups=H * HD).view(B, H, HD, 1).permute(0, 1, 3, 2)
-                kx = kx + k_loc.to(kx.dtype)
+                if getattr(ly, "_k_conv_active", True):
+                    k_in = torch.cat([kv_caches[li]["k_buf"], kx.unsqueeze(-1)], dim=-1)
+                    kv_caches[li]["k_buf"] = k_in[..., -3:]
+                    kx = kx + (k_in * ly._k_conv_w.to(kx.dtype)).sum(dim=-1)
                 q = q + ly.q_relu_mix.to(q.dtype) * F.relu(q)
                 kx = kx + ly.k_relu_mix.to(kx.dtype) * F.relu(kx)
 
-            gam = ly.gamma()
+            # Match training forward pass normalization
+            if not hasattr(ly, "out_norm"):
+                q = F.normalize(q.float(), p=2.0, dim=-1).to(x.dtype) * (HD ** 0.5)
+                kx = F.normalize(kx.float(), p=2.0, dim=-1).to(x.dtype)
+
+            gam = ly._cached_gam
+            omg_scale = ly._cached_omg
+            zero_vs = torch.zeros_like(gam)
+
             if record is not None:
-                # Pass fp32 tensors to kernel & trace so memorize/forget match to < 1e-6!
-                qf, kf, vf = q.float().contiguous(), (write_scale * kx.float()).contiguous(), vx.float().contiguous()
-                record[li].append((pos, kf.squeeze(2)[0].detach().cpu(), vf.squeeze(2)[0].detach().cpu()))
-                omg_scale = (1.0 - gam) / (HD ** 0.5)
-                zero_vs = torch.zeros_like(gam)
-                y = fused_vsa_recurrent_step(qf, kf, vf, states[li], gam, omg_scale, zero_vs).to(x.dtype)
-            elif x.is_cuda and write_scale == 1.0:
-                omg_scale = (1.0 - gam) / (HD ** 0.5)
-                zero_vs = torch.zeros_like(gam)
-                y = fused_vsa_recurrent_step(q.contiguous(), kx.contiguous(), vx.contiguous(), states[li], gam, omg_scale, zero_vs)
+                record[li].append((pos, kx.detach().clone(), vx.detach().clone()))
+
+            if x.is_cuda and write_scale == 1.0:
+                vself_arg = zero_vs if hasattr(ly, "out_norm") else ly._cached_vself
+                y = fused_vsa_recurrent_step(q.contiguous(), kx.contiguous(), vx.contiguous(), states[li], gam, omg_scale, vself_arg)
+                if hasattr(ly, "out_norm"):
+                    y = ly.out_norm(y) + ly.v_self_scale.view(1, H, 1, 1).to(y.dtype) * vx
             else:
                 qf, kf, vf = q.float(), (write_scale * kx.float()), vx.float()
                 M_new = gam.view(1, H, 1, 1) * states[li].float() + torch.einsum("bhe,bhd->bhed", kf.squeeze(2), vf.squeeze(2))
                 states[li] = M_new
                 carry = torch.einsum("bhed,bhe->bhd", M_new, qf.squeeze(2)).unsqueeze(2)
-                y = (carry * (1.0 - gam).view(1, H, 1, 1) / (HD ** 0.5)).to(x.dtype)
+                y = (carry * omg_scale.view(1, H, 1, 1)).to(x.dtype)
+                if hasattr(ly, "out_norm"):
+                    y = ly.out_norm(y)
+                if hasattr(ly, "v_self_scale"):
+                    y = y + ly.v_self_scale.view(1, H, 1, 1).to(y.dtype) * vx
 
-            if hasattr(ly, "out_norm"):
-                y = ly.out_norm(y)
-            if hasattr(ly, "v_self_scale"):
-                y = y + ly.v_self_scale.view(1, H, 1, 1).to(y.dtype) * vx
-
-            if hasattr(ly, "v_conv") and isinstance(kv_caches[li], dict):
-                w_dt = ly.v_conv.weight.dtype
-                v_buf = kv_caches[li]["v_buf"].to(w_dt)
-                vx_cur = vx.permute(0, 1, 3, 2).reshape(B, H * HD, 1).to(w_dt)
-                v_in = torch.cat([v_buf, vx_cur], dim=-1)
-                kv_caches[li]["v_buf"] = v_in[:, :, -7:]
-                v_loc = F.conv1d(v_in, ly.v_conv.weight, groups=H * HD).view(B, H, HD, 1).permute(0, 1, 3, 2)
+            if hasattr(ly, "v_conv") and isinstance(kv_caches[li], dict) and getattr(ly, "_v_conv_active", True):
+                v_in = torch.cat([kv_caches[li]["v_buf"], vx.unsqueeze(-1)], dim=-1)
+                kv_caches[li]["v_buf"] = v_in[..., -7:]
+                v_loc = (v_in * ly._v_conv_w.to(vx.dtype)).sum(dim=-1)
                 q_mod = torch.sigmoid((q * ly.local_q_gate.view(1, H, 1, HD).to(q.dtype)).sum(-1, keepdim=True))
-                y = y + (2.0 * q_mod) * v_loc.to(y.dtype)
+                y = y + (2.0 * q_mod) * v_loc
 
             if hasattr(ly, "g_proj"):
                 y = y * (2.0 * torch.sigmoid(ly.g_proj(h).view(B, 1, H, HD).transpose(1, 2)))
@@ -177,7 +199,6 @@ class VSARecurrentDecoder:
             states, kv_caches = self.blank_state(m, B, ids.device)
 
         if self.is_universal:
-            # Fast parallel prefill for prompts <= 1024 tokens when not recording traces!
             hidden = None
             pos = start_pos
             for t in range(T):
@@ -310,18 +331,25 @@ class VSARecurrentDecoder:
 
     @torch.no_grad()
     def forget(self, traces, states, next_pos: int, kv_caches=None, pre_kv_lens: list[int] | None = None):
+        """Replays exact Triton kernel recurrent accumulation over `traces` and subtracts from `states[li]`."""
         for li, trace in enumerate(traces):
             if not trace:
                 continue
-            gamma = self._gamma(self.model.blocks[li].vsa).double()
-            acc = torch.zeros_like(states[li], dtype=torch.float64)
+            ly = self.model.blocks[li].vsa
+            gam = self._gamma(ly).to(states[li].device)
+            omg = (1.0 - gam) / (ly.HD ** 0.5)
+            z_vs = torch.zeros_like(gam)
+            M_doc = torch.zeros_like(states[li])
+            last_p = trace[-1][0]
             for (p, k, v) in trace:
-                w = gamma.view(-1, 1, 1) ** float(next_pos - 1 - p)
-                acc += w * torch.einsum("he,hd->hed", k.double(), v.double()).unsqueeze(0)
-            states[li] = (states[li].double() - acc).float()
-        if kv_caches is not None and pre_kv_lens is not None:
-            for li, item in enumerate(kv_caches):
-                if isinstance(item, tuple):
-                    L0 = pre_kv_lens[li]
-                    kv_caches[li] = (item[0][:, :, :L0, :], item[1][:, :, :L0, :])
+                kt = k.to(states[li].device)
+                vt = v.to(states[li].device)
+                if kt.ndim == 2:
+                    kt = kt.unsqueeze(0).unsqueeze(2)
+                    vt = vt.unsqueeze(0).unsqueeze(2)
+                fused_vsa_recurrent_step(kt, kt, vt, M_doc, gam, omg, z_vs)
+            rem_steps = float(next_pos - 1 - last_p)
+            if rem_steps > 0:
+                M_doc = M_doc * (gam.view(1, -1, 1, 1) ** rem_steps)
+            states[li] = states[li] - M_doc
         return states
