@@ -65,14 +65,18 @@ class UniversalSoftmaxAttn(nn.Module):
                 q, k = self.q_norm(q), self.k_norm(k)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             q, k = self.rope(q), self.rope(k)
-            k, v = repeat_kv(k, self.G), repeat_kv(v, self.G)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            try:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=(self.G > 1))
+            except TypeError:
+                y = F.scaled_dot_product_attention(q, repeat_kv(k, self.G), repeat_kv(v, self.G), is_causal=True)
             return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD) * torch.sigmoid(gate))
 
         q, k, v = self.head_qkv(x)
         q, k = self.rope(q), self.rope(k)
-        k, v = repeat_kv(k, self.G), repeat_kv(v, self.G)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        try:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=(self.G > 1))
+        except TypeError:
+            y = F.scaled_dot_product_attention(q, repeat_kv(k, self.G), repeat_kv(v, self.G), is_causal=True)
         if self.g_proj is not None:
             y = y * torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2))
         return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD))
@@ -101,9 +105,9 @@ class UniversalVSAAttn(nn.Module):
 
         self.log_gamma = nn.Parameter(torch.zeros(H))
         with torch.no_grad():
-            max_h = float(max(64, max_T))
+            max_h = float(max(256, max_T))
             horizons = torch.logspace(math.log10(4.0), math.log10(max_h), H)
-            self.log_gamma.copy_(torch.logit((1.0 - 1.0 / horizons).clamp(0.5, 0.999) / 0.9999))
+            self.log_gamma.copy_(torch.logit((1.0 - 1.0 / horizons).clamp(0.5, 0.9995) / 0.9999))
         self.chunk_size = chunk_size
 
         if cfg.get("vsa_untie_gqa", True):
@@ -150,6 +154,9 @@ class UniversalVSAAttn(nn.Module):
             q = q + self.q_relu_mix.to(q.dtype) * F.relu(q)
             kx = kx + self.k_relu_mix.to(kx.dtype) * F.relu(kx)
 
+        q = F.normalize(q.float(), p=2.0, dim=-1).to(x.dtype) * (self.HD ** 0.5)
+        kx = F.normalize(kx.float(), p=2.0, dim=-1).to(x.dtype)
+
         gam = self.gamma()
         y = _vsa_apply(q, kx, vx, gam, self.chunk_size)
         y = self.out_norm(y)
@@ -191,7 +198,7 @@ class UniversalBlock(nn.Module):
 
 class UniversalVSALM(nn.Module):
     def __init__(self, vocab_size: int, dim: int, num_layers: int, num_heads: int,
-                 num_kv_heads: int, intermediate: int, max_T: int = 1024,
+                 num_kv_heads: int, intermediate: int, max_T: int = 2048,
                  chunk_size: int = 32, hybrid_every: int = 4,
                  rope_theta: float = 10000.0, rope_scaling: dict | None = None,
                  eps: float = 1e-5, head_dim: int | None = None,
