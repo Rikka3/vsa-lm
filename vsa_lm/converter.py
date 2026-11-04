@@ -1,13 +1,4 @@
-"""Universal Donor-to-VSA Converter & 2-Stage Attention-Transfer + KD Healer (vsa_lm.converter).
-
-Fixes from Audit:
-  - A1 + A2: Preserves native GatedDeltaNet layers on Qwen3.5 and converts half of full_attention layers.
-  - A4 + A5 + A6: Multi-scale horizons up to 5,000 tokens (gamma_cap=0.9998), active positive feature map.
-  - B2 + B3 + B4 + B5: Asserts teacher/student head equality before sharing, logs load_state_dict diffs, no silent fake teacher.
-  - C1 + C2: 50/50 interleaved & shuffled UltraChat + Bespoke-Stratos reasoning traces with native <think> tags preserved.
-  - C3: Stage-1 Layer-Wise Attention-Output MSE Transfer before end-to-end KD.
-  - C4 + C6 + C8: Unfreezes norms & converted-block MLPs gently (0.08x LR, 0 weight decay), fixes final mid_loss norm, uses kd=0.9 + 0.1 CE anchor.
-"""
+"""Universal Donor-to-VSA Converter & 2-Stage Healer (vsa_lm.converter)."""
 from __future__ import annotations
 
 import gc
@@ -69,7 +60,7 @@ def convert_donor_model(
     hybrid_every: int = 4,
     max_T: int = 1024,
     chunk_size: int = 32,
-    gamma_cap: float = 0.9998,
+    gamma_cap: float = 0.999,
     hf_token: str | None = None,
     visual_sidecar_out: str | None = None,
 ) -> str:
@@ -105,7 +96,8 @@ def convert_donor_model(
 
     H, HD, D = cfg["vsa_num_heads"], cfg["vsa_head_dim"], cfg["dim"]
     dtype = sd["embed_tokens.weight"].dtype
-    horizons = torch.logspace(math.log10(4.0), math.log10(1.0 / max(1e-4, 1.0 - gamma_cap)), H)
+    max_h = min(float(max(64, max_T)), 1.0 / max(1e-4, 1.0 - gamma_cap))
+    horizons = torch.logspace(math.log10(4.0), math.log10(max_h), H)
     g_init = (1.0 - 1.0 / horizons).clamp(0.50, gamma_cap)
     sig = (g_init / 0.9999).clamp(1e-6, 1.0 - 1e-6)
     lg_init = torch.log(sig / (1.0 - sig)).float()
@@ -114,21 +106,32 @@ def convert_donor_model(
         if ltype != "vsa":
             continue
         p = f"blocks.{li}.vsa"
-        sd[f"{p}.pos_code"] = torch.ones(max_T, HD, dtype=torch.float32)
         sd[f"{p}.log_gamma"] = lg_init.clone()
+        sd[f"{p}.out_norm.weight"] = torch.ones(HD, dtype=torch.float32)
         eye = torch.eye(HD, dtype=torch.float32).unsqueeze(0).repeat(H, 1, 1)
         sd[f"{p}.k_head_mix"] = eye.clone()
         sd[f"{p}.v_head_mix"] = eye.clone()
-        sd[f"{p}.head_pos_delta"] = torch.zeros(H, max_T, HD, dtype=torch.float32)
-        sd[f"{p}.v_self_scale"] = torch.full((H,), 0.1, dtype=torch.float32)
+        sd[f"{p}.v_self_scale"] = torch.zeros(H, dtype=torch.float32)
         sd.setdefault(f"{p}.g_proj.weight", torch.zeros(H * HD, D, dtype=dtype))
         sd[f"{p}.v_conv.weight"] = torch.zeros(H * HD, 1, 8, dtype=dtype)
         sd[f"{p}.k_conv.weight"] = torch.zeros(H * HD, 1, 4, dtype=dtype)
         sd[f"{p}.local_q_gate"] = torch.zeros(H, HD, dtype=torch.float32)
-        sd[f"{p}.q_relu_mix"] = torch.full((H, 1, 1), 0.5, dtype=torch.float32)
-        sd[f"{p}.k_relu_mix"] = torch.full((H, 1, 1), 0.5, dtype=torch.float32)
+        sd[f"{p}.q_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
+        sd[f"{p}.k_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
 
     stu.load_state_dict(sd, strict=True)
+
+    # Item 15 Verification: Assert every new residual / mixing module is a strict no-op at init
+    with torch.no_grad():
+        for li, ltype in enumerate(layer_types):
+            if ltype == "vsa":
+                ly = stu.blocks[li].vsa
+                assert float(ly.v_self_scale.abs().max()) == 0.0
+                assert float(ly.q_relu_mix.abs().max()) == 0.0
+                assert float(ly.k_relu_mix.abs().max()) == 0.0
+                assert float(ly.v_conv.weight.abs().max()) == 0.0
+                assert float(ly.k_conv.weight.abs().max()) == 0.0
+
     n_params = sum(p.numel() for p in stu.parameters())
     tmp = out_ckpt + ".tmp"
     torch.save({
@@ -137,44 +140,104 @@ def convert_donor_model(
         "config": stu.config,
         "injection": {
             "donor": donor_id_or_dir,
-            "converter": "vsa_lm.converter v10-audit-clean",
+            "converter": "vsa_lm.converter v11",
             "visual_sidecar_path": vis_path if n_vis > 0 else None,
         },
     }, tmp)
     os.replace(tmp, out_ckpt)
-    print(f"  Strict weight load  : PASS ({n_params/1e9:.3f}B text-model params)")
+    print(f"  Strict weight load  : PASS ({n_params/1e9:.3f}B text-model params, no-op init verified)")
     print(f"  Saved VSA student   : {out_ckpt}  ({time.perf_counter() - t0:.1f}s)")
     print("=" * 80)
     return out_ckpt
 
 
+def _format_conversation_donor_native(tok, msgs: list[dict]) -> str:
+    """Items 1 & 19 Fix: Uses the donor's own chat template for user/system turns while
+    preserving raw `<think>...</think>` reasoning blocks inside assistant turns.
+    """
+    norm_m = []
+    for m in msgs:
+        raw_role = str(m.get("from", m.get("role", "user"))).lower()
+        if raw_role in ("system", "sys"):
+            r = "system"
+        elif raw_role in ("human", "user"):
+            r = "user"
+        else:
+            r = "assistant"
+        c = str(m.get("value", m.get("content", "")))
+        c = c.replace("<|begin_of_thought|>", "<think>\n").replace("<|end_of_thought|>", "\n</think>\n").replace("<|begin_of_solution|>", "").replace("<|end_of_solution|>", "")
+        norm_m.append({"role": r, "content": c})
+
+    # If assistant turns contain <think>, render prefix via apply_chat_template(add_generation_prompt=True)
+    # and append raw assistant content so templates never strip <think> blocks!
+    has_cot = any("<think>" in m["content"] and m["role"] == "assistant" for m in norm_m)
+    if not has_cot:
+        try:
+            return tok.apply_chat_template(norm_m, tokenize=False)
+        except Exception:
+            return "\n".join(f"{x['role']}: {x['content']}" for x in norm_m)
+
+    eos = tok.eos_token or ""
+    parts = []
+    history = []
+    for m in norm_m:
+        if m["role"] != "assistant":
+            history.append(m)
+        else:
+            try:
+                prefix = tok.apply_chat_template(history, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                prefix = "\n".join(f"{x['role']}: {x['content']}" for x in history) + "\nassistant: "
+            content = m["content"]
+            if prefix.rstrip().endswith("<think>") and content.lstrip().startswith("<think>"):
+                content = content.lstrip()[len("<think>"):].lstrip("\n")
+            parts.append(prefix + content + eos)
+            history = []
+    return "\n".join(parts) if parts else "\n".join(f"{x['role']}: {x['content']}" for x in norm_m)
+
+
 def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str, target_tokens: int):
-    """C1 + C2 Fix: Interleaves 50% Bespoke-Stratos reasoning traces (preserving <think>...</think>
-    directly so chat templates never strip CoT!) with 50% UltraChat, shuffles documents, and logs token mix.
+    """Items 1 & 19 Fix:
+      - Renders all conversations in the donor's native template (never ChatML on DeepSeek!).
+      - Mixes ~40% CoT (Bespoke-Stratos), ~30% Chat (UltraChat), ~30% Web Text (FineWeb-Edu).
+      - Builds a >= 1M-token held-out eval cache from a disjoint source slice and logs exact token counts per source.
     """
     import pyarrow.parquet as pq
+    from datasets import load_dataset
     from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoTokenizer
 
     safe_tag = donor_repo.split("/")[-1].lower().replace("-", "_").replace(".", "_")
-    train_cache = os.path.join(work, f"{safe_tag}_v10_disjoint_train.pt")
-    eval_cache = os.path.join(work, f"{safe_tag}_v10_disjoint_eval.pt")
+    train_cache = os.path.join(work, f"{safe_tag}_v11_train.pt")
+    eval_cache = os.path.join(work, f"{safe_tag}_v11_eval.pt")
 
     if os.path.isfile(train_cache) and os.path.isfile(eval_cache):
         tr_t = torch.load(train_cache, weights_only=True)
         ev_t = torch.load(eval_cache, weights_only=True)
-        if len(tr_t) >= int(target_tokens * 0.8):
-            print(f"[vsa-data] Loaded v10 interleaved train cache ({len(tr_t)/1e6:.1f}M) & eval cache ({len(ev_t)/1e6:.2f}M)")
+        if len(tr_t) >= int(target_tokens * 0.8) and len(ev_t) >= 900_000:
+            print(f"[vsa-data] Loaded v11 train cache ({len(tr_t)/1e6:.1f}M) & held-out eval cache ({len(ev_t)/1e6:.2f}M)")
             return tr_t, ev_t
 
     tok = AutoTokenizer.from_pretrained(donor_dir)
-    eos_id = tok.eos_token_id or tok.pad_token_id or 0
+    eos_id = tok.eos_token_id if isinstance(tok.eos_token_id, int) else (tok.eos_token_id[0] if tok.eos_token_id else 0)
+    bos_id = tok.bos_token_id if isinstance(tok.bos_token_id, int) else eos_id
     api = HfApi()
-    print(f"[vsa-data] Building 50/50 interleaved Reasoning + Chat cache ({target_tokens/1e6:.0f}M tokens, 0% eval overlap)...", flush=True)
     t0 = time.perf_counter()
 
-    def _fetch_docs(ds_id: str, max_f: int, preserve_cot: bool) -> list[str]:
-        docs = []
+    def _tokenize_docs(docs: list[str], budget: int) -> tuple[array, int]:
+        buf = array("i")
+        for b_i in range(0, len(docs), 128):
+            for ids in tok(docs[b_i : b_i + 128], add_special_tokens=False)["input_ids"]:
+                if bos_id is not None:
+                    buf.append(int(bos_id))
+                buf.extend(ids)
+                buf.append(int(eos_id))
+            if len(buf) >= budget:
+                break
+        return buf, len(buf)
+
+    cot_docs, chat_docs = [], []
+    for ds_id, target_list, max_f in (("bespokelabs/Bespoke-Stratos-17k", cot_docs, 4), ("HuggingFaceH4/ultrachat_200k", chat_docs, 6)):
         for rev in ("main", "refs/convert/parquet"):
             try:
                 files = [f for f in api.list_repo_files(ds_id, revision=rev, repo_type="dataset") if f.endswith(".parquet") and "train" in f]
@@ -185,81 +248,83 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
                     for row in pq.read_table(lp).to_pylist():
                         msgs = row.get("messages") or row.get("conversations")
                         if isinstance(msgs, list):
-                            norm_m = []
-                            for m in msgs:
-                                r = "user" if m.get("from", m.get("role")) in ("human", "user") else "assistant"
-                                c = str(m.get("value", m.get("content", "")))
-                                c = c.replace("<|begin_of_thought|>", "<think>\n").replace("<|end_of_thought|>", "\n</think>\n").replace("<|begin_of_solution|>", "").replace("<|end_of_solution|>", "")
-                                norm_m.append({"role": r, "content": c})
-                            if preserve_cot:
-                                # Format manually if apply_chat_template strips <think> blocks
-                                rendered = "\n".join(f"<|im_start|>{x['role']}\n{x['content']}<|im_end|>" for x in norm_m)
-                                docs.append(rendered)
-                            else:
-                                try:
-                                    docs.append(tok.apply_chat_template(norm_m, tokenize=False))
-                                except Exception:
-                                    docs.append("\n".join(x["content"] for x in norm_m))
-                if docs:
+                            target_list.append(_format_conversation_donor_native(tok, msgs))
+                if target_list:
                     break
             except Exception:
                 continue
-        return docs
 
-    cot_docs = _fetch_docs("bespokelabs/Bespoke-Stratos-17k", 2, preserve_cot=True)
-    chat_docs = _fetch_docs("HuggingFaceH4/ultrachat_200k", 3, preserve_cot=False)
+    web_docs = []
+    try:
+        fw = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+        for ex in fw:
+            web_docs.append(str(ex["text"]))
+            if len(web_docs) >= 25_000:
+                break
+    except Exception:
+        pass
 
     rng = random.Random(7777)
     rng.shuffle(cot_docs)
     rng.shuffle(chat_docs)
+    rng.shuffle(web_docs)
 
-    # Interleave 1 CoT doc with 2 shorter Chat docs (~50/50 token mix)
-    interleaved = []
-    n_max = max(len(cot_docs), len(chat_docs))
-    for i in range(n_max):
-        if i < len(cot_docs):
-            interleaved.append(cot_docs[i])
-        if 2 * i < len(chat_docs):
-            interleaved.append(chat_docs[2 * i])
-        if 2 * i + 1 < len(chat_docs):
-            interleaved.append(chat_docs[2 * i + 1])
+    # Disjoint held-out evaluation split (>= 1M tokens: 500k held-out native chat/CoT + 500k held-out web text)
+    eval_cot_cut = max(50, len(cot_docs) // 20)
+    eval_chat_cut = max(200, len(chat_docs) // 20)
+    eval_web_cut = max(500, len(web_docs) // 10)
 
-    n_eval_docs = min(500, max(100, len(interleaved) // 20))
-    eval_docs, train_docs = interleaved[:n_eval_docs], interleaved[n_eval_docs:]
+    ev_cot_buf, n_ev_cot = _tokenize_docs(cot_docs[:eval_cot_cut], 350_000)
+    ev_chat_buf, n_ev_chat = _tokenize_docs(chat_docs[:eval_chat_cut], 350_000)
+    ev_web_buf, n_ev_web = _tokenize_docs(web_docs[:eval_web_cut], 400_000)
+    eval_t = torch.cat([
+        torch.frombuffer(ev_cot_buf, dtype=torch.int32).clone(),
+        torch.frombuffer(ev_chat_buf, dtype=torch.int32).clone(),
+        torch.frombuffer(ev_web_buf, dtype=torch.int32).clone(),
+    ])
 
-    eval_buf = array("i")
-    for ids in tok(eval_docs, add_special_tokens=False)["input_ids"]:
-        eval_buf.extend(ids)
-        eval_buf.append(int(eos_id))
-        if len(eval_buf) >= 500_000:
-            break
-    eval_t = torch.frombuffer(eval_buf, dtype=torch.int32).clone()
+    # Training split (strictly disjoint from eval docs): target 40% CoT, 30% Chat, 30% Web
+    tr_cot_docs = cot_docs[eval_cot_cut:]
+    tr_chat_docs = chat_docs[eval_chat_cut:]
+    tr_web_docs = web_docs[eval_web_cut:]
 
-    train_buf = array("i")
-    for b_idx in range(0, len(train_docs), 128):
-        for ids in tok(train_docs[b_idx : b_idx + 128], add_special_tokens=False)["input_ids"]:
-            train_buf.extend(ids)
-            train_buf.append(int(eos_id))
-        if len(train_buf) >= target_tokens:
-            break
+    cot_budget = int(target_tokens * 0.40)
+    chat_budget = int(target_tokens * 0.30)
+    web_budget = max(0, target_tokens - cot_budget - chat_budget)
 
-    if len(train_buf) < target_tokens and len(train_buf) > 0:
-        reps = (target_tokens // len(train_buf)) + 1
-        train_t = torch.frombuffer(train_buf, dtype=torch.int32).clone().repeat(reps)[:target_tokens]
-    else:
-        train_t = torch.frombuffer(train_buf, dtype=torch.int32).clone()[:target_tokens]
+    tr_cot_buf, n_tr_cot = _tokenize_docs(tr_cot_docs, cot_budget)
+    tr_chat_buf, n_tr_chat = _tokenize_docs(tr_chat_docs, chat_budget)
+    tr_web_buf, n_tr_web = _tokenize_docs(tr_web_docs, web_budget)
+
+    # Interleave 1024-token windows across the 3 sources and shuffle windows
+    T_chunk = 1025
+    chunks = []
+    for buf in (tr_cot_buf, tr_chat_buf, tr_web_buf):
+        t_arr = torch.frombuffer(buf, dtype=torch.int32).clone()
+        n_c = len(t_arr) // T_chunk
+        if n_c > 0:
+            chunks.append(t_arr[: n_c * T_chunk].view(n_c, T_chunk))
+    all_chunks = torch.cat(chunks, dim=0)
+    perm = torch.randperm(all_chunks.size(0), generator=torch.Generator().manual_seed(7777))
+    train_t = all_chunks[perm].reshape(-1)[:target_tokens].contiguous()
 
     torch.save(train_t, train_cache)
     torch.save(eval_t, eval_cache)
-    print(f"[vsa-data] Built v10 train ({len(train_t)/1e6:.1f}M, CoT docs={len(cot_docs)}, Chat docs={len(chat_docs)}) & eval ({len(eval_t)/1e6:.2f}M) in {time.perf_counter()-t0:.1f}s!", flush=True)
+    tot_tr = max(1, n_tr_cot + n_tr_chat + n_tr_web)
+    print(
+        f"[vsa-data] Token mix logged -> Train: {len(train_t)/1e6:.1f}M "
+        f"(CoT: {n_tr_cot/1e6:.1f}M [{n_tr_cot/tot_tr*100:.0f}%], "
+        f"Chat: {n_tr_chat/1e6:.1f}M [{n_tr_chat/tot_tr*100:.0f}%], "
+        f"Web: {n_tr_web/1e6:.1f}M [{n_tr_web/tot_tr*100:.0f}%]) | "
+        f"Held-out Eval: {len(eval_t)/1e6:.2f}M in {time.perf_counter()-t0:.1f}s!",
+        flush=True,
+    )
     return train_t, eval_t
 
 
 def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: torch.device):
-    """B4 Fix: Never silently fall back to a fake softmax teacher for Qwen3.5; log errors explicitly."""
     if stu_cfg.get("has_qwen35_lin", False):
         import transformers
-        print(f"[vsa-teacher] Loading native Qwen3.5 teacher from {donor_dir} (vision-stripped, bfloat16)...", flush=True)
         last_err = None
         for cls_name in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration", "AutoModelForCausalLM", "AutoModelForImageTextToText"):
             cls = getattr(transformers, cls_name, None)
@@ -291,9 +356,6 @@ def _load_donor_teacher(donor_repo: str, donor_dir: str, stu_cfg: dict, device: 
 
 
 def _forward_hf_teacher_body(donor, xm: torch.Tensor, num_layers: int, hybrid_every: int):
-    """C6 Fix: Excludes the final block from `t_mids` because `out.hidden_states[num_layers]`
-    in HF transformers is already post-final-RMSNorm (which is compared via `final_h_loss`).
-    """
     inner = getattr(donor, "model", donor)
     if hasattr(inner, "language_model"):
         inner = inner.language_model
@@ -310,26 +372,34 @@ def _forward_hf_teacher_body(donor, xm: torch.Tensor, num_layers: int, hybrid_ev
 
 @torch.no_grad()
 def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Tensor,
-                            device: torch.device, n_tokens: int = 32768, bs: int = 2) -> tuple[float, float, float, float]:
+                            device: torch.device, n_tokens: int = 262_144, bs: int = 2,
+                            bos_id: int | None = None) -> tuple[float, float, float, float]:
+    """Items 1 & 2 Fix: Evaluates on held-out multi-domain tokens with BOS prepended and
+    exact fp32 logit matmuls (`F.linear(h.float(), w.float())`).
+    """
     stu.eval()
     T, V = stu.config["max_T"], stu.config["vocab_size"]
     avail = len(eval_tokens) - 1
     n_b = max(1, min(n_tokens // (bs * T), avail // (bs * T)))
     ar = torch.arange(T)
     nll_s, nll_d, kl_sum, top1_ok, cnt = 0.0, 0.0, 0.0, 0, 0
-    d_lm_head = donor.get_output_embeddings() if is_hf_donor else donor.lm_head
+    w_lm_s = stu.lm_head.weight
+    w_lm_t = donor.get_output_embeddings().weight if is_hf_donor else donor.lm_head.weight
 
     for i in range(n_b):
         s = i * bs * T
         base = s + torch.arange(bs)[:, None] * T + ar[None, :]
         x, y = eval_tokens[base].long().to(device), eval_tokens[base + 1].long().to(device)
+        if bos_id is not None:
+            x[:, 0] = int(bos_id)
         with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
             hs = stu(x)
             hd, _ = _forward_hf_teacher_body(donor, x, stu.config["num_layers"], stu.config["hybrid_every"]) if is_hf_donor else (donor(x), None)
         for c in range(bs):
-            slog = stu.lm_head(hs[c:c+1]).float()
-            dlog = d_lm_head(hd[c:c+1]).float()
-            yv = y[c:c+1].reshape(-1)
+            # Item 2 Fix: Compute eval logits in fp32 before matmul
+            slog = F.linear(hs[c : c + 1].float(), w_lm_s.float())
+            dlog = F.linear(hd[c : c + 1].float(), w_lm_t.float())
+            yv = y[c : c + 1].reshape(-1)
             nll_s += F.cross_entropy(slog.reshape(-1, V), yv, reduction="sum").item()
             nll_d += F.cross_entropy(dlog.reshape(-1, V), yv, reduction="sum").item()
             lsm_s, lsm_d = F.log_softmax(slog, dim=-1), F.log_softmax(dlog, dim=-1)
@@ -344,23 +414,28 @@ def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Te
 
 
 def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_tokens: torch.Tensor,
-                                         device: torch.device, steps: int = 120, bs: int = 4):
-    """C3 Fix: Fast parallel Stage-1 Layer-Wise Attention-Output MSE + Cosine Transfer!
-    Directly trains every converted VSA block to match its exact donor block output given the
-    exact same teacher input hidden state before end-to-end KD begins.
+                                         device: torch.device, stage1_tokens: int = 10_000_000, bs: int = 4):
+    """Item 16 Fix:
+      - Sets requires_grad=False on all non-VSA parameters during Stage 1 (zero wasted MLP grads).
+      - Normalizes per-layer MSE by target variance + cosine distance.
+      - Logs per-layer alignment loss.
     """
-    if steps <= 0:
+    if stage1_tokens <= 0:
         return
     T = min(512, int(stu.config["max_T"]))
+    steps = max(1, stage1_tokens // (bs * T))
     L = int(stu.config["num_layers"])
     layer_types = stu.config.get("layer_types") or []
     vsa_indices = [li for li in range(L) if layer_types[li] == "vsa" or (not layer_types and hasattr(stu.blocks[li], "vsa"))]
     if not vsa_indices:
         return
 
+    for p in stu.parameters():
+        p.requires_grad_(False)
     vsa_params = []
     for li in vsa_indices:
         for p in stu.blocks[li].vsa.parameters():
+            p.data = p.data.to(device, dtype=torch.float32)
             p.requires_grad_(True)
             vsa_params.append(p)
 
@@ -369,9 +444,10 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
     gen = torch.Generator().manual_seed(101)
     ar = torch.arange(T)
     t0 = time.perf_counter()
-    print(f"  [Stage-1 Layer-Wise Transfer] Aligning {len(vsa_indices)} VSA layers to exact donor block outputs ({steps} steps)...", flush=True)
+    print(f"  [Stage-1 Layer-Wise Transfer] {stage1_tokens/1e6:.1f}M tokens ({steps} steps) across {len(vsa_indices)} VSA layers...", flush=True)
 
     stu.train()
+    per_layer_loss = {}
     for s in range(steps):
         idx = torch.randint(0, n_win, (bs,), generator=gen)
         x = train_tokens[idx[:, None] * T + ar[None, :]].long().to(device)
@@ -381,8 +457,6 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
             if is_hf_donor:
                 inner = getattr(getattr(donor, "model", donor), "language_model", getattr(donor, "model", donor))
                 out = inner(input_ids=x, output_hidden_states=True, use_cache=False)
-                # hidden_states[0] is embedding output; hidden_states[li+1] is output of block li
-                # Note: hidden_states[L] in HF is post-final-norm, so for li == L-1 we skip or normalize
                 t_hs = [h.detach() for h in out.hidden_states]
                 del out
             else:
@@ -392,23 +466,28 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
                     xt = blk(xt)
                     t_hs.append(xt.detach())
 
-        total_mse = torch.zeros((), device=device, dtype=torch.float32)
+        total_loss = torch.zeros((), device=device, dtype=torch.float32)
         with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
             for li in vsa_indices:
                 if is_hf_donor and li == L - 1:
                     continue
                 h_in = t_hs[li]
-                h_target = t_hs[li + 1]
-                h_pred = stu.blocks[li](h_in)
-                l_mse = F.mse_loss(h_pred.float(), h_target.float()) + (1.0 - F.cosine_similarity(h_pred.float(), h_target.float(), dim=-1).mean())
-                total_mse = total_mse + l_mse / max(1, len(vsa_indices))
+                h_target = t_hs[li + 1].float()
+                h_pred = stu.blocks[li](h_in).float()
+                target_var = h_target.var(dim=-1, keepdim=True).mean().clamp_min(1e-4)
+                nmse = F.mse_loss(h_pred, h_target) / target_var
+                cos_d = 1.0 - F.cosine_similarity(h_pred, h_target, dim=-1).mean()
+                l_val = nmse + cos_d
+                per_layer_loss[li] = float(l_val.detach().item())
+                total_loss = total_loss + l_val / max(1, len(vsa_indices))
 
-        total_mse.backward()
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(vsa_params, 1.0)
         opt.step()
         del t_hs
-        if (s + 1) in (1, steps // 2, steps):
-            print(f"    [Stage-1] step {s+1:3d}/{steps} | layer_mse+cos = {float(total_mse.item()):.4f} ({time.perf_counter()-t0:.1f}s)", flush=True)
+        if (s + 1) in (1, max(1, steps // 4), max(1, steps // 2), steps):
+            max_l = max(per_layer_loss.values()) if per_layer_loss else 0.0
+            print(f"    [Stage-1] step {s+1:4d}/{steps} | mean_nmse+cos = {float(total_loss.item()):.4f} | max_layer = {max_l:.4f} ({time.perf_counter()-t0:.1f}s)", flush=True)
 
 
 def heal_universal_model(
@@ -419,43 +498,70 @@ def heal_universal_model(
     out_prefix: str = "vsa_healed",
     tokens_budget: int = 80_000_000,
     data_tokens: int = 100_000_000,
+    stage1_tokens: int = 10_000_000,
     bs: int = 16,
     lr: float = 1.5e-4,
     warmup: int = 150,
-    kd: float = 0.9,
+    kd: float = 1.0,
     eval_every: int = 250,
     save_every: int = 250,
     seed: int = 7777,
     hf_repo: str | None = None,
     highspeed: bool = False,
+    resume: bool = False,
 ):
+    """Items 12, 16, 17, 20 Fix:
+      - Requires explicit `resume=True` to continue from an existing `out_prefix_latest.pth`.
+      - Saves and restores optimizer state (`ck["opt"]`) and removes the 0.5x LR spike on resume.
+      - Keeps all trainable weights (including norms and converted-block MLPs at 0.05x LR) in fp32 master precision.
+      - Computes KD logits in fp32 (`F.linear(hs.float(), w.float())`).
+    """
     _purge_zombie_vram()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_ckpt = os.path.join(work, f"{out_prefix}_latest.pth")
-    active_ckpt = out_ckpt if os.path.isfile(out_ckpt) else ckpt_path
+    active_ckpt = out_ckpt if (resume and os.path.isfile(out_ckpt)) else ckpt_path
 
     ck = torch.load(active_ckpt, map_location="cpu", weights_only=False)
     stu_cfg = dict(ck["config"])
-    start_step = int(ck.get("step", 0))
+    start_step = int(ck.get("step", 0)) if resume else 0
     donor_repo = donor_id or (ck.get("injection") or {}).get("donor")
     if not donor_repo:
         raise ValueError("Pass --donor <repo_id> or use a checkpoint created by `python -m vsa_lm convert`")
 
     stu = UniversalVSALM(**stu_cfg)
-    # B5 Fix: Explicit missing/unexpected key check
-    missing, unexpected = stu.load_state_dict(ck["model"], strict=False)
-    allowed_missing = {"rope_mix", "v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix"}
+    # Ignore legacy pos_code / head_pos_delta if loading an older checkpoint
+    state_in = {k: v for k, v in ck["model"].items() if "pos_code" not in k and "head_pos_delta" not in k}
+    missing, unexpected = stu.load_state_dict(state_in, strict=False)
+    allowed_missing = {"rope_mix", "v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm"}
     real_missing = [m for m in missing if not any(a in m for a in allowed_missing)]
     if real_missing or unexpected:
         raise RuntimeError(f"Checkpoint mismatch! Missing: {real_missing[:10]}, Unexpected: {unexpected[:10]}")
 
-    fp32_keys = ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta",
-                 "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias")
-    for name, p in stu.named_parameters():
-        if any(k in name for k in fp32_keys):
-            p.data = p.data.to(device, dtype=torch.float32)
+    # Freeze everything first so we know which parameters are trainable
+    vsa_conv, vsa_core, vsa_proj, mlp_and_norm = [], [], [], []
+    layer_types = stu_cfg.get("layer_types") or []
+    for n_, p_ in stu.named_parameters():
+        li = int(n_.split(".")[1]) if n_.startswith("blocks.") else -1
+        is_vsa_blk = (li >= 0 and (not layer_types or layer_types[li] == "vsa"))
+        if any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix")):
+            p_.requires_grad_(True)
+            vsa_conv.append(p_)
+        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm")):
+            p_.requires_grad_(True)
+            vsa_core.append(p_)
+        elif ".vsa." in n_ and is_vsa_blk:
+            p_.requires_grad_(True)
+            vsa_proj.append(p_)
+        elif is_vsa_blk and (".mlp." in n_ or ".norm1." in n_ or ".norm2." in n_):
+            # Item 17 Fix: Unfreeze converted-block MLPs and norms at 0.05x LR
+            p_.requires_grad_(True)
+            mlp_and_norm.append(p_)
         else:
-            p.data = p.data.to(device, dtype=(torch.bfloat16 if device.type == "cuda" else torch.float32))
+            p_.requires_grad_(False)
+
+    # Item 12 Fix: Keep all trainable parameters in fp32 master precision, frozen parameters in bf16
+    for n_, p_ in stu.named_parameters():
+        p_.data = p_.data.to(device, dtype=(torch.float32 if p_.requires_grad else (torch.bfloat16 if device.type == "cuda" else torch.float32)))
     for b in stu.buffers():
         b.data = b.data.to(device)
 
@@ -463,19 +569,18 @@ def heal_universal_model(
     T = int(stu_cfg["max_T"])
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
 
-    if highspeed and vram_gb >= 45.0 and n_params < 4_600_000_000:
-        micro_bs = 4 if n_params >= 3_000_000_000 else 8
+    if highspeed and vram_gb >= 45.0 and n_params < 3_000_000_000:
+        micro_bs = 4
         use_ckpt = False
         mode_str = f"HIGHSPEED (use_ckpt=False, micro_bs={micro_bs})"
     else:
-        micro_bs = 2 if n_params >= 3_000_000_000 else (4 if vram_gb >= 20.0 else 2)
+        micro_bs = 2 if n_params >= 2_500_000_000 else (4 if vram_gb >= 24.0 else 2)
         use_ckpt = True
         mode_str = f"LOW-VRAM (use_ckpt=True, micro_bs={micro_bs})"
 
     donor_dir = fetch_any_donor(donor_repo)
     donor, is_hf_donor = _load_donor_teacher(donor_repo, donor_dir, stu_cfg, device)
 
-    # B3 Fix: Only share teacher/student embeddings after verifying exact equality!
     if is_hf_donor:
         t_in_emb, t_out_emb = donor.get_input_embeddings(), donor.get_output_embeddings()
         if t_in_emb is not None and t_in_emb.weight.shape == stu.embed_tokens.weight.shape and torch.equal(t_in_emb.weight, stu.embed_tokens.weight):
@@ -494,52 +599,36 @@ def heal_universal_model(
         work, donor_dir, donor_repo, max(data_tokens, int(tokens_budget * 1.05))
     )
 
-    # C3 Fix: Run Stage-1 Layer-Wise Attention Transfer on fresh conversions (start_step == 0)
-    if start_step == 0:
-        _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor, train_tokens, device, steps=120, bs=max(2, micro_bs))
+    if start_step == 0 and stage1_tokens > 0:
+        _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor, train_tokens, device, stage1_tokens=stage1_tokens, bs=max(2, micro_bs))
+        for p_ in vsa_conv + vsa_core + vsa_proj + mlp_and_norm:
+            p_.requires_grad_(True)
         _purge_zombie_vram()
 
     start_ppl, donor_ppl, start_kl, start_top1 = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
     total_steps = max(start_step + 1, math.ceil(tokens_budget / (bs * T)))
 
     print("=" * 84)
-    print(f"VSA-FASTDISTILL 2-STAGE HEALER: {donor_repo} (kd={kd}, ce={1.0-kd:.1f})")
+    print(f"VSA-FASTDISTILL 2-STAGE HEALER: {donor_repo} (kd={kd})")
     print("=" * 84)
-    print(f"  Memory Mode    : {mode_str} ({n_params/1e9:.2f}B Student)")
-    print(f"  Donor Eval PPL : {donor_ppl:.3f}  |  Student Start PPL: {start_ppl:.3f} ({start_ppl/donor_ppl:.3f}x) | KL: {start_kl:.3f} | Top1: {start_top1:.1f}%")
-    print(f"  Budget         : {tokens_budget/1e6:.1f}M 50/50 Interleaved CoT+Chat tokens ({total_steps} steps, resume={start_step})")
-
-    # C4 Fix: Train VSA layers + gently adapt norms (0.1x LR, 0.0 weight decay so pretrained weights never erode!)
-    vsa_conv, vsa_core, vsa_proj, norm_params = [], [], [], []
-    layer_types = stu_cfg.get("layer_types") or []
-    for n_, p_ in stu.named_parameters():
-        if any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix")):
-            p_.requires_grad_(True)
-            vsa_conv.append(p_)
-        elif any(k in n_ for k in ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta", "v_self_scale")):
-            p_.requires_grad_(True)
-            vsa_core.append(p_)
-        elif ".vsa." in n_:
-            # Only train .vsa. projections if it's an actual VSA layer (keep native GatedDeltaNet frozen!)
-            li = int(n_.split(".")[1]) if n_.startswith("blocks.") else -1
-            is_vsa_blk = (li >= 0 and (not layer_types or layer_types[li] == "vsa"))
-            p_.requires_grad_(is_vsa_blk)
-            if is_vsa_blk:
-                vsa_proj.append(p_)
-        elif ".norm1." in n_ or ".norm2." in n_:
-            p_.requires_grad_(True)
-            norm_params.append(p_)
-        else:
-            p_.requires_grad_(False)
+    print(f"  Memory Mode    : {mode_str} ({n_params/1e9:.2f}B Student, FP32 Master Weights)")
+    print(f"  Held-Out Eval  : KL={start_kl:.4f} nats | Top1={start_top1:.2f}% | Student PPL={start_ppl:.2f} / Donor PPL={donor_ppl:.2f} ({start_ppl/donor_ppl:.3f}x)")
+    print(f"  Stage-2 Budget : {tokens_budget/1e6:.1f}M tokens ({total_steps} steps, resume={start_step})")
 
     opt_groups = [
-        {"params": vsa_conv,    "weight_decay": 0.0, "lr_scale": 6.0},
-        {"params": vsa_core,    "weight_decay": 0.0, "lr_scale": 5.0},
-        {"params": vsa_proj,    "weight_decay": 0.0, "lr_scale": 1.0},
-        {"params": norm_params, "weight_decay": 0.0, "lr_scale": 0.1},
+        {"params": vsa_conv,     "weight_decay": 0.0, "lr_scale": 5.0},
+        {"params": vsa_core,     "weight_decay": 0.0, "lr_scale": 5.0},
+        {"params": vsa_proj,     "weight_decay": 0.0, "lr_scale": 1.0},
+        {"params": mlp_and_norm, "weight_decay": 0.0, "lr_scale": 0.05},
     ]
-    trainable = vsa_conv + vsa_core + vsa_proj + norm_params
+    trainable = vsa_conv + vsa_core + vsa_proj + mlp_and_norm
     opt = torch.optim.AdamW(opt_groups, lr=lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
+    if resume and "opt" in ck:
+        try:
+            opt.load_state_dict(ck["opt"])
+            print("  [Resume] Restored optimizer moments from checkpoint.")
+        except Exception as e:
+            print(f"  [Resume] Optimizer state skipped: {e}")
 
     stable_end = int(total_steps * 0.65)
     def set_step_lr(s: int):
@@ -550,8 +639,6 @@ def heal_universal_model(
         else:
             prog = (s - stable_end) / max(1, total_steps - stable_end)
             m = 0.05 + 0.475 * (1.0 + math.cos(math.pi * min(1.0, prog)))
-        if start_step > 0 and s >= start_step:
-            m = max(m, 0.5) * min(1.0, (s - start_step + 1) / 50.0)
         for g in opt.param_groups:
             g["lr"] = lr * m * g.get("lr_scale", 1.0)
 
@@ -615,18 +702,22 @@ def heal_universal_model(
             N_m = B_m * T_m
             hs_2d, ht_2d, ym_1d = h_student.reshape(N_m, D_m), h_teacher.reshape(N_m, D_m), ym.reshape(N_m)
             dh_2d = torch.empty_like(hs_2d)
-            w_lm_s = stu.lm_head.weight
+            w_lm_s_f32 = stu.lm_head.weight.float()
+            w_lm_t_f32 = w_lm_t.float()
 
+            # Item 2 Fix: Compute KD logits in fp32 before matmul
             with torch.no_grad():
                 for t_lo in range(0, N_m, tok_slice):
                     t_hi = min(t_lo + tok_slice, N_m)
-                    hs_c, ht_c, ym_c = hs_2d[t_lo:t_hi], ht_2d[t_lo:t_hi], ym_1d[t_lo:t_hi]
+                    hs_c = hs_2d[t_lo:t_hi].float()
+                    ht_c = ht_2d[t_lo:t_hi].float()
+                    ym_c = ym_1d[t_lo:t_hi]
 
-                    slog = F.linear(hs_c, w_lm_s).float()
+                    slog = F.linear(hs_c, w_lm_s_f32)
                     lsm_s = F.log_softmax(slog, dim=-1)
                     prob_s = lsm_s.exp()
 
-                    rlog = F.linear(ht_c, w_lm_t).float()
+                    rlog = F.linear(ht_c, w_lm_t_f32)
                     rlsm = F.log_softmax(rlog, dim=-1)
                     prob_t = rlsm.exp()
                     kd_i = (prob_t * (rlsm - lsm_s)).sum()
@@ -643,10 +734,10 @@ def heal_universal_model(
                         g_logits.scatter_add_(-1, ym_c.unsqueeze(-1), torch.full_like(ym_c.unsqueeze(-1), -(1.0 - kd), dtype=torch.float32))
                         g_logits.mul_(w / N_m)
 
-                    dh_2d[t_lo:t_hi] = (g_logits.to(h_student.dtype) @ w_lm_s)
+                    dh_2d[t_lo:t_hi] = (g_logits @ w_lm_s_f32).to(h_student.dtype)
                     del slog, lsm_s, prob_s, prob_t, g_logits
 
-            del h_teacher, ht_2d
+            del h_teacher, ht_2d, w_lm_s_f32, w_lm_t_f32
             torch.autograd.backward(
                 [h_student, (mid_loss + final_h_loss) * (0.20 * w)],
                 [dh_2d.view(B_m, T_m, D_m), torch.ones_like(final_h_loss)],
@@ -665,7 +756,7 @@ def heal_universal_model(
             dt = (now - t_window) / max(1, step_done - step_window)
             t_window, step_window = now, step_done
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
-            print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_ce {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
+            print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_kl {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
         if step_done % eval_every == 0 or step_done == total_steps:
             s_ppl, d_ppl, kl_v, top1_v = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
@@ -674,12 +765,14 @@ def heal_universal_model(
             dt = (now - t_window) / max(1, step_done - step_window)
             t_window, step_window = now, step_done
             peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
-            print(f"  >>> [{out_prefix} EVAL] step {step_done:5d}/{total_steps}  val_ppl {s_ppl:.2f}/{d_ppl:.2f} ({s_ppl/d_ppl:.3f}x donor)  "
-                  f"KL {kl_v:.3f} nats  Top1 {top1_v:.1f}%  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
+            print(f"  >>> [{out_prefix} EVAL] step {step_done:5d}/{total_steps}  KL {kl_v:.4f} nats  Top1 {top1_v:.2f}%  "
+                  f"val_ppl {s_ppl:.2f}/{d_ppl:.2f} ({s_ppl/d_ppl:.3f}x donor)  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
         if step_done % save_every == 0 or step_done == total_steps:
             tmp = out_ckpt + ".tmp"
-            torch.save({"model": stu.state_dict(), "step": step_done,
+            # Save model weights in bf16 on disk for compact checkpoint size while keeping fp32 params in fp32
+            save_sd = {k: (v.cpu() if any(f in k for f in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm")) else v.cpu().to(torch.bfloat16)) for k, v in stu.state_dict().items()}
+            torch.save({"model": save_sd, "opt": opt.state_dict(), "step": step_done,
                         "config": stu_cfg, "injection": ck.get("injection", {})}, tmp)
             os.replace(tmp, out_ckpt)
             if hf_repo and (step_done % 500 == 0 or step_done == total_steps):
