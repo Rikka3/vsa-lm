@@ -181,9 +181,11 @@ def vsa_chunk_backward_kernel(
 def vsa_recurrent_step_kernel(
     Q_ptr, K_ptr, V_ptr, M_ptr, Out_ptr,
     GAM_ptr, OMG_SCALE_ptr, VSELF_ptr,
+    Q_RELU_ptr, K_RELU_ptr, NORM_W_ptr,
+    HAS_NORM: tl.constexpr,
     H: tl.constexpr, D: tl.constexpr,
 ):
-    """Fused O(1) VSA recurrent decode step in a single SRAM pass."""
+    """Single-launch fused O(1) VSA step: ReLU sharpener + L2-norm + M update + RMSNorm readout."""
     pid = tl.program_id(0)
     h_idx = pid % H
 
@@ -194,6 +196,18 @@ def vsa_recurrent_step_kernel(
     q = tl.load(Q_ptr + vec_off).to(tl.float32)
     k = tl.load(K_ptr + vec_off).to(tl.float32)
     v = tl.load(V_ptr + vec_off).to(tl.float32)
+
+    qr = tl.load(Q_RELU_ptr + h_idx).to(tl.float32)
+    kr = tl.load(K_RELU_ptr + h_idx).to(tl.float32)
+    q = q + qr * tl.maximum(q, 0.0)
+    k = k + kr * tl.maximum(k, 0.0)
+
+    if not HAS_NORM:
+        q_inv = tl.rsqrt(tl.sum(q * q, axis=0) + 1e-12) * (D ** 0.5)
+        k_inv = tl.rsqrt(tl.sum(k * k, axis=0) + 1e-12)
+        q = q * q_inv
+        k = k * k_inv
+
     gam = tl.load(GAM_ptr + h_idx).to(tl.float32)
     omg_s = tl.load(OMG_SCALE_ptr + h_idx).to(tl.float32)
     v_self = tl.load(VSELF_ptr + h_idx).to(tl.float32)
@@ -202,5 +216,9 @@ def vsa_recurrent_step_kernel(
     M_new = gam * M + k[:, None] * v[None, :]
     tl.store(M_ptr + mat_off, M_new.to(M_ptr.dtype.element_ty))
 
-    y = tl.sum(M_new * q[:, None], axis=0) * omg_s + v_self * v
+    y = tl.sum(M_new * q[:, None], axis=0) * omg_s
+    if HAS_NORM:
+        nw = tl.load(NORM_W_ptr + d_idx).to(tl.float32)
+        y = y * tl.rsqrt(tl.sum(y * y, axis=0) / D + 1e-6) * nw
+    y = y + v_self * v
     tl.store(Out_ptr + vec_off, y.to(Out_ptr.dtype.element_ty))
