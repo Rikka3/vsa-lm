@@ -1,13 +1,13 @@
-"""Audit-Clean Benchmark & Systems Suite (`python -m vsa_lm benchmark`).
+"""Fast, Audit-Clean Benchmark & Systems Suite (`python -m vsa_lm benchmark`).
 
-Fixes E1, E2, E3, E4, E5, D1, D2, D3 from Audit:
-  1. MMLU (`cais/mmlu`) — Standard 4-choice A/B/C/D evaluation
-  2. ARC-Challenge (`allenai/ai2_arc`) — Length-normalized continuation log-likelihood
-  3. HellaSwag (`Rowan/hellaswag`) — Length-normalized continuation log-likelihood
-  4. TruthfulQA (`truthfulqa/truthful_qa`) — MC1 log-likelihood
-  5. GSM8K (`openai/gsm8k`) — TRUE generative Chain-of-Thought + exact numerical extraction (no MC distractors!)
-  6. HumanEval-Code (`openai/openai_humaneval`) — TRUE Python code generation + live `exec()` unit-test verification!
-  + Measured End-to-End Decode Speed (tok/s) & Cache RAM Scaling + True `.vsa` Cartridge State Mounting.
+Evaluates VSA-LM and Donor on identical prompts & paths:
+  1. MMLU (`cais/mmlu`)
+  2. ARC-Challenge (`allenai/ai2_arc`)
+  3. HellaSwag (`Rowan/hellaswag`)
+  4. TruthfulQA (`truthfulqa/truthful_qa`)
+  5. GSM8K (`openai/gsm8k`) — Generative CoT + numerical verification
+  6. HumanEval-Code (`openai/openai_humaneval`) — Generative Python + live `exec()` unit-test verification
+  + Decode Speed (tok/s), Cache RAM (2k -> 64k), and `.vsa` Cartridge State Mounting & Unlearning.
 """
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ import torch
 import torch.nn.functional as F
 
 from .converter import UniversalVSALM, fetch_any_donor, _load_donor_teacher, _purge_zombie_vram
-from .decode import VSARecurrentDecoder
 from .functional import fused_vsa_recurrent_step
 from .memory_bank import VSAMemoryBank
 from .server import get_all_eos_ids
@@ -96,41 +95,40 @@ def _score_choices(model, is_hf: bool, tok, prompt: str, choices: list[str],
 
 
 @torch.no_grad()
-def _generate_cached(model, is_hf: bool, tok, prompt: str, device: torch.device, max_new: int = 384) -> str:
-    """E3 + D1 + D3 Fix: Cached greedy generation with identical prompt & stop tokens for Donor and Student."""
+def _generate_fast(model, is_hf: bool, tok, prompt: str, device: torch.device, max_new: int = 128) -> str:
+    """Fast parallel chunked greedy decode (never slides/drops prompt tokens when len < 1024)."""
     ids = tok.encode(prompt, add_special_tokens=False)
     p_len = len(ids)
+    pad_id = tok.eos_token_id or 0
     eos_ids = get_all_eos_ids(tok)
-    x_in = torch.tensor([ids], dtype=torch.long, device=device)
 
-    if not is_hf:
-        dec = VSARecurrentDecoder(model, wrap_positions=False)
-        out = dec.generate(x_in, max_new_tokens=max_new, temperature=0.0, eos_ids=eos_ids)
-        gen_ids = out[0, p_len:].tolist()
-    else:
-        # Donor cached greedy decode
-        with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+    with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+        if is_hf and not hasattr(model, "blocks"):
             inner = getattr(getattr(model, "model", model), "language_model", getattr(model, "model", model))
-            lm_head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") and model.get_output_embeddings() is not None else model.lm_head
-            if hasattr(model, "blocks"):
-                # UniversalVSALM teacher (hybrid_every=1)
-                dec = VSARecurrentDecoder(model, wrap_positions=False)
-                out = dec.generate(x_in, max_new_tokens=max_new, temperature=0.0, eos_ids=eos_ids)
-                gen_ids = out[0, p_len:].tolist()
-            else:
-                gen_ids = []
-                past = None
-                cur = x_in
-                for _ in range(max_new):
-                    out = inner(input_ids=cur, past_key_values=past, use_cache=True)
-                    past = getattr(out, "past_key_values", None)
-                    h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
-                    nxt = int(lm_head(h[:, -1]).argmax(-1).item())
-                    gen_ids.append(nxt)
-                    if nxt in eos_ids:
-                        break
-                    cur = torch.tensor([[nxt]], dtype=torch.long, device=device)
+            lm_head = model.get_output_embeddings()
+            cur = torch.tensor([ids], dtype=torch.long, device=device)
+            past = None
+            for _ in range(max_new):
+                out = inner(input_ids=cur, past_key_values=past, use_cache=True)
+                past = getattr(out, "past_key_values", None)
+                h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+                nxt = int(lm_head(h[:, -1]).argmax(-1).item())
+                ids.append(nxt)
+                if nxt in eos_ids:
+                    break
+                cur = torch.tensor([[nxt]], dtype=torch.long, device=device)
+        else:
+            for _ in range(max_new):
+                L = len(ids)
+                pad = (-L) % 32
+                x = torch.tensor([ids + ([pad_id] * pad if pad else [])], dtype=torch.long, device=device)
+                logits = model.lm_head(model(x)[0, L - 1])
+                nxt = int(logits.argmax(-1).item())
+                ids.append(nxt)
+                if nxt in eos_ids:
+                    break
 
+    gen_ids = ids[p_len:]
     if eos_ids and gen_ids and gen_ids[-1] in eos_ids:
         gen_ids = gen_ids[:-1]
     return tok.decode(gen_ids, skip_special_tokens=True)
@@ -170,7 +168,7 @@ def _exec_humaneval_safely(code_str: str, timeout_s: int = 3) -> bool:
 
 
 @torch.no_grad()
-def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 100, gsm8k_limit: int = 40) -> dict:
+def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 100, gsm8k_limit: int = 25) -> dict:
     out = {}
 
     # 1. MMLU (cais/mmlu)
@@ -212,17 +210,19 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 100,
         ok += int(_score_choices(model, is_hf, tok, f"Question: {r['question'].strip()}\nAnswer:", ch, device) == gold)
     out["TruthfulQA"] = {"acc": (ok / len(rows)) * 100.0, "correct": ok, "total": len(rows)}
 
-    # 5. GSM8K Generative CoT (E1 Fix: True generation + numerical verification, zero answer leakage!)
+    # 5. GSM8K Generative CoT (closes <think> so R1 models output concise CoT + \boxed{} within 160 tokens)
     rows = _load_rows("openai/gsm8k", "main", "test", gsm8k_limit)
     ok, tot = 0, 0
     for r in rows:
         gold_str = r["answer"].split("####")[-1].strip().replace(",", "")
-        q_text = f"Solve this math problem step by step and write the final numerical answer inside \\boxed{{}}:\n{r['question'].strip()}"
+        q_text = f"Solve this math problem concisely and put the final numerical answer in \\boxed{{}}:\n{r['question'].strip()}"
         try:
             prompt = tok.apply_chat_template([{"role": "user", "content": q_text}], tokenize=False, add_generation_prompt=True)
+            if "<think>" in prompt and "</think>" not in prompt:
+                prompt = prompt.rstrip() + "\n</think>\n\n"
         except Exception:
             prompt = f"Question: {q_text}\nAnswer:\n"
-        gen = _generate_cached(model, is_hf, tok, prompt, device, max_new=384)
+        gen = _generate_fast(model, is_hf, tok, prompt, device, max_new=160)
         pred_str = _extract_gsm8k_number(gen)
         hit = False
         if pred_str is not None:
@@ -234,19 +234,18 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 100,
         tot += 1
     out["GSM8K"] = {"acc": (ok / max(1, tot)) * 100.0, "correct": ok, "total": tot}
 
-    # 6. HumanEval-Code Live Execution (E1 Fix: True Python completion + official check(candidate) execution!)
-    rows = _load_rows("openai/openai_humaneval", None, "test", min(gsm8k_limit, 40))
+    # 6. HumanEval-Code Live Execution
+    rows = _load_rows("openai/openai_humaneval", None, "test", min(gsm8k_limit, 25))
     ok, tot = 0, 0
     for r in rows:
         prompt_code = r["prompt"]
         test_code = r["test"]
         entry_point = r["entry_point"]
-        gen = _generate_cached(model, is_hf, tok, prompt_code, device, max_new=192)
+        gen = _generate_fast(model, is_hf, tok, prompt_code, device, max_new=128)
         if "```python" in gen:
             gen = gen.split("```python")[1].split("```")[0]
         elif "```" in gen:
             gen = gen.split("```")[0]
-        # Stop at next top-level def/class/if __name__
         clean_lines = []
         for line in gen.splitlines():
             if line.startswith(("def ", "class ", "if __name__", "# Test")) and clean_lines:
@@ -420,7 +419,7 @@ def run_benchmark_suite(
     donor_id: str | None = None,
     compare_donor: bool = True,
     limit: int = 100,
-    gsm8k_limit: int = 40,
+    gsm8k_limit: int = 25,
     out_json: str | None = None,
 ) -> dict:
     _purge_zombie_vram()
