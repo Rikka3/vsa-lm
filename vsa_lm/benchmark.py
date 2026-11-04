@@ -321,7 +321,7 @@ def eval_real_speed_and_ram(stu, donor, is_hf_donor: bool, cfg: dict, tok, devic
     plus fp32/fp64 algebraic unlearning residual.
     """
     gen_steps = 32
-    ctx_lengths = (512, 2048, 4096)
+    ctx_lengths = (2048, 8192, 16384, 32768)
     scaling = []
 
     dec_stu = VSARecurrentDecoder(stu, wrap_positions=False)
