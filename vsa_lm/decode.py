@@ -18,7 +18,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 def _apply_cached_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    return x * cos + torch.cat((-x2, x1), dim=-1) * sin
 
 
 class VSARecurrentDecoder:
