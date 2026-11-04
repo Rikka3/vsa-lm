@@ -87,6 +87,8 @@ class UniversalVSAAttn(nn.Module):
         HD = cfg.get("vsa_head_dim") or cfg.get("head_dim") or (D // H)
         while HD > 128 and H * 2 <= 64:
             H, HKV, HD = H * 2, HKV * 2, HD // 2
+        if HD & (HD - 1) != 0:
+            raise ValueError(f"VSA head_dim must be a power of two for Triton kernel, got {HD}")
 
         qkv_bias = bool(cfg.get("vsa_qkv_bias", cfg.get("qkv_bias", False)))
         self.H, self.HKV, self.HD, self.G = H, HKV, HD, H // HKV
@@ -95,18 +97,19 @@ class UniversalVSAAttn(nn.Module):
         self.v_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
         self.o_proj = nn.Linear(H * HD, D, bias=False)
         self.rope = LlamaRoPE(HD, cfg["rope_theta"], cfg.get("rope_scaling"))
-        self.pos_code = nn.Parameter(torch.ones(max_T, HD))
+        self.out_norm = LlamaRMSNorm(HD, cfg["eps"])
+
         self.log_gamma = nn.Parameter(torch.zeros(H))
         with torch.no_grad():
-            horizons = torch.logspace(math.log10(4.0), math.log10(2000.0), H)
-            self.log_gamma.copy_(torch.logit((1.0 - 1.0 / horizons).clamp(0.5, 0.9995) / 0.9999))
+            max_h = float(max(64, max_T))
+            horizons = torch.logspace(math.log10(4.0), math.log10(max_h), H)
+            self.log_gamma.copy_(torch.logit((1.0 - 1.0 / horizons).clamp(0.5, 0.999) / 0.9999))
         self.chunk_size = chunk_size
 
         if cfg.get("vsa_untie_gqa", True):
             eye = torch.eye(HD).unsqueeze(0).repeat(H, 1, 1)
             self.k_head_mix = nn.Parameter(eye.clone())
             self.v_head_mix = nn.Parameter(eye.clone())
-            self.head_pos_delta = nn.Parameter(torch.zeros(H, max_T, HD))
             self.g_proj = nn.Linear(D, H * HD, bias=False)
             nn.init.zeros_(self.g_proj.weight)
             self.v_self_scale = nn.Parameter(torch.zeros(H))
@@ -134,21 +137,10 @@ class UniversalVSAAttn(nn.Module):
         B, T, _ = x.shape
         q, k, v = self.head_qkv(x)
         q, k = self.rope(q), self.rope(k)
-
-        T_use = min(T, self.pos_code.shape[0])
-        pc = self.pos_code[:T_use].view(1, 1, T_use, self.HD).to(k.dtype)
-        if T > T_use:
-            pc = torch.cat([pc, torch.ones(1, 1, T - T_use, self.HD, device=k.device, dtype=k.dtype)], dim=2)
-        kc = k * pc
-        kx, vx = repeat_kv(kc, self.G), repeat_kv(v, self.G)
+        kx, vx = repeat_kv(k, self.G), repeat_kv(v, self.G)
 
         if hasattr(self, "k_head_mix"):
             kx = torch.einsum("bhtd,hde->bhte", kx, self.k_head_mix.to(kx.dtype))
-            T_d = min(T, self.head_pos_delta.shape[1])
-            delta = (1.0 + 0.5 * torch.tanh(self.head_pos_delta[:, :T_d, :])).unsqueeze(0).to(kx.dtype)
-            if T > T_d:
-                delta = torch.cat([delta, torch.ones(1, self.H, T - T_d, self.HD, device=kx.device, dtype=kx.dtype)], dim=2)
-            kx = kx * delta
             vx = torch.einsum("bhtd,hde->bhte", vx, self.v_head_mix.to(vx.dtype))
 
         if hasattr(self, "k_conv"):
@@ -157,11 +149,11 @@ class UniversalVSAAttn(nn.Module):
             kx = kx + k_loc
             q = q + self.q_relu_mix.to(q.dtype) * F.relu(q)
             kx = kx + self.k_relu_mix.to(kx.dtype) * F.relu(kx)
-            q = F.normalize(q.float(), p=2.0, dim=-1).to(x.dtype) * (self.HD ** 0.5)
-        kx = F.normalize(kx.float(), p=2.0, dim=-1).to(x.dtype)
 
         gam = self.gamma()
         y = _vsa_apply(q, kx, vx, gam, self.chunk_size)
+        y = self.out_norm(y)
+
         if hasattr(self, "v_self_scale"):
             y = y + self.v_self_scale.view(1, self.H, 1, 1).to(y.dtype) * vx
         if hasattr(self, "v_conv"):
