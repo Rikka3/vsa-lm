@@ -111,14 +111,19 @@ class VSAMemoryBank:
         traces = [[(p, k.to(self.device), v.to(self.device)) for (p, k, v) in tr] for tr in cart["traces"]]
         doc_next_pos = int(cart["next_pos"])
 
+        # Item 41: Measure exact state erasure error: ||forget(M_doc) - M_before||_max
+        states_to_erase = [s.clone() if s is not None else None for s in states]
+        erased_states = self.decoder.forget(traces, states_to_erase, next_pos=doc_next_pos)
+        max_erase_err = max(
+            float(es.abs().max().item())
+            for es in erased_states
+            if es is not None
+        )
+
+        # Item 40: Answer from the mounted state with NO document text in the prompt!
         q_prompt = f"Question: {question.strip()}\nAnswer:"
         q_ids = torch.tensor([self.tokenizer.encode(q_prompt, add_special_tokens=False)], dtype=torch.long, device=self.device)
         eos_ids = get_all_eos_ids(self.tokenizer)
-
-        # Also build reference state M_without_doc (encoding only q_ids from blank state) to measure P9 relative erase error!
-        ref_states, ref_kv = VSARecurrentDecoder.blank_state(self.model, 1, self.device, max_kv_len=128)
-        for t in range(q_ids.shape[1]):
-            _, ref_states, ref_kv = self.decoder.step(q_ids[:, t : t + 1], doc_next_pos + t, ref_states, ref_kv)
 
         gen_toks, _, _, _ = self.decoder.continue_generate(
             q_ids, states, kv_caches, start_pos=doc_next_pos,
@@ -126,25 +131,10 @@ class VSAMemoryBank:
         )
         answer = self.tokenizer.decode(gen_toks[0].tolist(), skip_special_tokens=True).strip().splitlines()[0].strip()
 
-        st_both = [s.to(self.device, dtype=torch.float32) if s is not None else None for s in cart["vsa_states"]]
-        kv_both = [
-            ({k: torch.zeros_like(v, device=self.device) for k, v in item.items()} if isinstance(item, dict) else StaticKV(1, 2, 256, 128, self.device))
-            for item in cart["kv_caches"]
-        ]
-        for t in range(q_ids.shape[1]):
-            _, st_both, kv_both = self.decoder.step(q_ids[:, t : t + 1], doc_next_pos + t, st_both, kv_both)
-        after_q_pos = doc_next_pos + q_ids.shape[1]
-        erased_states = self.decoder.forget(traces, st_both, next_pos=after_q_pos)
-        max_rel_err = max(
-            float((es - rs).norm() / rs.norm().clamp_min(1e-12))
-            for es, rs in zip(erased_states, ref_states)
-            if es is not None and rs is not None
-        )
-
         return dict(
             cartridge=best_name,
             score=score,
             route_ms=route_ms,
             answer=answer,
-            erase_residual=max_rel_err,
+            erase_residual=max_erase_err,
         )
