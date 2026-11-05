@@ -135,7 +135,7 @@ class VSARecurrentDecoder:
                 v = blk.vsa
                 vsa_bytes += v.H * v.HD * v.HD * 4
                 if getattr(v, "swa_window", 0) > 0:
-                    vsa_bytes += 2 * (v.swa_window + 1) * v.HKV * v.HD * 2
+                    vsa_bytes += 2 * (2 * v.swa_window) * v.HKV * v.HD * 2
             else:
                 s = blk.attn if hasattr(blk, "attn") else blk.softmax_attn
                 hk = getattr(s, "HKV", s.H)
@@ -156,7 +156,7 @@ class VSARecurrentDecoder:
                     cache["v_buf"] = torch.zeros(batch_size, v.H, 1, v.HD, 7, device=device, dtype=dt)
                 if getattr(v, "swa_window", 0) > 0:
                     W = v.swa_window
-                    cache["swa_k"] = torch.zeros(batch_size, v.HKV, W + 1, v.HD, device=device, dtype=dt)
+                    cache["swa_k"] = torch.zeros(batch_size, v.HKV, 2 * W, v.HD, device=device, dtype=dt)
                     cache["swa_v"] = torch.zeros_like(cache["swa_k"])
                     cache["swa_n"] = 0
                 kv_caches[li] = cache or None
@@ -196,23 +196,24 @@ class VSARecurrentDecoder:
 
     @staticmethod
     def _window_attn_step(cache: dict, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, W: int, G: int) -> torch.Tensor:
-        """Zero-copy 65-token sliding-window + sink attention (slot 0 = sink, slots 1..W = ring buffer)."""
+        """Keeps first W prompt tokens (question sink) in slots 0..W-1, and slides ring buffer in slots W..2W-1."""
         n = cache["swa_n"]
-        slot = 0 if n == 0 else (1 + ((n - 1) % W))
+        if n < W:
+            slot = n
+        else:
+            slot = W + ((n - W) % W)
         cache["swa_k"][:, :, slot : slot + 1].copy_(k)
         cache["swa_v"][:, :, slot : slot + 1].copy_(v)
         n += 1
         cache["swa_n"] = n
-        m = min(n, W + 1)
+        m = min(n, 2 * W)
         pk = cache["swa_k"][:, :, :m]
         pv = cache["swa_v"][:, :, :m]
-        # For m <= 65, direct GQA broadcast matmul is 2.5x faster than SDPA dispatcher overhead!
         B, HKV, _, HD = pk.shape
         qg = q.to(pk.dtype).view(B, HKV, G, 1, HD)
         scores = torch.matmul(qg, pk.unsqueeze(2).transpose(-1, -2)) * (HD ** -0.5)
         probs = F.softmax(scores.float(), dim=-1).to(pv.dtype)
-        out = torch.matmul(probs, pv.unsqueeze(2)).view(B, HKV * G, 1, HD)
-        return out
+        return torch.matmul(probs, pv.unsqueeze(2)).view(B, HKV * G, 1, HD)
 
     def _step_universal_block(self, li: int, blk, x: torch.Tensor, pos: int, states, kv_caches, record=None, write_scale: float = 1.0):
         B = x.shape[0]
@@ -246,7 +247,7 @@ class VSARecurrentDecoder:
 
             y_swa = None
             if getattr(ly, "swa_window", 0) > 0:
-                if v_raw is None:  # packed path holds head-mixed V; the window branch needs the donor's raw V
+                if v_raw is None:
                     v_raw = ly.v_proj(h).view(B, 1, HKV, HD).transpose(1, 2)
                 y_swa = self._window_attn_step(kv_caches[li], q, k, v_raw, ly.swa_window, G)
 
@@ -268,7 +269,6 @@ class VSARecurrentDecoder:
                 kv_caches[li]["v_buf"] = v_in[..., -7:]
                 v_loc = (v_in * ly._v_conv_w).sum(dim=-1)
 
-            # Single-launch Fused Triton O(1) Step (includes ReLU + L2-norm + M update + out_norm + v_self + local_q_gate*v_loc!)
             y = fused_vsa_recurrent_step(
                 q.contiguous(), kx.contiguous(), vx.contiguous(),
                 states[li], ly._cached_gam, ly._cached_omg, ly._cached_vself,
