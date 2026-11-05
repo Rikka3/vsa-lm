@@ -74,7 +74,7 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
     del ck
 
     fp32_keys = ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate",
-                 "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "out_norm")
+                 "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "out_norm", "swa_mix")
     for n, p in stu.named_parameters():
         if any(k in n for k in fp32_keys):
             p.data = p.data.to(device, dtype=torch.float32)
@@ -339,6 +339,8 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
                 kv_s[li].n = T_c
                 kv_s[li].k[:, :, :T_c].normal_(0, 0.02)
                 kv_s[li].v[:, :, :T_c].normal_(0, 0.02)
+            elif isinstance(kv_s[li], dict) and "swa_n" in kv_s[li]:
+                kv_s[li]["swa_n"] = T_c  # window full + sink, as at real context T_c
         vsa_state_mb = (torch.cuda.memory_allocated() - base_mem_stu) / (1024 ** 2)
 
         dec_stu.step(nxt_tok, T_c, states_s, kv_s)
