@@ -1,4 +1,4 @@
-"""O(1)-state recurrent decoder with StaticKV, enable_gqa=True SDPA, and parallel state-emitting prefill."""
+"""O(1)-state recurrent decoder with StaticKV, enable_gqa=True SDPA, and fully fused Triton step."""
 from __future__ import annotations
 
 import torch
@@ -22,8 +22,6 @@ def _apply_cached_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) ->
 
 
 class StaticKV:
-    """Preallocated KV cache eliminating per-token torch.cat allocations."""
-
     def __init__(self, B: int, HKV: int, Tmax: int, HD: int, dev, dt=torch.bfloat16):
         self.k = torch.empty(B, HKV, Tmax, HD, device=dev, dtype=dt)
         self.v = torch.empty_like(self.k)
@@ -81,6 +79,7 @@ class VSARecurrentDecoder:
                 ly._cached_qr = ly.q_relu_mix.detach().float().view(-1) if hasattr(ly, "q_relu_mix") else torch.zeros_like(gam)
                 ly._cached_kr = ly.k_relu_mix.detach().float().view(-1) if hasattr(ly, "k_relu_mix") else torch.zeros_like(gam)
                 ly._cached_nw = ly.out_norm.weight.detach().float() if hasattr(ly, "out_norm") else None
+                ly._cached_lqg = ly.local_q_gate.detach().float().contiguous() if hasattr(ly, "local_q_gate") else None
 
                 if hasattr(ly, "v_head_mix") and hasattr(ly, "v_proj"):
                     wv = ly.v_proj.weight.detach().to(torch.float32).view(HKV, HD, -1)
@@ -89,14 +88,24 @@ class VSARecurrentDecoder:
                     wv_fused = torch.bmm(vm_T, wv_rep).reshape(H * HD, -1).to(dt)
                     wq = ly.q_proj.weight.detach().to(dt)
                     wk = ly.k_proj.weight.detach().to(dt)
-                    ly._wqkv_packed = torch.cat([wq, wk, wv_fused], dim=0).contiguous()
+                    g_act = bool(hasattr(ly, "g_proj") and ly.g_proj.weight.abs().max().item() > 1e-4)
+                    ly._g_active = g_act
+                    if g_act:
+                        wg = ly.g_proj.weight.detach().to(dt)
+                        ly._wqkv_packed = torch.cat([wq, wk, wv_fused, wg], dim=0).contiguous()
+                    else:
+                        ly._wqkv_packed = torch.cat([wq, wk, wv_fused], dim=0).contiguous()
 
                     if ly.q_proj.bias is not None:
                         bq = ly.q_proj.bias.detach().to(dt)
                         bk = ly.k_proj.bias.detach().to(dt)
                         bv = ly.v_proj.bias.detach().to(torch.float32).view(HKV, 1, HD).expand(HKV, G, HD).reshape(H, 1, HD)
                         bv_fused = torch.bmm(bv, ly.v_head_mix.detach().to(torch.float32)).reshape(H * HD).to(dt)
-                        ly._bqkv_packed = torch.cat([bq, bk, bv_fused], dim=0).contiguous()
+                        if g_act:
+                            bg = torch.zeros(H * HD, device=device, dtype=dt)
+                            ly._bqkv_packed = torch.cat([bq, bk, bv_fused, bg], dim=0).contiguous()
+                        else:
+                            ly._bqkv_packed = torch.cat([bq, bk, bv_fused], dim=0).contiguous()
                     else:
                         ly._bqkv_packed = None
                     ly._km_dt = ly.k_head_mix.detach().to(dt).contiguous()
@@ -106,7 +115,6 @@ class VSARecurrentDecoder:
                     ly._v_conv_w = ly.v_conv.weight.detach().to(dt).view(1, H, 1, HD, 8)
                     ly._k_conv_active = bool(ly.k_conv.weight.abs().max().item() > 1e-4)
                     ly._v_conv_active = bool(ly.v_conv.weight.abs().max().item() > 1e-4)
-                    ly._g_active = bool(hasattr(ly, "g_proj") and ly.g_proj.weight.abs().max().item() > 1e-4)
             else:
                 if hasattr(ly, "q_proj") and not getattr(ly, "packed_q_gate", False):
                     wq = ly.q_proj.weight.detach().to(dt)
@@ -132,13 +140,13 @@ class VSARecurrentDecoder:
         return vsa_bytes, kv_per_token
 
     @staticmethod
-    def blank_state(model, batch_size: int, device, max_kv_len: int = 4096):
+    def blank_state(model, batch_size: int, device, max_kv_len: int = 4096, state_dtype=torch.float32):
         states, kv_caches = [None] * len(model.blocks), [None] * len(model.blocks)
         dt = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
         for li, blk in enumerate(model.blocks):
             if hasattr(blk, "vsa"):
                 v = blk.vsa
-                states[li] = torch.zeros(batch_size, v.H, v.HD, v.HD, device=device, dtype=torch.float32)
+                states[li] = torch.zeros(batch_size, v.H, v.HD, v.HD, device=device, dtype=state_dtype)
                 if hasattr(v, "k_conv") and hasattr(v, "v_conv"):
                     kv_caches[li] = {
                         "k_buf": torch.zeros(batch_size, v.H, 1, v.HD, 3, device=device, dtype=dt),
@@ -184,9 +192,13 @@ class VSARecurrentDecoder:
         if hasattr(blk, "vsa"):
             ly = blk.vsa
             H, HKV, HD, G = ly.H, ly.HKV, ly.HD, ly.G
+            g_proj_out = None
             if hasattr(ly, "_wqkv_packed"):
                 qkv = F.linear(h, ly._wqkv_packed, ly._bqkv_packed)
-                q, k, vx = torch.split(qkv, [H * HD, HKV * HD, H * HD], dim=-1)
+                if getattr(ly, "_g_active", False):
+                    q, k, vx, g_proj_out = torch.split(qkv, [H * HD, HKV * HD, H * HD, H * HD], dim=-1)
+                else:
+                    q, k, vx = torch.split(qkv, [H * HD, HKV * HD, H * HD], dim=-1)
                 q = q.view(B, 1, H, HD).transpose(1, 2)
                 k = k.view(B, 1, HKV, HD).transpose(1, 2)
                 vx = vx.view(B, 1, H, HD).transpose(1, 2)
@@ -214,21 +226,22 @@ class VSARecurrentDecoder:
             if record is not None:
                 record[li].append((pos, kx.detach().clone(), vx.detach().clone()))
 
-            y = fused_vsa_recurrent_step(
-                q.contiguous(), kx.contiguous(), vx.contiguous(),
-                states[li], ly._cached_gam, ly._cached_omg, ly._cached_vself,
-                q_relu=ly._cached_qr, k_relu=ly._cached_kr, norm_w=ly._cached_nw,
-            )
-
+            v_loc = None
             if hasattr(ly, "v_conv") and isinstance(kv_caches[li], dict) and getattr(ly, "_v_conv_active", False):
                 v_in = torch.cat([kv_caches[li]["v_buf"], vx.unsqueeze(-1)], dim=-1)
                 kv_caches[li]["v_buf"] = v_in[..., -7:]
                 v_loc = (v_in * ly._v_conv_w).sum(dim=-1)
-                q_mod = torch.sigmoid((q * ly.local_q_gate.view(1, H, 1, HD).to(q.dtype)).sum(-1, keepdim=True))
-                y = y + (2.0 * q_mod) * v_loc
 
-            if getattr(ly, "_g_active", False):
-                y = y * (2.0 * torch.sigmoid(ly.g_proj(h).view(B, 1, H, HD).transpose(1, 2)))
+            # Single-launch Fused Triton O(1) Step (includes ReLU + L2-norm + M update + out_norm + v_self + local_q_gate*v_loc!)
+            y = fused_vsa_recurrent_step(
+                q.contiguous(), kx.contiguous(), vx.contiguous(),
+                states[li], ly._cached_gam, ly._cached_omg, ly._cached_vself,
+                q_relu=ly._cached_qr, k_relu=ly._cached_kr, norm_w=ly._cached_nw,
+                v_loc=v_loc, local_q_gate=ly._cached_lqg,
+            )
+
+            if g_proj_out is not None:
+                y = y * (2.0 * torch.sigmoid(g_proj_out.view(B, 1, H, HD).transpose(1, 2)))
             x = x + ly.o_proj(y.transpose(1, 2).reshape(B, 1, H * HD))
         else:
             ly = blk.attn
@@ -261,7 +274,6 @@ class VSARecurrentDecoder:
                 gate = None
                 q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
 
-            # P5 Fix: StaticKV + enable_gqa=True (zero torch.cat copy, zero 6x repeat_kv expansion!)
             cache_obj = kv_caches[li]
             if isinstance(cache_obj, StaticKV):
                 pk, pv = cache_obj.append(k, v)
