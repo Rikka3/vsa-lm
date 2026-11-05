@@ -156,10 +156,8 @@ class VSARecurrentDecoder:
                     cache["v_buf"] = torch.zeros(batch_size, v.H, 1, v.HD, 7, device=device, dtype=dt)
                 if getattr(v, "swa_window", 0) > 0:
                     W = v.swa_window
-                    cache["swa_k"] = torch.zeros(batch_size, v.HKV, W, v.HD, device=device, dtype=dt)
+                    cache["swa_k"] = torch.zeros(batch_size, v.HKV, W + 1, v.HD, device=device, dtype=dt)
                     cache["swa_v"] = torch.zeros_like(cache["swa_k"])
-                    cache["swa_k0"] = torch.zeros(batch_size, v.HKV, 1, v.HD, device=device, dtype=dt)
-                    cache["swa_v0"] = torch.zeros_like(cache["swa_k0"])
                     cache["swa_n"] = 0
                 kv_caches[li] = cache or None
             else:
