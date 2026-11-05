@@ -50,7 +50,7 @@ class VSAMemoryBank:
             elif isinstance(item, tuple):
                 cpu_kv.append((item[0].cpu(), item[1].cpu()))
             elif isinstance(item, dict):
-                cpu_kv.append({k: v.cpu() for k, v in item.items()})
+                cpu_kv.append({k: (v.cpu() if torch.is_tensor(v) else v) for k, v in item.items()})
             else:
                 cpu_kv.append(None)
         cpu_traces = [[(p, k.cpu(), v.cpu()) for (p, k, v) in tr] for tr in traces]
