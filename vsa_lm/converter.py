@@ -63,6 +63,7 @@ def convert_donor_model(
     gamma_cap: float = 0.9995,
     hf_token: str | None = None,
     visual_sidecar_out: str | None = None,
+    swa_window: int = 64,
 ) -> str:
     t0 = time.perf_counter()
     donor_dir = fetch_any_donor(donor_id_or_dir, hf_token=hf_token)
@@ -72,6 +73,7 @@ def convert_donor_model(
 
     hf_sd = load_all_safetensors(donor_dir)
     cfg = inspect_donor_config(donor_dir, hf_sd, max_T=max_T, chunk_size=chunk_size, hybrid_every=hybrid_every)
+    cfg["vsa_swa_window"] = int(swa_window)
     if n_vis > 0:
         cfg["visual_sidecar_path"] = vis_path
         cfg["visual_tensors_count"] = n_vis
@@ -89,6 +91,7 @@ def convert_donor_model(
     if n_vis > 0:
         print(f"  Vision Tower        : Preserved {n_vis} tensors ({vis_mb:.1f} MB) -> {vis_path}")
     print(f"  Target layout       : {n_vsa} VSA + {n_soft} Softmax + {n_gdn} Native GatedDeltaNet layers")
+    print(f"  VSA sliding window  : {swa_window} tokens + sink (0 = off)")
 
     stu = UniversalVSALM(**cfg)
     sd = map_any_hf_to_student(hf_sd, cfg, hybrid_every)
@@ -118,6 +121,8 @@ def convert_donor_model(
         sd[f"{p}.local_q_gate"] = torch.zeros(H, HD, dtype=torch.float32)
         sd[f"{p}.q_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
         sd[f"{p}.k_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
+        if swa_window > 0:
+            sd[f"{p}.swa_mix_logit"] = torch.full((H,), 2.0, dtype=torch.float32)
 
     stu.load_state_dict(sd, strict=True)
     n_params = sum(p.numel() for p in stu.parameters())
@@ -480,6 +485,7 @@ def heal_universal_model(
     hf_repo: str | None = None,
     highspeed: bool = False,
     resume: bool = False,
+    swa_window: int | None = None,
 ):
     _purge_zombie_vram()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -489,6 +495,11 @@ def heal_universal_model(
 
     ck = torch.load(active_ckpt, map_location="cpu", weights_only=False)
     stu_cfg = dict(ck["config"])
+    # Sliding-window branch: explicit value wins; checkpoints converted before it existed get the default 64.
+    if swa_window is not None:
+        stu_cfg["vsa_swa_window"] = int(swa_window)
+    else:
+        stu_cfg.setdefault("vsa_swa_window", 64)
     start_step = int(ck.get("step", 0)) if resume else 0
     donor_repo = donor_id or (ck.get("injection") or {}).get("donor")
     if not donor_repo:
@@ -497,7 +508,7 @@ def heal_universal_model(
     stu = UniversalVSALM(**stu_cfg)
     state_in = {k: v for k, v in ck["model"].items() if "pos_code" not in k and "head_pos_delta" not in k}
     missing, unexpected = stu.load_state_dict(state_in, strict=False)
-    allowed_missing = {"rope_mix", "v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm"}
+    allowed_missing = {"rope_mix", "v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix"}
     real_missing = [m for m in missing if not any(a in m for a in allowed_missing)]
     if real_missing or unexpected:
         raise RuntimeError(f"Checkpoint mismatch! Missing: {real_missing[:10]}, Unexpected: {unexpected[:10]}")
@@ -510,7 +521,7 @@ def heal_universal_model(
         if any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix")):
             p_.requires_grad_(True)
             vsa_conv.append(p_)
-        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm")):
+        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm", "swa_mix")):
             p_.requires_grad_(True)
             vsa_core.append(p_)
         elif ".vsa." in n_ and is_vsa_blk:
@@ -732,7 +743,7 @@ def heal_universal_model(
 
         if step_done % save_every == 0 or step_done == total_steps:
             tmp = out_ckpt + ".tmp"
-            save_sd = {k: (v.cpu().float() if any(f in k for f in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm")) else v.cpu().to(torch.bfloat16)) for k, v in stu.state_dict().items()}
+            save_sd = {k: (v.cpu().float() if any(f in k for f in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix")) else v.cpu().to(torch.bfloat16)) for k, v in stu.state_dict().items()}
             torch.save({"model": save_sd, "step": step_done,
                         "config": stu_cfg, "injection": ck.get("injection", {})}, tmp)
             os.replace(tmp, out_ckpt)
