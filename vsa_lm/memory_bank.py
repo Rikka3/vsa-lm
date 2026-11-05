@@ -105,13 +105,12 @@ class VSAMemoryBank:
                 skv.append(k_t, v_t)
                 kv_caches.append(skv)
             elif isinstance(item, dict):
-                kv_caches.append({k: v.to(self.device) for k, v in item.items()})
+                kv_caches.append({k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in item.items()})
             else:
                 kv_caches.append(None)
         traces = [[(p, k.to(self.device), v.to(self.device)) for (p, k, v) in tr] for tr in cart["traces"]]
         doc_next_pos = int(cart["next_pos"])
 
-        # Item 41: Measure exact state erasure error: ||forget(M_doc) - M_before||_max
         states_to_erase = [s.clone() if s is not None else None for s in states]
         erased_states = self.decoder.forget(traces, states_to_erase, next_pos=doc_next_pos)
         max_erase_err = max(
@@ -120,7 +119,6 @@ class VSAMemoryBank:
             if es is not None
         )
 
-        # Item 40: Answer from the mounted state with NO document text in the prompt!
         q_prompt = f"Question: {question.strip()}\nAnswer:"
         q_ids = torch.tensor([self.tokenizer.encode(q_prompt, add_special_tokens=False)], dtype=torch.long, device=self.device)
         eos_ids = get_all_eos_ids(self.tokenizer)
