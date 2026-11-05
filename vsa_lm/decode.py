@@ -80,6 +80,7 @@ class VSARecurrentDecoder:
                 ly._cached_kr = ly.k_relu_mix.detach().float().view(-1) if hasattr(ly, "k_relu_mix") else torch.zeros_like(gam)
                 ly._cached_nw = ly.out_norm.weight.detach().float() if hasattr(ly, "out_norm") else None
                 ly._cached_lqg = ly.local_q_gate.detach().float().contiguous() if hasattr(ly, "local_q_gate") else None
+                ly._cached_swa_a = torch.sigmoid(ly.swa_mix_logit.detach().float()) if getattr(ly, "swa_window", 0) > 0 else None
 
                 if hasattr(ly, "v_head_mix") and hasattr(ly, "v_proj"):
                     wv = ly.v_proj.weight.detach().to(torch.float32).view(HKV, HD, -1)
@@ -133,6 +134,8 @@ class VSARecurrentDecoder:
             if hasattr(blk, "vsa"):
                 v = blk.vsa
                 vsa_bytes += v.H * v.HD * v.HD * 4
+                if getattr(v, "swa_window", 0) > 0:
+                    vsa_bytes += 2 * (v.swa_window + 1) * v.HKV * v.HD * 2
             else:
                 s = blk.attn if hasattr(blk, "attn") else blk.softmax_attn
                 hk = getattr(s, "HKV", s.H)
@@ -147,11 +150,18 @@ class VSARecurrentDecoder:
             if hasattr(blk, "vsa"):
                 v = blk.vsa
                 states[li] = torch.zeros(batch_size, v.H, v.HD, v.HD, device=device, dtype=state_dtype)
+                cache = {}
                 if hasattr(v, "k_conv") and hasattr(v, "v_conv"):
-                    kv_caches[li] = {
-                        "k_buf": torch.zeros(batch_size, v.H, 1, v.HD, 3, device=device, dtype=dt),
-                        "v_buf": torch.zeros(batch_size, v.H, 1, v.HD, 7, device=device, dtype=dt),
-                    }
+                    cache["k_buf"] = torch.zeros(batch_size, v.H, 1, v.HD, 3, device=device, dtype=dt)
+                    cache["v_buf"] = torch.zeros(batch_size, v.H, 1, v.HD, 7, device=device, dtype=dt)
+                if getattr(v, "swa_window", 0) > 0:
+                    W = v.swa_window
+                    cache["swa_k"] = torch.zeros(batch_size, v.HKV, W, v.HD, device=device, dtype=dt)
+                    cache["swa_v"] = torch.zeros_like(cache["swa_k"])
+                    cache["swa_k0"] = torch.zeros(batch_size, v.HKV, 1, v.HD, device=device, dtype=dt)
+                    cache["swa_v0"] = torch.zeros_like(cache["swa_k0"])
+                    cache["swa_n"] = 0
+                kv_caches[li] = cache or None
             else:
                 s = blk.attn if hasattr(blk, "attn") else blk.softmax_attn
                 hk = getattr(s, "HKV", s.H)
@@ -186,6 +196,29 @@ class VSARecurrentDecoder:
         topv, topi = torch.topk(logits.float() / temperature, min(top_k, logits.size(-1)), dim=-1)
         return topi.gather(-1, torch.multinomial(F.softmax(topv, -1), 1))
 
+    @staticmethod
+    def _window_attn_step(cache: dict, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, W: int, G: int) -> torch.Tensor:
+        """One-token sliding-window + sink softmax; matches UniversalVSAAttn.window_attn. k/v: (B,HKV,1,HD)."""
+        n = cache["swa_n"]
+        if n == 0:
+            cache["swa_k0"].copy_(k)
+            cache["swa_v0"].copy_(v)
+        slot = n % W
+        cache["swa_k"][:, :, slot : slot + 1].copy_(k)
+        cache["swa_v"][:, :, slot : slot + 1].copy_(v)
+        n += 1
+        cache["swa_n"] = n
+        m = min(n, W)
+        pk, pv = cache["swa_k"][:, :, :m], cache["swa_v"][:, :, :m]
+        if n > W:  # token 0 has left the window; keep it as the attention sink
+            pk = torch.cat([cache["swa_k0"], pk], dim=2)
+            pv = torch.cat([cache["swa_v0"], pv], dim=2)
+        q = q.to(pk.dtype)
+        try:
+            return F.scaled_dot_product_attention(q, pk, pv, enable_gqa=(G > 1))
+        except TypeError:
+            return F.scaled_dot_product_attention(q, repeat_kv(pk, G), repeat_kv(pv, G))
+
     def _step_universal_block(self, li: int, blk, x: torch.Tensor, pos: int, states, kv_caches, record=None, write_scale: float = 1.0):
         B = x.shape[0]
         h = blk.norm1(x)
@@ -193,6 +226,7 @@ class VSARecurrentDecoder:
             ly = blk.vsa
             H, HKV, HD, G = ly.H, ly.HKV, ly.HD, ly.G
             g_proj_out = None
+            v_raw = None
             if hasattr(ly, "_wqkv_packed"):
                 qkv = F.linear(h, ly._wqkv_packed, ly._bqkv_packed)
                 if getattr(ly, "_g_active", False):
@@ -205,6 +239,7 @@ class VSARecurrentDecoder:
             else:
                 q, k, v = ly.head_qkv(h)
                 vx = repeat_kv(v, G)
+                v_raw = v
 
             if hasattr(ly, "_rope_cos") and pos < ly._rope_cos.shape[0]:
                 cos = ly._rope_cos[pos].view(1, 1, 1, HD)
@@ -213,6 +248,12 @@ class VSARecurrentDecoder:
                 k = _apply_cached_rope(k, cos, sin)
             else:
                 q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
+
+            y_swa = None
+            if getattr(ly, "swa_window", 0) > 0:
+                if v_raw is None:  # packed path holds head-mixed V; the window branch needs the donor's raw V
+                    v_raw = ly.v_proj(h).view(B, 1, HKV, HD).transpose(1, 2)
+                y_swa = self._window_attn_step(kv_caches[li], q, k, v_raw, ly.swa_window, G)
 
             kx = repeat_kv(k, G)
             if hasattr(ly, "_km_dt"):
@@ -239,6 +280,10 @@ class VSARecurrentDecoder:
                 q_relu=ly._cached_qr, k_relu=ly._cached_kr, norm_w=ly._cached_nw,
                 v_loc=v_loc, local_q_gate=ly._cached_lqg,
             )
+
+            if y_swa is not None:
+                a = ly._cached_swa_a.view(1, H, 1, 1).to(y.dtype)
+                y = y + a * (y_swa.to(y.dtype) - y)
 
             if g_proj_out is not None:
                 y = y * (2.0 * torch.sigmoid(g_proj_out.view(B, 1, H, HD).transpose(1, 2)))
