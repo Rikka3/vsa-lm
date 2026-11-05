@@ -118,6 +118,13 @@ class UniversalVSAAttn(nn.Module):
             nn.init.zeros_(self.g_proj.weight)
             self.v_self_scale = nn.Parameter(torch.zeros(H))
 
+        # Sliding-window softmax branch: exact donor attention over the last `swa_window` tokens
+        # plus the first token (attention sink), reusing the donor's q/k/v. Mixed per head into the
+        # VSA output via sigmoid(swa_mix_logit); init 2.0 -> 88% window attention at start.
+        self.swa_window = int(cfg.get("vsa_swa_window", 0) or 0)
+        if self.swa_window > 0:
+            self.swa_mix_logit = nn.Parameter(torch.full((H,), 2.0))
+
         if cfg.get("vsa_local_conv", True):
             self.v_conv = nn.Conv1d(H * HD, H * HD, kernel_size=8, padding=7, groups=H * HD, bias=False)
             nn.init.zeros_(self.v_conv.weight)
@@ -137,10 +144,20 @@ class UniversalVSAAttn(nn.Module):
     def gamma(self) -> torch.Tensor:
         return (0.9999 * torch.sigmoid(self.log_gamma)).clamp(1e-4, 0.9999).float()
 
+    def window_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Causal softmax over keys j with i-j < swa_window, plus key 0 (sink). q: (B,H,T,HD), k/v: (B,HKV,T,HD)."""
+        T = q.shape[2]
+        pos = torch.arange(T, device=q.device)
+        dist = pos[:, None] - pos[None, :]
+        mask = (dist >= 0) & ((dist < self.swa_window) | (pos[None, :] == 0))
+        # Expand KV heads explicitly: enable_gqa + attn_mask can fall back to the O(T^2)-memory math kernel.
+        return F.scaled_dot_product_attention(q, repeat_kv(k, self.G), repeat_kv(v, self.G), attn_mask=mask)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
         q, k, v = self.head_qkv(x)
         q, k = self.rope(q), self.rope(k)
+        y_swa = self.window_attn(q, k, v) if self.swa_window > 0 else None
         kx, vx = repeat_kv(k, self.G), repeat_kv(v, self.G)
 
         if hasattr(self, "k_head_mix"):
@@ -168,6 +185,9 @@ class UniversalVSAAttn(nn.Module):
             v_loc = self.v_conv(vx_flat)[..., :T].view(B, self.H, self.HD, T).permute(0, 1, 3, 2)
             q_mod = torch.sigmoid((q * self.local_q_gate.view(1, self.H, 1, self.HD).to(q.dtype)).sum(-1, keepdim=True))
             y = y + (2.0 * q_mod) * v_loc
+        if y_swa is not None:
+            a = torch.sigmoid(self.swa_mix_logit.float()).view(1, self.H, 1, 1).to(y.dtype)
+            y = y + a * (y_swa.to(y.dtype) - y)
         if hasattr(self, "g_proj"):
             y = y * (2.0 * torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2)))
         return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD))
