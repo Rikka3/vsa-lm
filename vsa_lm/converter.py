@@ -389,8 +389,15 @@ def _eval_reasoning_metrics(stu, donor, is_hf_donor: bool, eval_tokens: torch.Te
     return math.exp(nll_s / max(1, cnt)), math.exp(nll_d / max(1, cnt)), kl_sum / max(1, cnt), (top1_ok / max(1, cnt)) * 100.0
 
 
+def _attn_transfer_loss(a_hat: torch.Tensor, a_tgt: torch.Tensor) -> torch.Tensor:
+    a_hat, a_tgt = a_hat.float(), a_tgt.float()
+    rel_mse = F.mse_loss(a_hat, a_tgt) / a_tgt.pow(2).mean().clamp_min(1e-5)
+    return rel_mse + (1.0 - F.cosine_similarity(a_hat, a_tgt, dim=-1).mean())
+
+
 def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_tokens: torch.Tensor,
-                                         device: torch.device, stage1_tokens: int = 16_000_000, bs: int = 4):
+                                         device: torch.device, stage1_tokens: int = 16_000_000, bs: int = 4,
+                                         on_policy: bool = False):
     """P3 Step 1 Fix: True Per-Layer Attention-Output Transfer!
     Feeds the exact same normed input `h_norm = donor.blocks[li].norm1(x)` into both `donor.blocks[li].attn`
     and `stu.blocks[li].vsa` and minimizes normalized MSE + Cosine distance on the attention output itself!
@@ -404,6 +411,12 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
     vsa_indices = [li for li in range(L) if layer_types[li] == "vsa" or (not layer_types and hasattr(stu.blocks[li], "vsa"))]
     if not vsa_indices:
         return
+    vsa_set = set(vsa_indices)
+    # On-policy needs the teacher's attention modules callable on arbitrary inputs (native replica donor only).
+    # The first quarter stays teacher-forced so early VSA layers are roughly fitted before their outputs drive later ones.
+    if on_policy and is_hf_donor:
+        print("  [Stage-1] on-policy mode needs a native donor replica; HF donor -> teacher-forced only.", flush=True)
+    on_policy_from = steps // 4 if (on_policy and not is_hf_donor) else None
 
     for p in stu.parameters():
         p.requires_grad_(False)
@@ -427,41 +440,66 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
         x = train_tokens[idx[:, None] * T + ar[None, :]].long().to(device)
         opt.zero_grad(set_to_none=True)
 
-        # Capture normed inputs and exact attention outputs from the teacher
-        norm_inputs, attn_targets = {}, {}
-        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-            if not is_hf_donor:
-                xt = donor.embed_tokens(x)
-                for li, blk in enumerate(donor.blocks):
-                    h_n = blk.norm1(xt)
-                    a_out = blk.attn(h_n) if hasattr(blk, "attn") else blk.vsa(h_n)
-                    if li in vsa_indices:
-                        norm_inputs[li] = h_n.detach()
-                        attn_targets[li] = a_out.detach()
-                    xt = xt + a_out
-                    xt = xt + blk.mlp(blk.norm2(xt))
-            else:
-                inner = getattr(getattr(donor, "model", donor), "language_model", getattr(donor, "model", donor))
-                out = inner(input_ids=x, output_hidden_states=True, use_cache=False)
-                for li in vsa_indices:
-                    if li < L - 1:
-                        norm_inputs[li] = stu.blocks[li].norm1(out.hidden_states[li].detach())
-                        attn_targets[li] = (out.hidden_states[li + 1] - out.hidden_states[li]).detach()
-                del out
-
+        if on_policy_from is not None and s == on_policy_from:
+            print(f"    [Stage-1] step {s+1}: switching to on-policy inputs (student's own hidden states)", flush=True)
         total_loss = torch.zeros((), device=device, dtype=torch.float32)
-        with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-            for li, h_n in norm_inputs.items():
-                a_tgt = attn_targets[li].float()
-                a_hat = stu.blocks[li].vsa(h_n).float()
-                rel_mse = F.mse_loss(a_hat, a_tgt) / a_tgt.pow(2).mean().clamp_min(1e-5)
-                cos_d = 1.0 - F.cosine_similarity(a_hat, a_tgt, dim=-1).mean()
-                total_loss = total_loss + (rel_mse + cos_d) / max(1, len(norm_inputs))
+
+        if on_policy_from is not None and s >= on_policy_from:
+            # On-policy: walk the STUDENT's residual stream. At each VSA layer the target is the teacher's
+            # attention applied to the student's own normed input, so the layer learns to imitate the teacher
+            # on the drifted inputs it will actually see, instead of on teacher inputs it never sees after
+            # the earlier VSA layers have made small errors. The stream itself carries no gradient.
+            with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+                with torch.no_grad():
+                    xs = stu.embed_tokens(x)
+                for li, blk in enumerate(stu.blocks):
+                    with torch.no_grad():
+                        h_n = blk.norm1(xs)
+                    if li in vsa_set:
+                        with torch.no_grad():
+                            a_tgt = donor.blocks[li].attn(h_n)
+                        a_hat = blk.vsa(h_n)
+                        total_loss = total_loss + _attn_transfer_loss(a_hat, a_tgt) / len(vsa_indices)
+                        a_out = a_hat.detach()
+                    else:
+                        with torch.no_grad():
+                            a_out = blk.attn(h_n)
+                    with torch.no_grad():
+                        xs = xs + a_out
+                        xs = xs + blk.mlp(blk.norm2(xs))
+            del xs
+        else:
+            # Teacher-forced: capture normed inputs and exact attention outputs from the teacher's stream.
+            norm_inputs, attn_targets = {}, {}
+            with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+                if not is_hf_donor:
+                    xt = donor.embed_tokens(x)
+                    for li, blk in enumerate(donor.blocks):
+                        h_n = blk.norm1(xt)
+                        a_out = blk.attn(h_n) if hasattr(blk, "attn") else blk.vsa(h_n)
+                        if li in vsa_set:
+                            norm_inputs[li] = h_n.detach()
+                            attn_targets[li] = a_out.detach()
+                        xt = xt + a_out
+                        xt = xt + blk.mlp(blk.norm2(xt))
+                else:
+                    inner = getattr(getattr(donor, "model", donor), "language_model", getattr(donor, "model", donor))
+                    out = inner(input_ids=x, output_hidden_states=True, use_cache=False)
+                    for li in vsa_indices:
+                        if li < L - 1:
+                            norm_inputs[li] = stu.blocks[li].norm1(out.hidden_states[li].detach())
+                            attn_targets[li] = (out.hidden_states[li + 1] - out.hidden_states[li]).detach()
+                    del out
+
+            with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+                for li, h_n in norm_inputs.items():
+                    a_hat = stu.blocks[li].vsa(h_n)
+                    total_loss = total_loss + _attn_transfer_loss(a_hat, attn_targets[li]) / max(1, len(norm_inputs))
+            del norm_inputs, attn_targets
 
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(vsa_params, 1.0)
         opt.step()
-        del norm_inputs, attn_targets
         if (s + 1) in (1, max(1, steps // 4), max(1, steps // 2), steps):
             print(f"    [Stage-1] step {s+1:4d}/{steps} | attn_rel_mse+cos = {float(total_loss.item()):.4f} ({time.perf_counter()-t0:.1f}s)", flush=True)
 
@@ -487,6 +525,7 @@ def heal_universal_model(
     resume: bool = False,
     swa_window: int | None = None,
     freeze_mlp: bool = False,
+    stage1_onpolicy: bool = False,
 ):
     _purge_zombie_vram()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -579,7 +618,7 @@ def heal_universal_model(
     )
 
     if start_step == 0 and stage1_tokens > 0:
-        _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor, train_tokens, device, stage1_tokens=stage1_tokens, bs=max(2, micro_bs))
+        _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor, train_tokens, device, stage1_tokens=stage1_tokens, bs=max(2, micro_bs), on_policy=stage1_onpolicy)
         for p_ in vsa_conv + vsa_core + vsa_proj + mlp_and_norm:
             p_.data = p_.data.to(device, dtype=torch.float32)
             p_.requires_grad_(True)
