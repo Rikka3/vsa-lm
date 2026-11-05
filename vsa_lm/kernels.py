@@ -179,13 +179,13 @@ def vsa_chunk_backward_kernel(
 
 @triton.jit
 def vsa_recurrent_step_kernel(
-    Q_ptr, K_ptr, V_ptr, M_ptr, Out_ptr,
+    Q_ptr, K_ptr, V_ptr, VLOC_ptr, M_ptr, Out_ptr,
     GAM_ptr, OMG_SCALE_ptr, VSELF_ptr,
-    Q_RELU_ptr, K_RELU_ptr, NORM_W_ptr,
-    HAS_NORM: tl.constexpr,
+    Q_RELU_ptr, K_RELU_ptr, NORM_W_ptr, LQG_ptr,
+    HAS_NORM: tl.constexpr, HAS_VLOC: tl.constexpr,
     H: tl.constexpr, D: tl.constexpr,
 ):
-    """Single-launch fused O(1) VSA step: ReLU sharpener + L2-norm + M update + RMSNorm readout."""
+    """Fused O(1) VSA step: ReLU + L2-norm + M update + RMSNorm + v_self + local_q_gate*v_loc."""
     pid = tl.program_id(0)
     h_idx = pid % H
 
@@ -220,4 +220,11 @@ def vsa_recurrent_step_kernel(
         nw = tl.load(NORM_W_ptr + d_idx).to(tl.float32)
         y = y * tl.rsqrt(tl.sum(y * y, axis=0) / D + 1e-6) * nw
     y = y + v_self * v
+
+    if HAS_VLOC:
+        v_loc = tl.load(VLOC_ptr + vec_off).to(tl.float32)
+        lqg = tl.load(LQG_ptr + h_idx * D + d_idx).to(tl.float32)
+        q_mod = tl.sigmoid(tl.sum(q * lqg, axis=0))
+        y = y + (2.0 * q_mod) * v_loc
+
     tl.store(Out_ptr + vec_off, y.to(Out_ptr.dtype.element_ty))
