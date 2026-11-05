@@ -43,6 +43,9 @@ def _run_fast_heal(heal_args: list[str]):
         p.add_argument("--seed", type=int, default=7777)
         p.add_argument("--hf-repo", default=None, help="Optional HF repo for periodic checkpoint backups")
         p.add_argument("--highspeed", action="store_true", help="Disable activation checkpointing and use micro_bs=8 on 45GB+ GPUs")
+        p.add_argument("--resume", action="store_true", help="Resume from <work>/<out-prefix>_latest.pth (+ optimizer sidecar); skips Stage-1")
+        p.add_argument("--stage1-tokens", type=int, default=16_000_000, help="Stage-1 per-layer attention-transfer tokens (0 = skip)")
+        p.add_argument("--swa-window", type=int, default=None, help="VSA sliding-window softmax size (default: checkpoint value, else 64; 0 = off)")
         args, _ = p.parse_known_args(heal_args)
         from .converter import heal_universal_model
         heal_universal_model(
@@ -61,6 +64,9 @@ def _run_fast_heal(heal_args: list[str]):
             seed=args.seed,
             hf_repo=args.hf_repo,
             highspeed=args.highspeed,
+            resume=args.resume,
+            stage1_tokens=args.stage1_tokens,
+            swa_window=args.swa_window,
         )
         return
 
@@ -106,6 +112,7 @@ def main(argv: list[str] | None = None):
     p_conv.add_argument("--max-T", type=int, default=1024, help="Training sequence length (default: 1024)")
     p_conv.add_argument("--gamma-cap", type=float, default=0.992, help="Max initial decay horizon (default: 0.992)")
     p_conv.add_argument("--hf-token", default=None, help="Optional HuggingFace token for gated models")
+    p_conv.add_argument("--swa-window", type=int, default=64, help="Sliding-window softmax tokens inside each VSA layer (0 = off)")
 
     sub.add_parser("heal", help="Run memory-optimal anchored healing on any converted VSA checkpoint")
 
@@ -141,6 +148,7 @@ def main(argv: list[str] | None = None):
         convert_donor_model(
             args.donor, args.out, hybrid_every=args.hybrid_every,
             max_T=args.max_T, gamma_cap=args.gamma_cap, hf_token=args.hf_token,
+            swa_window=args.swa_window,
         )
     elif args.cmd == "train":
         from .train import main as train_main
