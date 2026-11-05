@@ -202,11 +202,10 @@ def vsa_recurrent_step_kernel(
     q = q + qr * tl.maximum(q, 0.0)
     k = k + kr * tl.maximum(k, 0.0)
 
-    if not HAS_NORM:
-        q_inv = tl.rsqrt(tl.sum(q * q, axis=0) + 1e-12) * (D ** 0.5)
-        k_inv = tl.rsqrt(tl.sum(k * k, axis=0) + 1e-12)
-        q = q * q_inv
-        k = k * k_inv
+    q_inv = tl.rsqrt(tl.sum(q * q, axis=0) + 1e-12) * (D ** 0.5)
+    k_inv = tl.rsqrt(tl.sum(k * k, axis=0) + 1e-12)
+    q = q * q_inv
+    k = k * k_inv
 
     gam = tl.load(GAM_ptr + h_idx).to(tl.float32)
     omg_s = tl.load(OMG_SCALE_ptr + h_idx).to(tl.float32)
