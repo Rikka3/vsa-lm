@@ -46,6 +46,7 @@ def _run_fast_heal(heal_args: list[str]):
         p.add_argument("--resume", action="store_true", help="Resume from <work>/<out-prefix>_latest.pth (+ optimizer sidecar); skips Stage-1")
         p.add_argument("--stage1-tokens", type=int, default=16_000_000, help="Stage-1 per-layer attention-transfer tokens (0 = skip)")
         p.add_argument("--swa-window", type=int, default=None, help="VSA sliding-window softmax size (default: checkpoint value, else 64; 0 = off)")
+        p.add_argument("--stage1-onpolicy", action="store_true", help="Stage-1: after the first 25%% of steps, train each VSA layer on the student's own hidden states (teacher attention as target)")
         p.add_argument("--freeze-mlp", action="store_true", help="Train only the VSA attention params in Stage-2 (MLPs/norms stay the teacher's); faster, less VRAM")
         args, _ = p.parse_known_args(heal_args)
         from .converter import heal_universal_model
@@ -69,6 +70,7 @@ def _run_fast_heal(heal_args: list[str]):
             stage1_tokens=args.stage1_tokens,
             swa_window=args.swa_window,
             freeze_mlp=args.freeze_mlp,
+            stage1_onpolicy=args.stage1_onpolicy,
         )
         return
 
