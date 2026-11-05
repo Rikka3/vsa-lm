@@ -486,9 +486,14 @@ def heal_universal_model(
     highspeed: bool = False,
     resume: bool = False,
     swa_window: int | None = None,
+    freeze_mlp: bool = False,
 ):
     _purge_zombie_vram()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # The KD head runs three [tokens x 1536 x 151936] matmuls per step in fp32; without TF32 they cost
+    # roughly as much as the whole bf16 body. train.py already enables this; healing never did.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     out_ckpt = os.path.join(work, f"{out_prefix}_latest.pth")
     opt_ckpt = os.path.join(work, f"{out_prefix}_optim.pth")
     active_ckpt = out_ckpt if (resume and os.path.isfile(out_ckpt)) else ckpt_path
@@ -527,7 +532,7 @@ def heal_universal_model(
         elif ".vsa." in n_ and is_vsa_blk:
             p_.requires_grad_(True)
             vsa_proj.append(p_)
-        elif is_vsa_blk and (".mlp." in n_ or ".norm1." in n_ or ".norm2." in n_):
+        elif is_vsa_blk and not freeze_mlp and (".mlp." in n_ or ".norm1." in n_ or ".norm2." in n_):
             p_.requires_grad_(True)
             mlp_and_norm.append(p_)
         else:
@@ -542,7 +547,8 @@ def heal_universal_model(
     T = int(stu_cfg["max_T"])
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
 
-    if highspeed and vram_gb >= 45.0 and n_params < 3_000_000_000:
+    # Frozen MLPs drop ~14 GB of fp32 master weights + Adam moments, so no-checkpoint mode fits on smaller GPUs.
+    if highspeed and vram_gb >= (32.0 if freeze_mlp else 45.0) and n_params < 3_000_000_000:
         micro_bs = 4 if T <= 1024 else 2
         use_ckpt = False
         mode_str = f"HIGHSPEED (use_ckpt=False, micro_bs={micro_bs}, T={T})"
@@ -595,7 +601,9 @@ def heal_universal_model(
         {"params": vsa_proj,     "weight_decay": 0.0, "lr_scale": 1.0},
         {"params": mlp_and_norm, "weight_decay": 0.0, "lr_scale": 0.08},
     ]
+    opt_groups = [g for g in opt_groups if g["params"]]
     trainable = vsa_conv + vsa_core + vsa_proj + mlp_and_norm
+    print(f"  Trainable      : {sum(p.numel() for p in trainable)/1e6:.1f}M params (MLPs {'frozen' if freeze_mlp else 'trained @0.08x lr'})")
     opt = torch.optim.AdamW(opt_groups, lr=lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
     if resume and os.path.isfile(opt_ckpt):
         try:
