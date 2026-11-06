@@ -1070,4 +1070,5 @@ def onpolicy_distill(
         if drift["n"] and drift["capped_n"] / drift["n"] > stop_capped_frac:
             print(f"  [Stage-3] stopping: {drift['capped']} probe chains hit the cap (> {stop_capped_frac:.0%}). "
                   f"Benchmark an earlier {out_prefix}_r*.pth.", flush=True)
-            break
+            return {"stopped_early": True}
+    return {"stopped_early": False}
