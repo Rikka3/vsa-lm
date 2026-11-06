@@ -50,22 +50,34 @@ def _bucketize(per_seq: list[torch.Tensor], edges=DRIFT_EDGES) -> list[dict]:
 
 
 @torch.no_grad()
-def score_continuation(s_fn, t_fn, seq: torch.Tensor, prompt_len: int, device) -> tuple[torch.Tensor, torch.Tensor]:
-    """seq: (1, P+n) token ids. Returns per-generated-token KL(teacher||student) and teacher NLL, both (n,)."""
+def score_continuation(s_fn, t_fn, seq: torch.Tensor, prompt_len: int, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """seq: (1, P+n) token ids. Returns per-generated-token KL(teacher||student), teacher NLL, and whether
+    student and teacher pick the same top-1 token, all (n,)."""
     L = seq.shape[1]
     seq_p = pad_to_multiple(seq, 32)  # VSA chunk kernel needs T % 32 == 0; right-padding is causal-safe
     with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
         ls = s_fn(seq_p)[0, prompt_len - 1 : L - 1]
         lt = t_fn(seq_p)[0, prompt_len - 1 : L - 1]
     tgt = seq[0, prompt_len:]
-    kl, nll = [], []
+    kl, nll, agree = [], [], []
     for lo in range(0, tgt.numel(), 512):
         a = F.log_softmax(lt[lo : lo + 512].float(), dim=-1)
         b = F.log_softmax(ls[lo : lo + 512].float(), dim=-1)
         kl.append((a.exp() * (a - b)).sum(-1))
         nll.append(-a.gather(-1, tgt[lo : lo + 512, None])[:, 0])
+        agree.append((a.argmax(-1) == b.argmax(-1)).float())
     del ls, lt
-    return torch.cat(kl).cpu(), torch.cat(nll).cpu()
+    return torch.cat(kl).cpu(), torch.cat(nll).cpu(), torch.cat(agree).cpu()
+
+
+def _token_classes(tok, prompt_ids: list[int], gen_ids: list[int]) -> list[str]:
+    """Label each generated token: 'number (from question)' = a digit token that also occurs in the prompt
+    (must be recalled from far back), 'number (new)' = other digit tokens (computed results), 'text'."""
+    def has_digit(t):
+        return any(ch.isdigit() for ch in tok.decode([t]))
+    prompt_digits = {t for t in prompt_ids if has_digit(t)}
+    return [("number (from question)" if t in prompt_digits else "number (new)") if has_digit(t) else "text"
+            for t in gen_ids]
 
 
 @torch.no_grad()
@@ -82,7 +94,7 @@ def student_drift(stu, s_fn, t_fn, tok, device, prompts: list[str], max_new: int
         toks, n = dec.generate_batch(x, max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids)
         n = int(n[0])
         lens.append(n)
-        kl, nll = score_continuation(s_fn, t_fn, torch.cat([x, toks[:, :n]], dim=1), x.shape[1], device)
+        kl, nll, _ = score_continuation(s_fn, t_fn, torch.cat([x, toks[:, :n]], dim=1), x.shape[1], device)
         kls.append(kl)
         nlls.append(nll)
     return {"kl": _bucketize(kls), "teacher_nll": _bucketize(nlls),
@@ -97,17 +109,26 @@ def teacher_forced_drift(teacher, s_fn, t_fn, tok, device, prompts: list[str], m
     """HF teacher generates; the student reads the teacher's reasoning. KL by position = long-range fidelity."""
     eos_ids = list(get_all_eos_ids(tok))
     kls, nlls, lens = [], [], []
+    by_cls: dict[str, list[float]] = {}  # class -> [kl_sum, agree_sum, count]
     for i, p in enumerate(prompts):
         torch.manual_seed(seed + i)
         x = torch.tensor([tok.encode(p, add_special_tokens=False)], dtype=torch.long, device=device)
         out = teacher.generate(x, max_new_tokens=max_new, do_sample=True, temperature=temperature, top_p=top_p,
                                eos_token_id=eos_ids, pad_token_id=tok.eos_token_id or 0)
         lens.append(out.shape[1] - x.shape[1])
-        kl, nll = score_continuation(s_fn, t_fn, out, x.shape[1], device)
+        kl, nll, agree = score_continuation(s_fn, t_fn, out, x.shape[1], device)
         kls.append(kl)
         nlls.append(nll)
+        classes = _token_classes(tok, x[0].tolist(), out[0, x.shape[1]:].tolist())
+        for c, k_v, a_v in zip(classes, kl.tolist(), agree.tolist()):
+            s = by_cls.setdefault(c, [0.0, 0.0, 0])
+            s[0] += k_v
+            s[1] += a_v
+            s[2] += 1
     return {"kl": _bucketize(kls), "teacher_nll": _bucketize(nlls),
-            "median_len": int(statistics.median(lens)) if lens else 0}
+            "median_len": int(statistics.median(lens)) if lens else 0,
+            "by_token_class": {c: {"kl": round(s[0] / s[2], 4), "top1_agree_pct": round(100.0 * s[1] / s[2], 2), "n": s[2]}
+                               for c, s in sorted(by_cls.items())}}
 
 
 def _parity_tokens(tok, device, T: int) -> torch.Tensor:
@@ -210,7 +231,8 @@ def _print_rows(title: str, rows: list[dict], key: str = "mean"):
 
 
 def run_diagnostics(ckpt_path: str, donor_id: str | None = None, n_prompts: int = 16, max_new: int = 2048,
-                    parity_T: int = 3072, out_json: str | None = None, parity_only: bool = False) -> dict:
+                    parity_T: int = 3072, out_json: str | None = None, parity_only: bool = False,
+                    skip_parity: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     stu, cfg, tok, donor_id, donor_dir, step, _ = _load_student(ckpt_path, donor_id, device)
     res = {"checkpoint": ckpt_path, "step": step}
@@ -218,18 +240,19 @@ def run_diagnostics(ckpt_path: str, donor_id: str | None = None, n_prompts: int 
     print("=" * 84)
     print(f"VSA DIAGNOSTICS: {ckpt_path} (step {step})")
     print("=" * 84)
-    res["decode_parity"] = decode_parity(stu, tok, device, T=parity_T)
-    print("  [1] Decode parity (recurrent step vs parallel forward; pass = >=99% top-1 in every bucket)")
-    for r in res["decode_parity"]:
-        flag = "ok" if r["top1_agree_pct"] >= 99.0 else "MISMATCH"
-        graph = f"  graph top1 {r['graph_top1_agree_pct']:6.2f}%" if "graph_top1_agree_pct" in r else "  graph n/a"
-        print(f"    pos {r['pos']:>10}  top1 {r['top1_agree_pct']:6.2f}%  max|dlogit| {r['max_abs_logit_diff']:.3f}{graph}  {flag}")
+    if not skip_parity:
+        res["decode_parity"] = decode_parity(stu, tok, device, T=parity_T)
+        print("  [1] Decode parity (recurrent step vs parallel forward; pass = >=99% top-1 in every bucket)")
+        for r in res["decode_parity"]:
+            flag = "ok" if r["top1_agree_pct"] >= 99.0 else "MISMATCH"
+            graph = f"  graph top1 {r['graph_top1_agree_pct']:6.2f}%" if "graph_top1_agree_pct" in r else "  graph n/a"
+            print(f"    pos {r['pos']:>10}  top1 {r['top1_agree_pct']:6.2f}%  max|dlogit| {r['max_abs_logit_diff']:.3f}{graph}  {flag}")
 
-    res["layer_parity"] = layer_parity(stu, tok, device, T=min(parity_T, 2048))
-    print("  [1b] Per-layer parity: relative error of each block's output, same inputs, no compounding")
-    for r in res["layer_parity"]:
-        cols = "  ".join(f"{k}:{v:.4f}" for k, v in r.items() if k not in ("layer", "type"))
-        print(f"    L{r['layer']:02d} {r['type']:>7}  {cols}")
+        res["layer_parity"] = layer_parity(stu, tok, device, T=min(parity_T, 2048))
+        print("  [1b] Per-layer parity: relative error of each block's output, same inputs, no compounding")
+        for r in res["layer_parity"]:
+            cols = "  ".join(f"{k}:{v:.4f}" for k, v in r.items() if k not in ("layer", "type"))
+            print(f"    L{r['layer']:02d} {r['type']:>7}  {cols}")
 
     if parity_only:
         if out_json:
@@ -246,6 +269,9 @@ def run_diagnostics(ckpt_path: str, donor_id: str | None = None, n_prompts: int 
 
     print(f"  [2] Teacher-forced: student reads the teacher's reasoning (median len {res['teacher_forced']['median_len']})")
     _print_rows("KL(teacher||student) by position", res["teacher_forced"]["kl"])
+    print("  [2b] Teacher-forced by token type (numbers from the question must be recalled from far back)")
+    for c, v in res["teacher_forced"]["by_token_class"].items():
+        print(f"    {c:>24}  KL {v['kl']:.4f}  top1 agree {v['top1_agree_pct']:6.2f}%  (n={v['n']})")
     print(f"  [3] Free-run: student reads its own reasoning (median len {res['free_run']['median_len']}, capped {res['free_run']['capped']})")
     _print_rows("KL(teacher||student) by position", res["free_run"]["kl"])
     _print_rows("teacher NLL of the student's tokens by position", res["free_run"]["teacher_nll"])
