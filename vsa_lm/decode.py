@@ -133,7 +133,9 @@ class VSARecurrentDecoder:
         if not self.use_cuda_graph or device.type != "cuda":
             return None
         Tmax = -(-need_len // 1024) * 1024
-        if Tmax > self.max_cache_pos:
+        # Masked SDPA over a fixed buffer does not split the KV length across blocks, so past ~8k keys it is
+        # slower than eager flash (split-KV) decoding: 30.7 vs 55.7 tok/s at 65k. Long contexts stay eager.
+        if Tmax > min(self.max_cache_pos, 8192):
             return None
         key = (B, Tmax)
         runner = self._graphs.pop(key, None)
