@@ -583,6 +583,7 @@ def run_benchmark_suite(
         mc = results["mcnemar"].get(k, {"stu_only": 0, "don_only": 0, "p": 1.0})
         verdict = f"{sv['acc'] - dv.get('acc', 0.0):+.2f}% (sig)" if mc["p"] < 0.05 else "No detectable diff (p >= 0.05)"
         print(f"| **{k}** | `{dv.get('acc', 0.0):.2f}%` | **`{sv['acc']:.2f}%`** | `stu={mc['stu_only']}, don={mc['don_only']}` (`p={mc['p']:.3f}`) | {verdict} |")
-    print(f"| **Decode Speed @{sc_last['context']}** | `{sc_last['donor_tok_s']} tok/s` | **`{sc_last['vsa_tok_s']} tok/s`** | — | **`{sc_last['speedup']}x Faster`** |")
+    speed_word = "faster" if sc_last["speedup"] >= 1.0 else "speed (slower)"
+    print(f"| **Decode Speed @{sc_last['context']}** | `{sc_last['donor_tok_s']} tok/s` | **`{sc_last['vsa_tok_s']} tok/s`** | — | **`{sc_last['speedup']}x {speed_word}`** |")
     print(f"| **State RAM @{sc_last['context']}** | `{sc_last['donor_kv_mb']} MB` | **`{sc_last['vsa_kv_mb']} MB`** | — | **`-{sc_last['ram_saved_pct']}% RAM`** |")
     return results
