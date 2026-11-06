@@ -185,6 +185,15 @@ def _exec_subprocess_safely(code_str: str, timeout_s: int = 4) -> bool:
 
 
 @torch.no_grad()
+def gsm8k_prompt(tok, question: str) -> str:
+    """The exact GSM8K generation prompt the benchmark scores (shared by diagnose and on-policy KD)."""
+    msgs = [{"role": "user", "content": f"Solve this math problem step by step and put the final numerical answer inside \\boxed{{}}:\n{question.strip()}"}]
+    try:
+        return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        return f"Question: {question.strip()}\nSolution:\n"
+
+
 def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 285, gen_limit: int = 60) -> dict:
     out = {}
     eos_ids = get_all_eos_ids(tok)
@@ -235,11 +244,7 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 285,
     hits, lengths, trunc_cnt = [], [], 0
     for idx_q, r in enumerate(rows):
         gold = r["answer"].split("####")[-1].strip().replace(",", "")
-        msgs = [{"role": "user", "content": f"Solve this math problem step by step and put the final numerical answer inside \\boxed{{}}:\n{r['question'].strip()}"}]
-        try:
-            p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            p_str = f"Question: {r['question'].strip()}\nSolution:\n"
+        p_str = gsm8k_prompt(tok, r["question"])
         gen, n_new, hit_cap = _gen(p_str, max_new=2048, temperature=0.6, top_p=0.95, seed=1000 + idx_q)
         lengths.append(n_new)
         trunc_cnt += int(hit_cap)

@@ -443,6 +443,34 @@ class VSARecurrentDecoder:
         return out
 
     @torch.no_grad()
+    def generate_batch(self, ids: torch.Tensor, max_new_tokens: int, temperature: float = 0.6, top_k: int = 40,
+                       top_p: float = 0.95, eos_ids: set[int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample B continuations of B prompts that all have the same length (so `pos` and the window
+        counter stay shared scalars). Returns (tokens [B, n], lengths [B]); lengths count generated tokens
+        up to and including each row's first EOS, or max_new_tokens if it never stopped. Tokens after a
+        row's EOS are filler and must be dropped by the caller."""
+        B, T = ids.shape
+        x, states, kv = self.prefill(ids, max_kv_len=T + max_new_tokens + 64)
+        logits = self.model.lm_head(x[:, -1, :])
+        eos = torch.tensor(sorted(eos_ids or ()), device=ids.device, dtype=torch.long)
+        done = torch.zeros(B, dtype=torch.bool, device=ids.device)
+        lengths = torch.full((B,), max_new_tokens, dtype=torch.long, device=ids.device)
+        out, pos = [], T - 1
+        for i in range(max_new_tokens):
+            nxt = self._sample(logits, temperature, top_k=top_k, top_p=top_p)
+            out.append(nxt)
+            if eos.numel():
+                hit = torch.isin(nxt[:, 0], eos) & ~done
+                lengths[hit] = i + 1
+                done |= hit
+                if i % 16 == 15 and bool(done.all()):
+                    break
+            pos += 1
+            x, states, kv = self.step(nxt, pos, states, kv)
+            logits = self.model.lm_head(x[:, -1, :])
+        return torch.cat(out, dim=1), lengths
+
+    @torch.no_grad()
     def continue_generate(self, ids: torch.Tensor, states, kv_caches, start_pos: int,
                           max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, top_p: float = 0.95, eos_ids: set[int] | None = None):
         out, pos, logits = [], start_pos, None

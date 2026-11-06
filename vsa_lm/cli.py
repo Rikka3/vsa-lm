@@ -143,6 +143,31 @@ def main(argv: list[str] | None = None):
     p_bench.add_argument("--gsm8k-limit", type=int, default=40, help="Samples for generative GSM8K (default: 40)")
     p_bench.add_argument("--out", default=None, help="Output JSON report path")
 
+    p_diag = sub.add_parser("diagnose", help="Decode parity + KL-by-position drift (teacher-forced vs free-run) vs the HF donor")
+    p_diag.add_argument("--ckpt", required=True, help="Path to VSA-LM .pth checkpoint")
+    p_diag.add_argument("--donor", default=None, help="Optional HF donor repo ID")
+    p_diag.add_argument("--n-prompts", type=int, default=16, help="GSM8K test prompts for the drift probe")
+    p_diag.add_argument("--max-new", type=int, default=2048)
+    p_diag.add_argument("--parity-T", type=int, default=3072, help="Sequence length for the decode-parity check")
+    p_diag.add_argument("--out", default=None, help="Output JSON path")
+
+    p_onp = sub.add_parser("onpolicy", help="Stage-3: distill on the student's own reasoning chains (teacher-scored)")
+    p_onp.add_argument("--ckpt", required=True, help="Healed checkpoint to start from")
+    p_onp.add_argument("--donor", default=None)
+    p_onp.add_argument("--work", default=".")
+    p_onp.add_argument("--out-prefix", default="vsa_onpolicy")
+    p_onp.add_argument("--rounds", type=int, default=10)
+    p_onp.add_argument("--prompts-per-round", type=int, default=256)
+    p_onp.add_argument("--gen-bs", type=int, default=16)
+    p_onp.add_argument("--max-new", type=int, default=3072)
+    p_onp.add_argument("--temperature", type=float, default=0.6)
+    p_onp.add_argument("--lr", type=float, default=5e-5)
+    p_onp.add_argument("--seqs-per-step", type=int, default=8)
+    p_onp.add_argument("--corpus-every", type=int, default=4, help="Every Nth micro-batch is a corpus window (0 = never)")
+    p_onp.add_argument("--seed", type=int, default=4242)
+    p_onp.add_argument("--resume", action="store_true")
+    p_onp.add_argument("--freeze-mlp", action="store_true")
+
     sub.add_parser("test", help="Run the Triton kernel, gradient, decoder, and erasure parity suite")
 
     args = p.parse_args(argv)
@@ -178,6 +203,18 @@ def main(argv: list[str] | None = None):
             limit=args.limit,
             gsm8k_limit=args.gsm8k_limit,
             out_json=args.out,
+        )
+    elif args.cmd == "diagnose":
+        from .diagnose import run_diagnostics
+        run_diagnostics(args.ckpt, donor_id=args.donor, n_prompts=args.n_prompts, max_new=args.max_new,
+                        parity_T=args.parity_T, out_json=args.out)
+    elif args.cmd == "onpolicy":
+        from .converter import onpolicy_distill
+        onpolicy_distill(
+            args.ckpt, donor_id=args.donor, work=args.work, out_prefix=args.out_prefix, rounds=args.rounds,
+            prompts_per_round=args.prompts_per_round, gen_bs=args.gen_bs, max_new=args.max_new,
+            temperature=args.temperature, lr=args.lr, seqs_per_step=args.seqs_per_step,
+            corpus_every=args.corpus_every, seed=args.seed, resume=args.resume, freeze_mlp=args.freeze_mlp,
         )
     elif args.cmd == "test":
         from .tests import run_all
