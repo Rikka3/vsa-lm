@@ -210,12 +210,16 @@ class VSARecurrentDecoder:
         pk = cache["swa_k"][:, :, :m]
         pv = cache["swa_v"][:, :, :m]
         # For m <= 65, direct GQA broadcast matmul is 2.5x faster than SDPA dispatcher overhead!
+        # Scores and the weighted sum run in fp32 with autocast off: training's SDPA keeps scores in fp32,
+        # while a bf16 matmul rounds them BEFORE softmax. Layer 0's q.k logits reach the hundreds (attention
+        # sink), where bf16 steps are 1-2 units, so the old path gave a different softmax there.
         B, HKV, _, HD = pk.shape
-        qg = q.to(pk.dtype).view(B, HKV, G, 1, HD)
-        scores = torch.matmul(qg, pk.unsqueeze(2).transpose(-1, -2)) * (HD ** -0.5)
-        probs = F.softmax(scores.float(), dim=-1).to(pv.dtype)
-        out = torch.matmul(probs, pv.unsqueeze(2)).view(B, HKV * G, 1, HD)
-        return out
+        with torch.autocast(q.device.type, enabled=False):
+            qg = q.float().reshape(B, HKV, G, 1, HD)
+            scores = torch.matmul(qg, pk.float().unsqueeze(2).transpose(-1, -2)) * (HD ** -0.5)
+            probs = F.softmax(scores, dim=-1)
+            out = torch.matmul(probs, pv.float().unsqueeze(2)).view(B, HKV * G, 1, HD)
+        return out.to(q.dtype)
 
     def _step_universal_block(self, li: int, blk, x: torch.Tensor, pos: int, states, kv_caches, record=None, write_scale: float = 1.0):
         B = x.shape[0]
