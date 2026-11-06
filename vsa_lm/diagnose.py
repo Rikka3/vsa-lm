@@ -109,9 +109,8 @@ def teacher_forced_drift(teacher, s_fn, t_fn, tok, device, prompts: list[str], m
             "median_len": int(statistics.median(lens)) if lens else 0}
 
 
-@torch.no_grad()
-def decode_parity(stu, tok, device, T: int = 3072) -> list[dict]:
-    """Parallel forward vs recurrent step on one real token sequence of length T."""
+def _parity_tokens(tok, device, T: int) -> torch.Tensor:
+    """One real token sequence (GSM8K prompt + worked solutions), length rounded down to a multiple of 32."""
     rows = _load_rows("openai/gsm8k", "main", "train", 400)
     ids = tok.encode(gsm8k_prompt(tok, rows[0]["question"]), add_special_tokens=False)
     for r in rows:
@@ -119,7 +118,57 @@ def decode_parity(stu, tok, device, T: int = 3072) -> list[dict]:
             break
         ids += tok.encode(f"{r['question'].strip()}\n{r['answer'].strip()}\n\n", add_special_tokens=False)
     T = (min(T, len(ids)) // 32) * 32
-    x = torch.tensor([ids[:T]], dtype=torch.long, device=device)
+    return torch.tensor([ids[:T]], dtype=torch.long, device=device)
+
+
+@torch.no_grad()
+def layer_parity(stu, tok, device, T: int = 1024) -> list[dict]:
+    """Per-block parity with no error compounding: every block gets exactly the inputs the parallel forward
+    gave it, is stepped token by token through the decoder path, and its contribution (out - in) is compared.
+    bf16 noise shows as a small, similar error in every layer; a decode bug shows as one layer type far above it."""
+    x = _parity_tokens(tok, device, T)
+    T = x.shape[1]
+    ins, outs = {}, {}
+
+    def _hook(li):
+        def fn(_m, args, out):
+            ins[li], outs[li] = args[0].detach(), out.detach()
+        return fn
+
+    hooks = [blk.register_forward_hook(_hook(li)) for li, blk in enumerate(stu.blocks)]
+    stu.eval()
+    try:
+        with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+            stu(x)
+    finally:
+        for h in hooks:
+            h.remove()
+
+    dec = VSARecurrentDecoder(stu, wrap_positions=False)
+    states, kv = VSARecurrentDecoder.blank_state(stu, 1, device, max_kv_len=T + 64)
+    edges = [e for e in (0, 64, 256, 1024, 2048, 3072) if e < T] + [T]
+    rows = []
+    for li, blk in enumerate(stu.blocks):
+        rec = torch.empty_like(outs[li])
+        with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+            for t in range(T):
+                rec[:, t : t + 1] = dec._step_universal_block(li, blk, ins[li][:, t : t + 1], t, states, kv)
+        ref_d = (outs[li] - ins[li]).float()
+        rec_d = (rec - ins[li]).float()
+        err = ((rec_d - ref_d).norm(dim=-1) / ref_d.norm(dim=-1).clamp_min(1e-6))[0]
+        row = {"layer": li, "type": "vsa" if hasattr(blk, "vsa") else "softmax"}
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            row[f"{lo}-{hi}"] = round(float(err[lo:hi].mean()), 4)
+        rows.append(row)
+        del rec, ref_d, rec_d
+    return rows
+
+
+@torch.no_grad()
+def decode_parity(stu, tok, device, T: int = 3072) -> list[dict]:
+    """Parallel forward vs recurrent step on one real token sequence of length T."""
+    x = _parity_tokens(tok, device, T)
+    T = x.shape[1]
 
     stu.eval()
     with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
@@ -150,7 +199,7 @@ def _print_rows(title: str, rows: list[dict], key: str = "mean"):
 
 
 def run_diagnostics(ckpt_path: str, donor_id: str | None = None, n_prompts: int = 16, max_new: int = 2048,
-                    parity_T: int = 3072, out_json: str | None = None) -> dict:
+                    parity_T: int = 3072, out_json: str | None = None, parity_only: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     stu, cfg, tok, donor_id, donor_dir, step, _ = _load_student(ckpt_path, donor_id, device)
     res = {"checkpoint": ckpt_path, "step": step}
@@ -163,6 +212,18 @@ def run_diagnostics(ckpt_path: str, donor_id: str | None = None, n_prompts: int 
     for r in res["decode_parity"]:
         flag = "ok" if r["top1_agree_pct"] >= 99.0 else "MISMATCH"
         print(f"    pos {r['pos']:>10}  top1 {r['top1_agree_pct']:6.2f}%  max|dlogit| {r['max_abs_logit_diff']:.3f}  {flag}")
+
+    res["layer_parity"] = layer_parity(stu, tok, device, T=min(parity_T, 2048))
+    print("  [1b] Per-layer parity: relative error of each block's output, same inputs, no compounding")
+    for r in res["layer_parity"]:
+        cols = "  ".join(f"{k}:{v:.4f}" for k, v in r.items() if k not in ("layer", "type"))
+        print(f"    L{r['layer']:02d} {r['type']:>7}  {cols}")
+
+    if parity_only:
+        if out_json:
+            with open(out_json, "w") as f:
+                json.dump(res, f, indent=2)
+        return res
 
     teacher = _load_hf_donor(donor_dir, device)
     s_fn, t_fn = vsa_logits_fn(stu), hf_logits_fn(teacher)

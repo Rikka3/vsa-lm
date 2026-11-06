@@ -150,6 +150,7 @@ def main(argv: list[str] | None = None):
     p_diag.add_argument("--max-new", type=int, default=2048)
     p_diag.add_argument("--parity-T", type=int, default=3072, help="Sequence length for the decode-parity check")
     p_diag.add_argument("--out", default=None, help="Output JSON path")
+    p_diag.add_argument("--parity-only", action="store_true", help="Only run the decode + per-layer parity checks (minutes)")
 
     p_onp = sub.add_parser("onpolicy", help="Stage-3: distill on the student's own reasoning chains (teacher-scored)")
     p_onp.add_argument("--ckpt", required=True, help="Healed checkpoint to start from")
@@ -207,7 +208,7 @@ def main(argv: list[str] | None = None):
     elif args.cmd == "diagnose":
         from .diagnose import run_diagnostics
         run_diagnostics(args.ckpt, donor_id=args.donor, n_prompts=args.n_prompts, max_new=args.max_new,
-                        parity_T=args.parity_T, out_json=args.out)
+                        parity_T=args.parity_T, out_json=args.out, parity_only=args.parity_only)
     elif args.cmd == "onpolicy":
         from .converter import onpolicy_distill
         onpolicy_distill(
