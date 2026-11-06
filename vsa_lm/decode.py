@@ -89,7 +89,10 @@ class VSARecurrentDecoder:
                     wv_fused = torch.bmm(vm_T, wv_rep).reshape(H * HD, -1).to(dt)
                     wq = ly.q_proj.weight.detach().to(dt)
                     wk = ly.k_proj.weight.detach().to(dt)
-                    g_act = bool(hasattr(ly, "g_proj") and ly.g_proj.weight.abs().max().item() > 1e-4)
+                    # Skip a branch only when it is exactly zero (zero-init, never trained). A magnitude
+                    # threshold silently drops small-but-real weights: g_proj sums over D inputs, so even
+                    # max|w| <= 1e-4 moves the 2*sigmoid gate by several percent (seen as ~14% error in layer 0).
+                    g_act = bool(hasattr(ly, "g_proj") and ly.g_proj.weight.any().item())
                     ly._g_active = g_act
                     if g_act:
                         wg = ly.g_proj.weight.detach().to(dt)
@@ -114,8 +117,8 @@ class VSARecurrentDecoder:
                 if hasattr(ly, "k_conv"):
                     ly._k_conv_w = ly.k_conv.weight.detach().to(dt).view(1, H, 1, HD, 4)
                     ly._v_conv_w = ly.v_conv.weight.detach().to(dt).view(1, H, 1, HD, 8)
-                    ly._k_conv_active = bool(ly.k_conv.weight.abs().max().item() > 1e-4)
-                    ly._v_conv_active = bool(ly.v_conv.weight.abs().max().item() > 1e-4)
+                    ly._k_conv_active = bool(ly.k_conv.weight.any().item())
+                    ly._v_conv_active = bool(ly.v_conv.weight.any().item())
             else:
                 if hasattr(ly, "q_proj") and not getattr(ly, "packed_q_gate", False):
                     wq = ly.q_proj.weight.detach().to(dt)
