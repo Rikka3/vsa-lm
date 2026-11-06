@@ -45,7 +45,7 @@ class StaticKV:
 class GraphKV:
     """Fixed-capacity softmax KV cache for CUDA-graph decoding: the new key/value is written at a device-side
     position and attention runs over the whole buffer with a validity mask, so every step has the same shapes.
-    Scores and the weighted sum are computed in fp32 (matching the eager SDPA path's fp32 accumulation)."""
+    SDPA's fused kernel accumulates scores in fp32, matching the eager SDPA path."""
 
     def __init__(self, B: int, HKV: int, Tmax: int, HD: int, dev, dt=torch.bfloat16):
         self.k = torch.zeros(B, HKV, Tmax, HD, device=dev, dtype=dt)
@@ -56,12 +56,13 @@ class GraphKV:
         self.k.index_copy_(2, pos, k_new.to(self.k.dtype))
         self.v.index_copy_(2, pos, v_new.to(self.v.dtype))
         B, HKV, T, HD = self.k.shape
-        with torch.autocast(q.device.type, enabled=False):
-            qg = q.float().reshape(B, HKV, G, 1, HD)
-            s = torch.matmul(qg, self.k.float().unsqueeze(2).transpose(-1, -2)) * (HD ** -0.5)
-            p = F.softmax(s.masked_fill(self.ar > pos, float("-inf")), dim=-1)
-            y = torch.matmul(p, self.v.float().unsqueeze(2)).reshape(B, HKV * G, 1, HD)
-        return y.to(q.dtype)
+        # The G query heads sharing a KV head become G "query positions" of that head, so SDPA needs no GQA
+        # expansion, and reading the bf16 buffer directly lets its fused kernel accumulate scores in fp32.
+        # (Upcasting the whole buffer to fp32 each step cost ~2 GB of traffic per step at B=32, T=4096.)
+        qg = q.to(self.k.dtype).reshape(B, HKV, G, HD)
+        mask = (self.ar <= pos).view(1, 1, 1, T)
+        y = F.scaled_dot_product_attention(qg, self.k, self.v, attn_mask=mask)
+        return y.reshape(B, HKV * G, 1, HD).to(q.dtype)
 
 
 class _CUDAGraphStep:
