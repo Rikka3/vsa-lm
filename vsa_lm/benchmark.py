@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from .converter import UniversalVSALM, fetch_any_donor, _purge_zombie_vram
-from .decode import VSARecurrentDecoder, StaticKV
+from .decode import GraphKV, VSARecurrentDecoder, StaticKV
 from .memory_bank import VSAMemoryBank
 from .server import get_all_eos_ids
 
@@ -345,7 +345,7 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
                 kv_s[li].k[:, :, :T_c].normal_(0, 0.02)
                 kv_s[li].v[:, :, :T_c].normal_(0, 0.02)
             elif isinstance(kv_s[li], dict) and "swa_n" in kv_s[li]:
-                kv_s[li]["swa_n"] = T_c  # window full + sink, as at real context T_c
+                kv_s[li]["swa_n"].fill_(T_c)  # window full + sink, as at real context T_c
         vsa_state_mb = (torch.cuda.memory_allocated() - base_mem_stu) / (1024 ** 2)
 
         dec_stu.step(nxt_tok, T_c, states_s, kv_s)
@@ -361,8 +361,32 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
                 _ = stu.lm_head(x_h[:, -1, :]).argmax(-1)
             torch.cuda.synchronize()
             runs_s.append(gen_steps / (time.perf_counter() - t0))
-        vsa_tok_s = statistics.median(runs_s)
+        vsa_tok_s_eager = statistics.median(runs_s)
         del states_s, kv_s
+        torch.cuda.empty_cache()
+
+        # 1b. Same step replayed as one CUDA graph (what generate() uses); same bf16 KV size.
+        vsa_tok_s = vsa_tok_s_eager
+        runner = dec_stu._graph_runner(1, T_c + gen_steps + 32, device)
+        if runner is not None:
+            for li, blk in enumerate(stu.blocks):
+                c = runner.kv[li]
+                if isinstance(c, GraphKV):
+                    c.k[:, :, :T_c].normal_(0, 0.02)
+                    c.v[:, :, :T_c].normal_(0, 0.02)
+                elif isinstance(c, dict) and "swa_n" in c:
+                    c["swa_n"].fill_(T_c)
+            runner(nxt_tok, T_c)
+            torch.cuda.synchronize()
+            runs_g = []
+            for _ in range(3):
+                t0 = time.perf_counter()
+                for step_i in range(gen_steps):
+                    _ = runner(nxt_tok, T_c + step_i).argmax(-1)
+                torch.cuda.synchronize()
+                runs_g.append(gen_steps / (time.perf_counter() - t0))
+            vsa_tok_s = statistics.median(runs_g)
+            del runner
         torch.cuda.empty_cache()
 
         # 2. Donor with StaticKV + enable_gqa=True
@@ -399,6 +423,7 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
             "ram_saved_pct": round((1.0 - vsa_state_mb / max(1e-4, donor_kv_mb)) * 100.0, 1),
             "donor_tok_s": round(donor_tok_s, 1),
             "vsa_tok_s": round(vsa_tok_s, 1),
+            "vsa_tok_s_eager": round(vsa_tok_s_eager, 1),
             "speedup": round(vsa_tok_s / max(1e-4, donor_tok_s), 2),
         })
 

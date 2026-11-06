@@ -182,13 +182,23 @@ def decode_parity(stu, tok, device, T: int = 3072) -> list[dict]:
         ref = par[t].float()
         max_diff[t] = (rec - ref).abs().max().item()
         agree[t] = float(rec.argmax() == ref.argmax())
+    # Same check for the CUDA-graph step that generate()/generate_batch() actually use.
+    g_agree = None
+    runner = dec._graph_runner(1, T, device)
+    if runner is not None:
+        g_agree = torch.zeros(T)
+        for t in range(T):
+            g_agree[t] = float(runner(x[:, t : t + 1], t)[0].float().argmax() == par[t].float().argmax())
     out = []
     for lo, hi in zip(PARITY_EDGES[:-1], PARITY_EDGES[1:]):
         if lo >= T:
             break
         hi = min(hi, T)
-        out.append({"pos": f"{lo}-{hi}", "top1_agree_pct": round(100.0 * float(agree[lo:hi].mean()), 2),
-                    "max_abs_logit_diff": round(float(max_diff[lo:hi].max()), 3)})
+        row = {"pos": f"{lo}-{hi}", "top1_agree_pct": round(100.0 * float(agree[lo:hi].mean()), 2),
+               "max_abs_logit_diff": round(float(max_diff[lo:hi].max()), 3)}
+        if g_agree is not None:
+            row["graph_top1_agree_pct"] = round(100.0 * float(g_agree[lo:hi].mean()), 2)
+        out.append(row)
     return out
 
 
@@ -211,7 +221,8 @@ def run_diagnostics(ckpt_path: str, donor_id: str | None = None, n_prompts: int 
     print("  [1] Decode parity (recurrent step vs parallel forward; pass = >=99% top-1 in every bucket)")
     for r in res["decode_parity"]:
         flag = "ok" if r["top1_agree_pct"] >= 99.0 else "MISMATCH"
-        print(f"    pos {r['pos']:>10}  top1 {r['top1_agree_pct']:6.2f}%  max|dlogit| {r['max_abs_logit_diff']:.3f}  {flag}")
+        graph = f"  graph top1 {r['graph_top1_agree_pct']:6.2f}%" if "graph_top1_agree_pct" in r else "  graph n/a"
+        print(f"    pos {r['pos']:>10}  top1 {r['top1_agree_pct']:6.2f}%  max|dlogit| {r['max_abs_logit_diff']:.3f}{graph}  {flag}")
 
     res["layer_parity"] = layer_parity(stu, tok, device, T=min(parity_T, 2048))
     print("  [1b] Per-layer parity: relative error of each block's output, same inputs, no compounding")

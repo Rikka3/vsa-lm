@@ -42,13 +42,131 @@ class StaticKV:
         return self.k[:, :, :self.n], self.v[:, :, :self.n]
 
 
+class GraphKV:
+    """Fixed-capacity softmax KV cache for CUDA-graph decoding: the new key/value is written at a device-side
+    position and attention runs over the whole buffer with a validity mask, so every step has the same shapes.
+    Scores and the weighted sum are computed in fp32 (matching the eager SDPA path's fp32 accumulation)."""
+
+    def __init__(self, B: int, HKV: int, Tmax: int, HD: int, dev, dt=torch.bfloat16):
+        self.k = torch.zeros(B, HKV, Tmax, HD, device=dev, dtype=dt)
+        self.v = torch.zeros_like(self.k)
+        self.ar = torch.arange(Tmax, device=dev)
+
+    def attend(self, q: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor, pos: torch.Tensor, G: int) -> torch.Tensor:
+        self.k.index_copy_(2, pos, k_new.to(self.k.dtype))
+        self.v.index_copy_(2, pos, v_new.to(self.v.dtype))
+        B, HKV, T, HD = self.k.shape
+        with torch.autocast(q.device.type, enabled=False):
+            qg = q.float().reshape(B, HKV, G, 1, HD)
+            s = torch.matmul(qg, self.k.float().unsqueeze(2).transpose(-1, -2)) * (HD ** -0.5)
+            p = F.softmax(s.masked_fill(self.ar > pos, float("-inf")), dim=-1)
+            y = torch.matmul(p, self.v.float().unsqueeze(2)).reshape(B, HKV * G, 1, HD)
+        return y.to(q.dtype)
+
+
+class _CUDAGraphStep:
+    """One captured decode step (token -> logits) for a fixed batch size and KV capacity. Replaying it launches
+    the whole 28-layer step at once instead of ~1000 small kernels, which is what limits batch-1 decoding.
+    Only valid for generation that starts from an empty state at position 0 (generate / generate_batch)."""
+
+    def __init__(self, dec: "VSARecurrentDecoder", B: int, Tmax: int, device):
+        m = dec.model
+        self.states, self.kv = dec.blank_state(m, B, device, max_kv_len=Tmax, graph=True)
+        self.tok = torch.zeros(B, 1, dtype=torch.long, device=device)
+        self.pos = torch.zeros(1, dtype=torch.long, device=device)
+        # Keep the packed decode tables this graph reads alive, even if a later decoder rebuilds them.
+        self._keep = [t for blk in m.blocks for ly in (getattr(blk, "vsa", None), getattr(blk, "attn", None))
+                      if ly is not None for t in vars(ly).values() if torch.is_tensor(t)]
+
+        def run():
+            with torch.no_grad():  # no autograd bookkeeping may be recorded into the graph
+                h, _, _ = dec.step(self.tok, self.pos, self.states, self.kv)
+                return m.lm_head(h[:, -1, :])
+
+        side = torch.cuda.Stream(device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side):  # warm-up: Triton compile + allocator settle, outside the capture
+            for _ in range(2):
+                run()
+        torch.cuda.current_stream(device).wait_stream(side)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.logits = run()
+        self.reset()
+
+    def reset(self):
+        VSARecurrentDecoder.reset_state(self.states, self.kv)
+
+    def __call__(self, tok: torch.Tensor, pos: int) -> torch.Tensor:
+        self.tok.copy_(tok)
+        self.pos.fill_(pos)
+        self.graph.replay()
+        return self.logits
+
+
 class VSARecurrentDecoder:
-    def __init__(self, model, wrap_positions: bool = False, max_cache_pos: int = 65536):
+    def __init__(self, model, wrap_positions: bool = False, max_cache_pos: int = 65536, use_cuda_graph: bool = True):
         self.model = model.eval()
         self.wrap_positions = wrap_positions
         self.max_T = model.config["max_T"]
         self.is_universal = hasattr(model, "embed_tokens")
+        self.max_cache_pos = max_cache_pos
         self._prepare_fast_decode_tables(max_cache_pos)
+        self.use_cuda_graph = use_cuda_graph and self._graph_supported()
+        self._graphs: dict = {}
+
+    def _graph_supported(self) -> bool:
+        """CUDA graphs need every layer on the packed fast path with cached RoPE (no host-side branching)."""
+        if not self.is_universal or not torch.cuda.is_available():
+            return False
+        for blk in self.model.blocks:
+            ly = blk.vsa if hasattr(blk, "vsa") else getattr(blk, "attn", None)
+            if ly is None or not hasattr(ly, "_wqkv_packed") or not hasattr(ly, "_rope_cos"):
+                return False
+        return True
+
+    def _graph_runner(self, B: int, need_len: int, device):
+        """A reset CUDA-graph step for batch B with room for need_len tokens, or None (eager fallback).
+        Capacity is rounded up to 1024 so one capture serves many prompts; only the two most recent
+        captures are kept, since each owns a full KV buffer."""
+        if not self.use_cuda_graph or device.type != "cuda":
+            return None
+        Tmax = -(-need_len // 1024) * 1024
+        if Tmax > self.max_cache_pos:
+            return None
+        key = (B, Tmax)
+        runner = self._graphs.pop(key, None)
+        if runner is None:
+            while len(self._graphs) >= 2:
+                self._graphs.pop(next(iter(self._graphs)))
+            try:
+                runner = _CUDAGraphStep(self, B, Tmax, device)
+            except Exception as e:  # never fail generation over a capture problem
+                print(f"[vsa-decode] CUDA graph capture failed ({type(e).__name__}: {e}); using eager decode.", flush=True)
+                self.use_cuda_graph = False
+                return None
+        else:
+            runner.reset()
+        self._graphs[key] = runner
+        return runner
+
+    def _start(self, ids: torch.Tensor, max_new_tokens: int):
+        """Prefill `ids` from an empty state. Returns (logits for the next token, feed(tok, pos) -> logits),
+        through a CUDA graph when possible and the eager step otherwise."""
+        B, T = ids.shape
+        runner = self._graph_runner(B, T + max_new_tokens + 1, ids.device)
+        if runner is not None:
+            logits = None
+            for t in range(T):
+                logits = runner(ids[:, t : t + 1], t)
+            return logits, runner
+        x, states, kv = self.prefill(ids, max_kv_len=T + max_new_tokens + 64)
+
+        def feed(tok, pos):
+            h, _, _ = self.step(tok, pos, states, kv)
+            return self.model.lm_head(h[:, -1, :])
+
+        return self.model.lm_head(x[:, -1, :]), feed
 
     @torch.no_grad()
     def _prepare_fast_decode_tables(self, max_pos: int):
@@ -94,22 +212,30 @@ class VSARecurrentDecoder:
                     # max|w| <= 1e-4 moves the 2*sigmoid gate by several percent (seen as ~14% error in layer 0).
                     g_act = bool(hasattr(ly, "g_proj") and ly.g_proj.weight.any().item())
                     ly._g_active = g_act
+                    # The sliding window reads the raw (un-mixed) v; packing it here saves one matmul per VSA layer.
+                    raw_v = getattr(ly, "swa_window", 0) > 0
+                    w_parts, sizes = [wq, wk, wv_fused], [H * HD, HKV * HD, H * HD]
                     if g_act:
-                        wg = ly.g_proj.weight.detach().to(dt)
-                        ly._wqkv_packed = torch.cat([wq, wk, wv_fused, wg], dim=0).contiguous()
-                    else:
-                        ly._wqkv_packed = torch.cat([wq, wk, wv_fused], dim=0).contiguous()
+                        w_parts.append(ly.g_proj.weight.detach().to(dt))
+                        sizes.append(H * HD)
+                    if raw_v:
+                        w_parts.append(ly.v_proj.weight.detach().to(dt))
+                        sizes.append(HKV * HD)
+                    ly._wqkv_packed = torch.cat(w_parts, dim=0).contiguous()
+                    ly._qkv_sizes = sizes
+                    ly._raw_v_packed = raw_v
 
                     if ly.q_proj.bias is not None:
                         bq = ly.q_proj.bias.detach().to(dt)
                         bk = ly.k_proj.bias.detach().to(dt)
                         bv = ly.v_proj.bias.detach().to(torch.float32).view(HKV, 1, HD).expand(HKV, G, HD).reshape(H, 1, HD)
                         bv_fused = torch.bmm(bv, ly.v_head_mix.detach().to(torch.float32)).reshape(H * HD).to(dt)
+                        b_parts = [bq, bk, bv_fused]
                         if g_act:
-                            bg = torch.zeros(H * HD, device=device, dtype=dt)
-                            ly._bqkv_packed = torch.cat([bq, bk, bv_fused, bg], dim=0).contiguous()
-                        else:
-                            ly._bqkv_packed = torch.cat([bq, bk, bv_fused], dim=0).contiguous()
+                            b_parts.append(torch.zeros(H * HD, device=device, dtype=dt))
+                        if raw_v:
+                            b_parts.append(ly.v_proj.bias.detach().to(dt))
+                        ly._bqkv_packed = torch.cat(b_parts, dim=0).contiguous()
                     else:
                         ly._bqkv_packed = None
                     ly._km_dt = ly.k_head_mix.detach().to(dt).contiguous()
@@ -146,7 +272,8 @@ class VSARecurrentDecoder:
         return vsa_bytes, kv_per_token
 
     @staticmethod
-    def blank_state(model, batch_size: int, device, max_kv_len: int = 4096, state_dtype=torch.float32):
+    def blank_state(model, batch_size: int, device, max_kv_len: int = 4096, state_dtype=torch.float32, graph: bool = False):
+        """Per-layer decode state. graph=True gives softmax layers a fixed-capacity GraphKV (CUDA-graph safe)."""
         states, kv_caches = [None] * len(model.blocks), [None] * len(model.blocks)
         dt = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
         for li, blk in enumerate(model.blocks):
@@ -161,13 +288,33 @@ class VSARecurrentDecoder:
                     W = v.swa_window
                     cache["swa_k"] = torch.zeros(batch_size, v.HKV, W + 1, v.HD, device=device, dtype=dt)
                     cache["swa_v"] = torch.zeros_like(cache["swa_k"])
-                    cache["swa_n"] = 0
+                    # Tokens seen so far, kept on device so a step has no host-side branching (CUDA-graph safe).
+                    cache["swa_n"] = torch.zeros(1, dtype=torch.long, device=device)
+                    cache["swa_ar"] = torch.arange(W + 1, device=device)
                 kv_caches[li] = cache or None
             else:
                 s = blk.attn if hasattr(blk, "attn") else blk.softmax_attn
                 hk = getattr(s, "HKV", s.H)
-                kv_caches[li] = StaticKV(batch_size, hk, max_kv_len, s.HD, device, dt=dt)
+                kv_cls = GraphKV if graph else StaticKV
+                kv_caches[li] = kv_cls(batch_size, hk, max_kv_len, s.HD, device, dt=dt)
         return states, kv_caches
+
+    @staticmethod
+    def reset_state(states, kv_caches):
+        """Zero a decode state in place (keeps every buffer's address, as a captured CUDA graph requires)."""
+        for s in states:
+            if s is not None:
+                s.zero_()
+        for c in kv_caches:
+            if isinstance(c, dict):
+                for key, t in c.items():
+                    if torch.is_tensor(t) and key != "swa_ar":
+                        t.zero_()
+            elif isinstance(c, GraphKV):
+                c.k.zero_()
+                c.v.zero_()
+            elif isinstance(c, StaticKV):
+                c.n = 0
 
     def _gamma(self, layer):
         return getattr(layer, "_cached_gam", None) or layer.gamma()
@@ -199,16 +346,19 @@ class VSARecurrentDecoder:
 
     @staticmethod
     def _window_attn_step(cache: dict, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, W: int, G: int) -> torch.Tensor:
-        """Zero-copy 65-token sliding-window + sink attention (slot 0 = sink, slots 1..W = ring buffer)."""
+        """Zero-copy 65-token sliding-window + sink attention (slot 0 = sink, slots 1..W = ring buffer).
+        The token counter lives on device and unfilled slots are masked, so there are no data-dependent
+        shapes or host syncs (CUDA-graph safe)."""
         n = cache["swa_n"]
-        slot = 0 if n == 0 else (1 + ((n - 1) % W))
-        cache["swa_k"][:, :, slot : slot + 1].copy_(k)
-        cache["swa_v"][:, :, slot : slot + 1].copy_(v)
-        n += 1
-        cache["swa_n"] = n
-        m = min(n, W + 1)
-        pk = cache["swa_k"][:, :, :m]
-        pv = cache["swa_v"][:, :, :m]
+        if not torch.is_tensor(n):  # states saved before the counter moved to device
+            n = cache["swa_n"] = torch.tensor([int(n)], dtype=torch.long, device=k.device)
+            cache["swa_ar"] = torch.arange(W + 1, device=k.device)
+        slot = ((n - 1).remainder(W) + 1) * (n != 0)  # token 0 -> sink slot 0, token p>=1 -> 1 + (p-1) % W
+        cache["swa_k"].index_copy_(2, slot, k.to(cache["swa_k"].dtype))
+        cache["swa_v"].index_copy_(2, slot, v.to(cache["swa_v"].dtype))
+        n.add_(1)
+        valid = cache["swa_ar"] < n  # slots 0..min(n, W+1)-1 hold real tokens
+        pk, pv = cache["swa_k"], cache["swa_v"]
         # For m <= 65, direct GQA broadcast matmul is 2.5x faster than SDPA dispatcher overhead!
         # Scores and the weighted sum run in fp32 with autocast off: training's SDPA keeps scores in fp32,
         # while a bf16 matmul rounds them BEFORE softmax. Layer 0's q.k logits reach the hundreds (attention
@@ -217,7 +367,7 @@ class VSARecurrentDecoder:
         with torch.autocast(q.device.type, enabled=False):
             qg = q.float().reshape(B, HKV, G, 1, HD)
             scores = torch.matmul(qg, pk.float().unsqueeze(2).transpose(-1, -2)) * (HD ** -0.5)
-            probs = F.softmax(scores, dim=-1)
+            probs = F.softmax(scores.masked_fill(~valid, float("-inf")), dim=-1)
             out = torch.matmul(probs, pv.float().unsqueeze(2)).view(B, HKV * G, 1, HD)
         return out.to(q.dtype)
 
@@ -230,11 +380,14 @@ class VSARecurrentDecoder:
             g_proj_out = None
             v_raw = None
             if hasattr(ly, "_wqkv_packed"):
-                qkv = F.linear(h, ly._wqkv_packed, ly._bqkv_packed)
-                if getattr(ly, "_g_active", False):
-                    q, k, vx, g_proj_out = torch.split(qkv, [H * HD, HKV * HD, H * HD, H * HD], dim=-1)
-                else:
-                    q, k, vx = torch.split(qkv, [H * HD, HKV * HD, H * HD], dim=-1)
+                parts = torch.split(F.linear(h, ly._wqkv_packed, ly._bqkv_packed), ly._qkv_sizes, dim=-1)
+                q, k, vx = parts[0], parts[1], parts[2]
+                nxt = 3
+                if ly._g_active:
+                    g_proj_out = parts[nxt]
+                    nxt += 1
+                if ly._raw_v_packed:
+                    v_raw = parts[nxt].view(B, 1, HKV, HD).transpose(1, 2)
                 q = q.view(B, 1, H, HD).transpose(1, 2)
                 k = k.view(B, 1, HKV, HD).transpose(1, 2)
                 vx = vx.view(B, 1, H, HD).transpose(1, 2)
@@ -243,7 +396,8 @@ class VSARecurrentDecoder:
                 vx = repeat_kv(v, G)
                 v_raw = v
 
-            if hasattr(ly, "_rope_cos") and pos < ly._rope_cos.shape[0]:
+            # pos is an int (eager) or a 1-element device tensor (CUDA graph: always inside the rope table).
+            if hasattr(ly, "_rope_cos") and (torch.is_tensor(pos) or pos < ly._rope_cos.shape[0]):
                 cos = ly._rope_cos[pos].view(1, 1, 1, HD)
                 sin = ly._rope_sin[pos].view(1, 1, 1, HD)
                 q = _apply_cached_rope(q, cos, sin)
@@ -263,7 +417,7 @@ class VSARecurrentDecoder:
 
             if hasattr(ly, "k_conv") and isinstance(kv_caches[li], dict) and getattr(ly, "_k_conv_active", False):
                 k_in = torch.cat([kv_caches[li]["k_buf"], kx.unsqueeze(-1)], dim=-1)
-                kv_caches[li]["k_buf"] = k_in[..., -3:]
+                kv_caches[li]["k_buf"].copy_(k_in[..., -3:])  # in place: buffer address must stay fixed
                 kx = kx + (k_in * ly._k_conv_w).sum(dim=-1)
 
             if record is not None:
@@ -272,7 +426,7 @@ class VSARecurrentDecoder:
             v_loc = None
             if hasattr(ly, "v_conv") and isinstance(kv_caches[li], dict) and getattr(ly, "_v_conv_active", False):
                 v_in = torch.cat([kv_caches[li]["v_buf"], vx.unsqueeze(-1)], dim=-1)
-                kv_caches[li]["v_buf"] = v_in[..., -7:]
+                kv_caches[li]["v_buf"].copy_(v_in[..., -7:])
                 v_loc = (v_in * ly._v_conv_w).sum(dim=-1)
 
             y = fused_vsa_recurrent_step(
@@ -308,7 +462,7 @@ class VSARecurrentDecoder:
                 k = k.view(B, 1, HKV, HD).transpose(1, 2)
                 v = v.view(B, 1, HKV, HD).transpose(1, 2)
                 gate = None
-                if hasattr(ly, "_rope_cos") and pos < ly._rope_cos.shape[0]:
+                if hasattr(ly, "_rope_cos") and (torch.is_tensor(pos) or pos < ly._rope_cos.shape[0]):
                     cos = ly._rope_cos[pos].view(1, 1, 1, HD)
                     sin = ly._rope_sin[pos].view(1, 1, 1, HD)
                     q = _apply_cached_rope(q, cos, sin)
@@ -321,16 +475,19 @@ class VSARecurrentDecoder:
                 q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
 
             cache_obj = kv_caches[li]
-            if isinstance(cache_obj, StaticKV):
-                pk, pv = cache_obj.append(k, v)
+            if isinstance(cache_obj, GraphKV):
+                y = cache_obj.attend(q, k, v, pos, ly.G)
             else:
-                pk, pv = cache_obj
-                pk, pv = torch.cat([pk, k.to(pk.dtype)], dim=2), torch.cat([pv, v.to(pv.dtype)], dim=2)
-                kv_caches[li] = (pk, pv)
-            try:
-                y = F.scaled_dot_product_attention(q, pk, pv, enable_gqa=(ly.G > 1))
-            except TypeError:
-                y = F.scaled_dot_product_attention(q, repeat_kv(pk, ly.G), repeat_kv(pv, ly.G))
+                if isinstance(cache_obj, StaticKV):
+                    pk, pv = cache_obj.append(k, v)
+                else:
+                    pk, pv = cache_obj
+                    pk, pv = torch.cat([pk, k.to(pk.dtype)], dim=2), torch.cat([pv, v.to(pv.dtype)], dim=2)
+                    kv_caches[li] = (pk, pv)
+                try:
+                    y = F.scaled_dot_product_attention(q, pk, pv, enable_gqa=(ly.G > 1))
+                except TypeError:
+                    y = F.scaled_dot_product_attention(q, repeat_kv(pk, ly.G), repeat_kv(pv, ly.G))
 
             if gate is not None:
                 y_out = y.transpose(1, 2).reshape(B, 1, H * HD) * torch.sigmoid(gate)
@@ -385,7 +542,9 @@ class VSARecurrentDecoder:
     def step(self, token: torch.Tensor, pos: int, states, kv_caches, record=None, write_scale: float = 1.0):
         m = self.model
         if self.is_universal:
-            with torch.autocast("cuda", torch.bfloat16, enabled=token.is_cuda):
+            # cache_enabled=False: required inside CUDA-graph capture, and a no-op cost here since the
+            # autocast cache never outlived a single step anyway.
+            with torch.autocast("cuda", torch.bfloat16, enabled=token.is_cuda, cache_enabled=False):
                 x = m.embed_tokens(token)
                 for li, blk in enumerate(m.blocks):
                     x = self._step_universal_block(li, blk, x, pos, states, kv_caches, record=record, write_scale=write_scale)
@@ -436,8 +595,7 @@ class VSARecurrentDecoder:
     @torch.no_grad()
     def generate(self, prompt: torch.Tensor, max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, top_p: float = 0.95, eos_ids: set[int] | None = None):
         out = prompt.clone()
-        x, states, kv = self.prefill(out, max_kv_len=prompt.shape[1] + max_new_tokens + 64)
-        logits = self.model.lm_head(x[:, -1, :])
+        logits, feed = self._start(prompt, max_new_tokens)
         pos = prompt.shape[1] - 1
         for _ in range(max_new_tokens):
             nxt = self._sample(logits, temperature, top_k=top_k, top_p=top_p)
@@ -445,8 +603,7 @@ class VSARecurrentDecoder:
             if eos_ids and int(nxt[0, 0].item()) in eos_ids:
                 break
             pos += 1
-            x, states, kv = self.step(nxt, pos, states, kv)
-            logits = self.model.lm_head(x[:, -1, :])
+            logits = feed(nxt, pos)
         return out
 
     @torch.no_grad()
@@ -457,8 +614,7 @@ class VSARecurrentDecoder:
         up to and including each row's first EOS, or max_new_tokens if it never stopped. Tokens after a
         row's EOS are filler and must be dropped by the caller."""
         B, T = ids.shape
-        x, states, kv = self.prefill(ids, max_kv_len=T + max_new_tokens + 64)
-        logits = self.model.lm_head(x[:, -1, :])
+        logits, feed = self._start(ids, max_new_tokens)
         eos = torch.tensor(sorted(eos_ids or ()), device=ids.device, dtype=torch.long)
         done = torch.zeros(B, dtype=torch.bool, device=ids.device)
         lengths = torch.full((B,), max_new_tokens, dtype=torch.long, device=ids.device)
@@ -473,8 +629,7 @@ class VSARecurrentDecoder:
                 if i % 16 == 15 and bool(done.all()):
                     break
             pos += 1
-            x, states, kv = self.step(nxt, pos, states, kv)
-            logits = self.model.lm_head(x[:, -1, :])
+            logits = feed(nxt, pos)
         return torch.cat(out, dim=1), lengths
 
     @torch.no_grad()
