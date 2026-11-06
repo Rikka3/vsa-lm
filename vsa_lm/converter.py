@@ -1064,7 +1064,7 @@ def onpolicy_distill(
         _save_student(stu, stu_cfg, ck, out_ckpt, int(ck.get("step", 0)), opt=opt, opt_ckpt=opt_ckpt,
                       onpolicy_round=rnd + 1, onpolicy_opt_steps=opt_steps, onpolicy_cursor=cursor)
         _save_student(stu, stu_cfg, ck, os.path.join(work, f"{out_prefix}_r{rnd+1}.pth"), int(ck.get("step", 0)),
-                      onpolicy_round=rnd + 1)
+                      onpolicy_round=rnd + 1, onpolicy_opt_steps=opt_steps, onpolicy_cursor=cursor)
 
         # 5. Early stop once the student stops ending its reasoning on the held-out probe.
         if drift["n"] and drift["capped_n"] / drift["n"] > stop_capped_frac:
