@@ -87,7 +87,8 @@ def student_drift(stu, s_fn, t_fn, tok, device, prompts: list[str], max_new: int
         nlls.append(nll)
     return {"kl": _bucketize(kls), "teacher_nll": _bucketize(nlls),
             "median_len": int(statistics.median(lens)) if lens else 0,
-            "capped": f"{sum(int(n >= max_new) for n in lens)}/{len(lens)}"}
+            "capped": f"{sum(int(n >= max_new) for n in lens)}/{len(lens)}",
+            "capped_n": sum(int(n >= max_new) for n in lens), "n": len(lens)}
 
 
 @torch.no_grad()

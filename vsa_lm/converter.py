@@ -925,6 +925,7 @@ def onpolicy_distill(
     seed: int = 4242,
     resume: bool = False,
     freeze_mlp: bool = False,
+    stop_capped_frac: float = 0.5,
 ):
     """Stage-3 on-policy distillation. Each round the student samples reasoning chains with the benchmark's
     sampling settings; the teacher scores every token of those chains and the student is trained with
@@ -1011,13 +1012,19 @@ def onpolicy_distill(
         del dec
         t_gen = time.perf_counter() - t0
 
-        # 2. Train on the student's own chains: loss only on generated tokens (incl. EOS).
+        # 2. Train on the student's own chains that ENDED (EOS): loss only on generated tokens (incl. EOS).
+        # Capped chains are dropped: they never stop, and on looping text the teacher also predicts
+        # "continue", so training on them teaches the student not to stop (R2 overshoot: median hit the cap).
         stu.train()
-        random.Random(seed + rnd).shuffle(pool)
+        train_pool = [c for c, k in zip(pool, lens) if k < max_new]
+        if len(train_pool) < seqs_per_step:
+            print(f"  [Stage-3] only {len(train_pool)} finished chains (< {seqs_per_step}); skipping training this round", flush=True)
+            train_pool = []
+        random.Random(seed + rnd).shuffle(train_pool)
         loss_sum, n_steps = 0.0, 0
         n_corpus = (seqs_per_step // max(1, corpus_every - 1)) if corpus_every > 1 else 0
-        for s0 in range(0, len(pool), seqs_per_step):
-            chunk = pool[s0 : s0 + seqs_per_step]
+        for s0 in range(0, len(train_pool), seqs_per_step):
+            chunk = train_pool[s0 : s0 + seqs_per_step]
             w = 1.0 / (len(chunk) + n_corpus)
             opt.zero_grad(set_to_none=True)
             loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
@@ -1048,9 +1055,19 @@ def onpolicy_distill(
         peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
         kl_line = "  ".join(f"{r['pos']}:{r['mean']:.3f}" for r in drift["kl"])
         print(f"  >>> [{out_prefix} R{rnd+1}/{rounds}] kd {loss_sum/max(1,n_steps):.4f} | gen median {int(statistics.median(lens))} tok, "
-              f"capped {capped}/{len(lens)} | probe median {drift['median_len']} | gen {t_gen/60:.1f}m train {t_train/60:.1f}m | VRAM {peak_gb:.1f} GiB", flush=True)
+              f"capped {capped}/{len(lens)}, trained {len(train_pool)} | probe median {drift['median_len']}, capped {drift['capped']} | "
+              f"gen {t_gen/60:.1f}m train {t_train/60:.1f}m | VRAM {peak_gb:.1f} GiB", flush=True)
         print(f"      drift KL by pos: {kl_line}", flush=True)
 
-        # 4. Save (atomic) with the round counter so --resume continues at the next round.
+        # 4. Save (atomic) with the round counter so --resume continues at the next round, plus a
+        #    weights-only snapshot per round so the best round can be benchmarked later.
         _save_student(stu, stu_cfg, ck, out_ckpt, int(ck.get("step", 0)), opt=opt, opt_ckpt=opt_ckpt,
                       onpolicy_round=rnd + 1, onpolicy_opt_steps=opt_steps, onpolicy_cursor=cursor)
+        _save_student(stu, stu_cfg, ck, os.path.join(work, f"{out_prefix}_r{rnd+1}.pth"), int(ck.get("step", 0)),
+                      onpolicy_round=rnd + 1)
+
+        # 5. Early stop once the student stops ending its reasoning on the held-out probe.
+        if drift["n"] and drift["capped_n"] / drift["n"] > stop_capped_frac:
+            print(f"  [Stage-3] stopping: {drift['capped']} probe chains hit the cap (> {stop_capped_frac:.0%}). "
+                  f"Benchmark an earlier {out_prefix}_r*.pth.", flush=True)
+            break
