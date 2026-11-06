@@ -926,12 +926,18 @@ def onpolicy_distill(
     resume: bool = False,
     freeze_mlp: bool = False,
     stop_capped_frac: float = 0.5,
+    chain_source: str = "student",
 ):
-    """Stage-3 on-policy distillation. Each round the student samples reasoning chains with the benchmark's
-    sampling settings; the teacher scores every token of those chains and the student is trained with
-    forward KL on its OWN generated tokens (no CE: the samples are the student's, so CE would reinforce its
-    errors). This removes the train/test mismatch of Stage-1/2, which only ever fed the student corpus text.
-    Every `corpus_every`-th micro-batch is a Stage-2 corpus window, to keep general ability."""
+    """Stage-3 chain distillation. Each round reasoning chains are sampled with the benchmark's sampling
+    settings, the teacher scores every token, and the student is trained with forward KL on the chain tokens
+    (no CE). Every `corpus_every`-th micro-batch is a Stage-2 corpus window, to keep general ability.
+
+    chain_source="student": on-policy. The student writes the chains, which removes the train/test mismatch
+      of Stage-1/2 (corpus text only), but it never shows the student reasoning moves it does not make.
+    chain_source="teacher": the teacher writes the chains (sequence-level KD), so the student learns the
+      teacher's own reasoning steps (self-checks, when to continue, when to stop)."""
+    if chain_source not in ("student", "teacher"):
+        raise ValueError(f"chain_source must be 'student' or 'teacher', got {chain_source!r}")
     from transformers import AutoTokenizer
     from .benchmark import _load_rows, gsm8k_prompt
     from .decode import VSARecurrentDecoder
@@ -987,23 +993,39 @@ def onpolicy_distill(
             g["lr"] = lr * m * g.get("lr_scale", 1.0)
 
     print("=" * 84)
-    print(f"VSA STAGE-3 ON-POLICY KD: {donor_repo} | rounds {start_round}->{rounds} | {prompts_per_round} chains/round "
-          f"(gen_bs={gen_bs}, max_new={max_new}, temp={temperature}) | lr {lr}")
+    print(f"VSA STAGE-3 CHAIN KD ({chain_source}-written chains): {donor_repo} | rounds {start_round}->{rounds} | "
+          f"{prompts_per_round} chains/round (gen_bs={gen_bs}, max_new={max_new}, temp={temperature}) | lr {lr}")
     print("=" * 84)
     set_lr(opt_steps)
 
+    # The teacher never changes, so its decoder (native replica) is built once.
+    t_dec = VSARecurrentDecoder(donor, wrap_positions=False) if (chain_source == "teacher" and not is_hf_donor) else None
+
+    def _teacher_generate(x):
+        if t_dec is not None:
+            return t_dec.generate_batch(x, max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids)
+        out = donor.generate(x, max_new_tokens=max_new, do_sample=True, temperature=temperature, top_p=top_p,
+                             eos_token_id=list(eos_ids), pad_token_id=tok.eos_token_id or 0)
+        toks = out[:, x.shape[1]:]
+        hit = torch.isin(toks, torch.tensor(sorted(eos_ids), device=toks.device))
+        n = torch.where(hit.any(1), hit.float().argmax(1) + 1, torch.full_like(hit[:, 0], toks.shape[1], dtype=torch.long))
+        return toks, n
+
     for rnd in range(start_round, rounds):
-        # 1. Generate with the current student. The decoder snapshots packed weights, so rebuild it each round.
+        # 1. Generate the chains. The student decoder snapshots packed weights, so it is rebuilt each round.
         t0 = time.perf_counter()
         stu.eval()
-        dec = VSARecurrentDecoder(stu, wrap_positions=False)
+        dec = VSARecurrentDecoder(stu, wrap_positions=False) if chain_source == "student" else None
         pool, lens = [], []
         while len(pool) < prompts_per_round:
             b = batches[cursor % len(batches)]
             cursor += 1
             torch.manual_seed(seed * 100_003 + cursor)
             x = torch.tensor(b, dtype=torch.long, device=device)
-            toks, n = dec.generate_batch(x, max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids)
+            if dec is not None:
+                toks, n = dec.generate_batch(x, max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids)
+            else:
+                toks, n = _teacher_generate(x)
             toks, n = toks.cpu(), n.cpu()
             for r in range(len(b)):
                 k = int(n[r])
@@ -1012,7 +1034,7 @@ def onpolicy_distill(
         del dec
         t_gen = time.perf_counter() - t0
 
-        # 2. Train on the student's own chains that ENDED (EOS): loss only on generated tokens (incl. EOS).
+        # 2. Train on the chains that ENDED (EOS): loss only on generated tokens (incl. EOS).
         # Capped chains are dropped: they never stop, and on looping text the teacher also predicts
         # "continue", so training on them teaches the student not to stop (R2 overshoot: median hit the cap).
         stu.train()

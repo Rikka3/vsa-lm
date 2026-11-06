@@ -170,6 +170,8 @@ def main(argv: list[str] | None = None):
     p_onp.add_argument("--freeze-mlp", action="store_true")
     p_onp.add_argument("--stop-capped-frac", type=float, default=0.5,
                        help="Stop when more than this fraction of probe chains hit the length cap")
+    p_onp.add_argument("--chain-source", choices=["student", "teacher"], default="student",
+                       help="Who writes the training chains: the student (on-policy) or the teacher (sequence-level KD)")
 
     sub.add_parser("test", help="Run the Triton kernel, gradient, decoder, and erasure parity suite")
 
@@ -218,7 +220,7 @@ def main(argv: list[str] | None = None):
             prompts_per_round=args.prompts_per_round, gen_bs=args.gen_bs, max_new=args.max_new,
             temperature=args.temperature, lr=args.lr, seqs_per_step=args.seqs_per_step,
             corpus_every=args.corpus_every, seed=args.seed, resume=args.resume, freeze_mlp=args.freeze_mlp,
-            stop_capped_frac=args.stop_capped_frac,
+            stop_capped_frac=args.stop_capped_frac, chain_source=args.chain_source,
         )
     elif args.cmd == "test":
         from .tests import run_all
