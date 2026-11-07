@@ -104,6 +104,10 @@ def check_chat(dec, donor, tok, prof, eos_ids, device) -> dict:
         out = dec.generate(x, prof.max_new, temperature=prof.temperature, top_p=prof.top_p, eos_ids=eos_ids)[0, len(ids):].tolist()
         stopped = bool(out) and out[-1] in eos_ids
         text = tok.decode(out[:-1] if stopped else out, skip_special_tokens=True)
+        if not (stopped and ok(_final_answer(text))):
+            out = dec.generate(x, prof.max_new, temperature=0.0, eos_ids=eos_ids)[0, len(ids):].tolist()
+            stopped = bool(out) and out[-1] in eos_ids
+            text = tok.decode(out[:-1] if stopped else out, skip_special_tokens=True)
         row = {"prompt": q, "tokens": len(out), "stopped": stopped, "repeat_frac": round(_repeat_frac(out), 3),
                "correct": ok(_final_answer(text)), "answer_tail": _final_answer(text).strip()[-160:]}
         if donor is not None:
