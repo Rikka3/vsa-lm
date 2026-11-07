@@ -1,6 +1,8 @@
 """O(1)-state recurrent decoder with StaticKV, enable_gqa=True SDPA, and fully fused Triton step."""
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -19,6 +21,57 @@ def _apply_cached_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) ->
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     return x * cos + torch.cat((-x2, x1), dim=-1) * sin
+
+
+def _rope_cos_sin(inv_freq64: torch.Tensor, pos: torch.Tensor, dt) -> tuple[torch.Tensor, torch.Tensor]:
+    """RoPE cos/sin for integer positions `pos` (device tensor, any shape) -> (..., HD). The angle is formed in
+    float64 and reduced mod 2*pi, so it stays exact at any position (an fp32 angle pos*freq loses its
+    fractional part once it passes 2^24, which positions beyond ~16M reach on the fastest frequency)."""
+    ang = torch.remainder(pos.to(torch.float64).unsqueeze(-1) * inv_freq64, 2.0 * math.pi)
+    emb = torch.cat((ang, ang), dim=-1)
+    return emb.cos().to(dt), emb.sin().to(dt)
+
+
+class StreamKV:
+    """Constant-size softmax KV cache for unbounded streams (StreamingLLM): the first `sinks` tokens plus a ring
+    buffer of the last `window` tokens. Keys are stored rotated at their true position; the sink keys are
+    re-rotated every step to sit just before the oldest window token, so every query-key distance stays below
+    sinks + window, inside what the donor was trained on, however long the stream runs. Until the window
+    fills this is exactly full attention. The counter lives on device, so a step has no host-side branching
+    (CUDA-graph safe)."""
+
+    def __init__(self, B: int, HKV: int, sinks: int, window: int, HD: int, dev, dt=torch.bfloat16):
+        self.S, self.W = sinks, window
+        self.k = torch.zeros(B, HKV, sinks + window, HD, device=dev, dtype=dt)
+        self.v = torch.zeros_like(self.k)
+        self.sink_k = torch.zeros(B, HKV, sinks, HD, device=dev, dtype=dt)  # sink keys at their true positions
+        self.n = torch.zeros(1, dtype=torch.long, device=dev)  # tokens seen so far
+        self.ar = torch.arange(sinks + window, device=dev)
+
+    def reset(self):
+        self.k.zero_()
+        self.v.zero_()
+        self.sink_k.zero_()
+        self.n.zero_()
+
+    def attend(self, q: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor, G: int, inv_freq64: torch.Tensor) -> torch.Tensor:
+        S, W, n = self.S, self.W, self.n
+        k_new, v_new = k_new.to(self.k.dtype), v_new.to(self.v.dtype)
+        slot = torch.where(n < S, n, S + (n - S).remainder(W))
+        self.k.index_copy_(2, slot, k_new)
+        self.v.index_copy_(2, slot, v_new)
+        s_idx = n.clamp(max=S - 1)
+        self.sink_k.index_copy_(2, s_idx, torch.where(n < S, k_new, self.sink_k.index_select(2, s_idx)))
+        n.add_(1)
+        # Tokens evicted so far: the sinks move up by that many positions (rotation by 0 is exact, so this is a
+        # no-op until the window is full).
+        cos, sin = _rope_cos_sin(inv_freq64, (n - S - W).clamp(min=0), torch.float32)
+        self.k[:, :, :S].copy_(_apply_cached_rope(self.sink_k.float(), cos.view(1, 1, 1, -1), sin.view(1, 1, 1, -1)))
+        B, HKV, T, HD = self.k.shape
+        qg = q.to(self.k.dtype).reshape(B, HKV, G, HD)
+        mask = (self.ar < n).view(1, 1, 1, T)
+        y = F.scaled_dot_product_attention(qg, self.k, self.v, attn_mask=mask)
+        return y.reshape(B, HKV * G, 1, HD).to(q.dtype)
 
 
 class StaticKV:
@@ -72,7 +125,7 @@ class _CUDAGraphStep:
 
     def __init__(self, dec: "VSARecurrentDecoder", B: int, Tmax: int, device):
         m = dec.model
-        self.states, self.kv = dec.blank_state(m, B, device, max_kv_len=Tmax, graph=True)
+        self.states, self.kv = dec.blank_state(m, B, device, max_kv_len=Tmax, graph=True, stream=dec.stream)
         self.tok = torch.zeros(B, 1, dtype=torch.long, device=device)
         self.pos = torch.zeros(1, dtype=torch.long, device=device)
         # Keep the packed decode tables this graph reads alive, even if a later decoder rebuilds them.
@@ -106,13 +159,30 @@ class _CUDAGraphStep:
 
 
 class VSARecurrentDecoder:
-    def __init__(self, model, wrap_positions: bool = False, max_cache_pos: int = 65536, use_cuda_graph: bool = True):
+    """Recurrent decoder. stream_window=W turns on infinite-context streaming: each softmax layer keeps only
+    `stream_sinks` sink tokens + the last W tokens (StreamKV), and each VSA layer's sliding-window sink is
+    kept within the training length, so decode RAM and speed are constant for any stream length. Text older
+    than W reaches the model only through the fixed-size VSA states. Until W tokens have been seen the
+    output is identical to exact decoding."""
+
+    def __init__(self, model, wrap_positions: bool = False, max_cache_pos: int = 65536, use_cuda_graph: bool = True,
+                 stream_window: int | None = None, stream_sinks: int = 4):
         self.model = model.eval()
         self.wrap_positions = wrap_positions
         self.max_T = model.config["max_T"]
         self.is_universal = hasattr(model, "embed_tokens")
         self.max_cache_pos = max_cache_pos
+        self.stream = (int(stream_sinks), int(stream_window)) if stream_window else None
+        self._step_rope = None
+        self._inv64, self._rope_tables = {}, {}
         self._prepare_fast_decode_tables(max_cache_pos)
+        if self.stream is not None:
+            if not self.is_universal or stream_sinks < 1:
+                raise ValueError("Streaming needs a UniversalVSALM checkpoint and stream_sinks >= 1")
+            for blk in self.model.blocks:
+                ly = blk.vsa if hasattr(blk, "vsa") else blk.attn
+                if not hasattr(ly, "_rope_key") or getattr(ly, "packed_q_gate", False):
+                    raise ValueError(f"Streaming needs full RoPE on every layer ({type(ly).__name__} has none/partial)")
         self.use_cuda_graph = use_cuda_graph and self._graph_supported()
         self._graphs: dict = {}
 
@@ -132,11 +202,17 @@ class VSARecurrentDecoder:
         captures are kept, since each owns a full KV buffer."""
         if not self.use_cuda_graph or device.type != "cuda":
             return None
-        Tmax = -(-need_len // 1024) * 1024
-        # Masked SDPA over a fixed buffer does not split the KV length across blocks, so past ~8k keys it is
-        # slower than eager flash (split-KV) decoding: 30.7 vs 55.7 tok/s at 65k. Long contexts stay eager.
-        if Tmax > min(self.max_cache_pos, 8192):
-            return None
+        if self.stream is not None:
+            # Streaming caches have a fixed size whatever the length, so one capture serves every length.
+            Tmax = 0
+            if self.stream[1] > 8192:  # same masked-SDPA limit as below
+                return None
+        else:
+            Tmax = -(-need_len // 1024) * 1024
+            # Masked SDPA over a fixed buffer does not split the KV length across blocks, so past ~8k keys it is
+            # slower than eager flash (split-KV) decoding: 30.7 vs 55.7 tok/s at 65k. Long contexts stay eager.
+            if Tmax > min(self.max_cache_pos, 8192):
+                return None
         key = (B, Tmax)
         runner = self._graphs.pop(key, None)
         if runner is None:
@@ -180,16 +256,23 @@ class VSARecurrentDecoder:
         self.model.lm_head.weight.data = self.model.lm_head.weight.data.to(dt)
         t = torch.arange(max_pos, device=device, dtype=torch.float32)
 
-        rope_cache = {}
+        # Layers share a table when their frequencies are equal (every layer has its own inv_freq buffer, so
+        # keying by buffer identity built one 33 MB table per layer, ~0.9 GB for 28 layers).
+        rope_cache = self._rope_tables = {}
+        self._inv64 = {}
         for blk in self.model.blocks:
             ly = blk.vsa if hasattr(blk, "vsa") else blk.attn
             if hasattr(ly, "rope") and hasattr(ly.rope, "inv_freq"):
-                key = (ly.HD, id(ly.rope.inv_freq))
+                inv = ly.rope.inv_freq.to(device)
+                key = (ly.HD, tuple(inv.tolist()))
                 if key not in rope_cache:
-                    freqs = torch.outer(t, ly.rope.inv_freq.to(device))
+                    freqs = torch.outer(t, inv)
                     emb = torch.cat((freqs, freqs), dim=-1)
                     rope_cache[key] = (emb.cos().to(dt), emb.sin().to(dt))
                 ly._rope_cos, ly._rope_sin = rope_cache[key]
+                if 2 * inv.numel() == ly.HD:  # full rotary: exact float64 angles available past the table
+                    self._inv64[key] = inv.double()
+                    ly._rope_key = key
 
             if hasattr(blk, "vsa"):
                 H, HKV, HD, G = ly.H, ly.HKV, ly.HD, ly.G
@@ -261,6 +344,8 @@ class VSARecurrentDecoder:
 
     @staticmethod
     def state_bytes(model):
+        """(fixed bytes, bytes per context token) of an exact decode state. Streaming with sinks S and window W
+        stores at most S + W tokens: total = fixed + (S + W) * per_token, whatever the length."""
         vsa_bytes, kv_per_token = 0, 0
         for blk in model.blocks:
             if hasattr(blk, "vsa"):
@@ -275,8 +360,10 @@ class VSARecurrentDecoder:
         return vsa_bytes, kv_per_token
 
     @staticmethod
-    def blank_state(model, batch_size: int, device, max_kv_len: int = 4096, state_dtype=torch.float32, graph: bool = False):
-        """Per-layer decode state. graph=True gives softmax layers a fixed-capacity GraphKV (CUDA-graph safe)."""
+    def blank_state(model, batch_size: int, device, max_kv_len: int = 4096, state_dtype=torch.float32, graph: bool = False,
+                    stream: tuple[int, int] | None = None):
+        """Per-layer decode state. graph=True gives softmax layers a fixed-capacity GraphKV (CUDA-graph safe);
+        stream=(sinks, window) gives them a constant-size StreamKV instead (decoder.stream)."""
         states, kv_caches = [None] * len(model.blocks), [None] * len(model.blocks)
         dt = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
         for li, blk in enumerate(model.blocks):
@@ -294,12 +381,17 @@ class VSARecurrentDecoder:
                     # Tokens seen so far, kept on device so a step has no host-side branching (CUDA-graph safe).
                     cache["swa_n"] = torch.zeros(1, dtype=torch.long, device=device)
                     cache["swa_ar"] = torch.arange(W + 1, device=device)
+                    if stream is not None:  # the sink key at its true position, re-rotated each step
+                        cache["swa_k0"] = torch.zeros(batch_size, v.HKV, 1, v.HD, device=device, dtype=dt)
                 kv_caches[li] = cache or None
             else:
                 s = blk.attn if hasattr(blk, "attn") else blk.softmax_attn
                 hk = getattr(s, "HKV", s.H)
-                kv_cls = GraphKV if graph else StaticKV
-                kv_caches[li] = kv_cls(batch_size, hk, max_kv_len, s.HD, device, dt=dt)
+                if stream is not None:
+                    kv_caches[li] = StreamKV(batch_size, hk, stream[0], stream[1], s.HD, device, dt=dt)
+                else:
+                    kv_cls = GraphKV if graph else StaticKV
+                    kv_caches[li] = kv_cls(batch_size, hk, max_kv_len, s.HD, device, dt=dt)
         return states, kv_caches
 
     @staticmethod
@@ -316,6 +408,8 @@ class VSARecurrentDecoder:
             elif isinstance(c, GraphKV):
                 c.k.zero_()
                 c.v.zero_()
+            elif isinstance(c, StreamKV):
+                c.reset()
             elif isinstance(c, StaticKV):
                 c.n = 0
 
@@ -348,10 +442,13 @@ class VSARecurrentDecoder:
         return topi.gather(-1, torch.multinomial(F.softmax(topv, -1), 1))
 
     @staticmethod
-    def _window_attn_step(cache: dict, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, W: int, G: int) -> torch.Tensor:
+    def _window_attn_step(cache: dict, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, W: int, G: int,
+                          sink_cap: int | None = None, inv_freq64: torch.Tensor | None = None) -> torch.Tensor:
         """Zero-copy 65-token sliding-window + sink attention (slot 0 = sink, slots 1..W = ring buffer).
         The token counter lives on device and unfilled slots are masked, so there are no data-dependent
-        shapes or host syncs (CUDA-graph safe)."""
+        shapes or host syncs (CUDA-graph safe).
+        Streaming (sink_cap set): the sink key is moved up so the query-sink distance never exceeds sink_cap
+        (the training length); exact (no-op) while fewer than sink_cap tokens have been seen."""
         n = cache["swa_n"]
         if not torch.is_tensor(n):  # states saved before the counter moved to device
             n = cache["swa_n"] = torch.tensor([int(n)], dtype=torch.long, device=k.device)
@@ -359,7 +456,13 @@ class VSARecurrentDecoder:
         slot = ((n - 1).remainder(W) + 1) * (n != 0)  # token 0 -> sink slot 0, token p>=1 -> 1 + (p-1) % W
         cache["swa_k"].index_copy_(2, slot, k.to(cache["swa_k"].dtype))
         cache["swa_v"].index_copy_(2, slot, v.to(cache["swa_v"].dtype))
+        if sink_cap is not None:
+            k0 = cache["swa_k0"]
+            k0.copy_(torch.where(n == 0, k.to(k0.dtype), k0))
         n.add_(1)
+        if sink_cap is not None:
+            cos, sin = _rope_cos_sin(inv_freq64, (n - sink_cap).clamp(min=0), torch.float32)
+            cache["swa_k"][:, :, :1].copy_(_apply_cached_rope(k0.float(), cos.view(1, 1, 1, -1), sin.view(1, 1, 1, -1)))
         valid = cache["swa_ar"] < n  # slots 0..min(n, W+1)-1 hold real tokens
         pk, pv = cache["swa_k"], cache["swa_v"]
         # For m <= 65, direct GQA broadcast matmul is 2.5x faster than SDPA dispatcher overhead!
@@ -373,6 +476,34 @@ class VSARecurrentDecoder:
             probs = F.softmax(scores.masked_fill(~valid, float("-inf")), dim=-1)
             out = torch.matmul(probs, pv.float().unsqueeze(2)).view(B, HKV * G, 1, HD)
         return out.to(q.dtype)
+
+    def _step_rope_for(self, pos, device) -> dict:
+        """Streaming: this step's cos/sin per frequency set, from the table while pos is inside it (so streaming
+        matches exact decoding there) and from exact float64 angles past it. pos may be a device tensor (graph)."""
+        p = pos if torch.is_tensor(pos) else torch.tensor([pos], device=device)
+        out = {}
+        for key, inv in self._inv64.items():
+            cos_t, sin_t = self._rope_tables[key]
+            L = cos_t.shape[0]
+            c64, s64 = _rope_cos_sin(inv, p, cos_t.dtype)
+            inside = (p < L).view(-1, 1)
+            idx = p.clamp(max=L - 1)
+            out[key] = (torch.where(inside, cos_t[idx], c64), torch.where(inside, sin_t[idx], s64))
+        return out
+
+    def _rope_qk(self, ly, q: torch.Tensor, k: torch.Tensor, pos):
+        """RoPE for one decode position. pos is an int (eager) or a 1-element device tensor (CUDA graph)."""
+        key = getattr(ly, "_rope_key", None)
+        if key is None:  # no / partial rotary: the layer's own rope
+            return ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
+        if self._step_rope is not None:
+            cos, sin = self._step_rope[key]
+        elif torch.is_tensor(pos) or pos < ly._rope_cos.shape[0]:
+            cos, sin = ly._rope_cos[pos], ly._rope_sin[pos]
+        else:  # past the table: exact float64 angles (the fp32 rope loses precision at large positions)
+            cos, sin = _rope_cos_sin(self._inv64[key], torch.tensor([pos], device=q.device), ly._rope_cos.dtype)
+        cos, sin = cos.view(1, 1, 1, -1), sin.view(1, 1, 1, -1)
+        return _apply_cached_rope(q, cos, sin), _apply_cached_rope(k, cos, sin)
 
     def _step_universal_block(self, li: int, blk, x: torch.Tensor, pos: int, states, kv_caches, record=None, write_scale: float = 1.0):
         B = x.shape[0]
@@ -399,20 +530,17 @@ class VSARecurrentDecoder:
                 vx = repeat_kv(v, G)
                 v_raw = v
 
-            # pos is an int (eager) or a 1-element device tensor (CUDA graph: always inside the rope table).
-            if hasattr(ly, "_rope_cos") and (torch.is_tensor(pos) or pos < ly._rope_cos.shape[0]):
-                cos = ly._rope_cos[pos].view(1, 1, 1, HD)
-                sin = ly._rope_sin[pos].view(1, 1, 1, HD)
-                q = _apply_cached_rope(q, cos, sin)
-                k = _apply_cached_rope(k, cos, sin)
-            else:
-                q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
+            q, k = self._rope_qk(ly, q, k, pos)
 
             y_swa = None
             if getattr(ly, "swa_window", 0) > 0:
                 if v_raw is None:
                     v_raw = ly.v_proj(h).view(B, 1, HKV, HD).transpose(1, 2)
-                y_swa = self._window_attn_step(kv_caches[li], q, k, v_raw, ly.swa_window, G)
+                if self.stream is not None:
+                    y_swa = self._window_attn_step(kv_caches[li], q, k, v_raw, ly.swa_window, G,
+                                                   sink_cap=self.max_T, inv_freq64=self._inv64[ly._rope_key])
+                else:
+                    y_swa = self._window_attn_step(kv_caches[li], q, k, v_raw, ly.swa_window, G)
 
             kx = repeat_kv(k, G)
             if hasattr(ly, "_km_dt"):
@@ -465,20 +593,16 @@ class VSARecurrentDecoder:
                 k = k.view(B, 1, HKV, HD).transpose(1, 2)
                 v = v.view(B, 1, HKV, HD).transpose(1, 2)
                 gate = None
-                if hasattr(ly, "_rope_cos") and (torch.is_tensor(pos) or pos < ly._rope_cos.shape[0]):
-                    cos = ly._rope_cos[pos].view(1, 1, 1, HD)
-                    sin = ly._rope_sin[pos].view(1, 1, 1, HD)
-                    q = _apply_cached_rope(q, cos, sin)
-                    k = _apply_cached_rope(k, cos, sin)
-                else:
-                    q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
+                q, k = self._rope_qk(ly, q, k, pos)
             else:
                 q, k, v = ly.head_qkv(h)
                 gate = None
-                q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
+                q, k = self._rope_qk(ly, q, k, pos)
 
             cache_obj = kv_caches[li]
-            if isinstance(cache_obj, GraphKV):
+            if isinstance(cache_obj, StreamKV):
+                y = cache_obj.attend(q, k, v, ly.G, self._inv64[ly._rope_key])
+            elif isinstance(cache_obj, GraphKV):
                 y = cache_obj.attend(q, k, v, pos, ly.G)
             else:
                 if isinstance(cache_obj, StaticKV):
@@ -507,7 +631,8 @@ class VSARecurrentDecoder:
         m = self.model
         B, T = ids.shape
         if states is None or kv_caches is None:
-            states, kv_caches = self.blank_state(m, B, ids.device, max_kv_len=max(max_kv_len or 4096, start_pos + T + 1024))
+            states, kv_caches = self.blank_state(m, B, ids.device, max_kv_len=max(max_kv_len or 4096, start_pos + T + 1024),
+                                                 stream=self.stream)
         if self.is_universal:
             hidden = None
             pos = start_pos
@@ -548,6 +673,7 @@ class VSARecurrentDecoder:
             # cache_enabled=False: required inside CUDA-graph capture, and a no-op cost here since the
             # autocast cache never outlived a single step anyway.
             with torch.autocast("cuda", torch.bfloat16, enabled=token.is_cuda, cache_enabled=False):
+                self._step_rope = self._step_rope_for(pos, token.device) if self.stream is not None else None
                 x = m.embed_tokens(token)
                 for li, blk in enumerate(m.blocks):
                     x = self._step_universal_block(li, blk, x, pos, states, kv_caches, record=record, write_scale=write_scale)

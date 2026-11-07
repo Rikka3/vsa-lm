@@ -78,7 +78,10 @@ def load_model_for_serving(ckpt_path: str, donor_tokenizer: str | None = None, q
 
 @torch.no_grad()
 def generate_completion(model, tokenizer, device, messages: list[dict], max_tokens: int = 1024,
-                        temperature: float = 0.0, repetition_penalty: float = 1.0) -> str:
+                        temperature: float = 0.0, repetition_penalty: float = 1.0,
+                        decoder: VSARecurrentDecoder | None = None) -> str:
+    """One chat completion. Pass a long-lived `decoder` to reuse its tables and CUDA graph across requests
+    (and to choose streaming: VSARecurrentDecoder(model, stream_window=W))."""
     try:
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:
@@ -89,7 +92,8 @@ def generate_completion(model, tokenizer, device, messages: list[dict], max_toke
     eos_ids = get_all_eos_ids(tokenizer)
 
     # D1 Fix: Use stateful VSARecurrentDecoder so context never drops out at 1,024 tokens!
-    decoder = VSARecurrentDecoder(model, wrap_positions=False)
+    if decoder is None:
+        decoder = VSARecurrentDecoder(model, wrap_positions=False)
     prompt_tensor = torch.tensor([ids], dtype=torch.long, device=device)
     out_tensor = decoder.generate(
         prompt_tensor,
@@ -103,8 +107,11 @@ def generate_completion(model, tokenizer, device, messages: list[dict], max_toke
     return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
 
-def run_server(ckpt_path: str, donor_tokenizer: str | None = None, host: str = "0.0.0.0", port: int = 8000, quantize_cpu: bool = False):
+def run_server(ckpt_path: str, donor_tokenizer: str | None = None, host: str = "0.0.0.0", port: int = 8000, quantize_cpu: bool = False,
+               stream_window: int | None = None):
+    """stream_window=W: infinite-context mode (constant RAM per request at any prompt length; see decode.StreamKV)."""
     model, tokenizer, device = load_model_for_serving(ckpt_path, donor_tokenizer, quantize_cpu=quantize_cpu)
+    decoder = VSARecurrentDecoder(model, wrap_positions=False, stream_window=stream_window)
 
     class OpenAIHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -129,7 +136,7 @@ def run_server(ckpt_path: str, donor_tokenizer: str | None = None, host: str = "
 
             reply = generate_completion(
                 model, tokenizer, device, messages,
-                max_tokens=max_tokens, temperature=temperature, repetition_penalty=rep_pen,
+                max_tokens=max_tokens, temperature=temperature, repetition_penalty=rep_pen, decoder=decoder,
             )
             resp = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:10]}",

@@ -123,6 +123,44 @@ print(res["cartridge"], "->", res["answer"], "| Erase residual:", res["erase_res
 bank.forget_from_disk("orion")
 ```
 
+### Streaming: constant RAM at any context length
+
+By default the softmax layers (25%) keep a full KV cache, so memory still grows with context. With `stream_window=W`, each softmax layer keeps 4 attention-sink tokens plus the last `W` tokens (StreamingLLM). RoPE distances stay inside the donor's trained range, and decode RAM and speed stay constant however long the stream runs. Output is identical to exact decoding until `W` tokens have been seen. Text older than the window reaches the model only through the fixed-size VSA states. `hubcheck` measures how much survives (passkey recall by depth).
+
+```python
+from vsa_lm.decode import VSARecurrentDecoder
+dec = VSARecurrentDecoder(model, stream_window=8192)
+out = dec.generate(prompt_ids, max_new_tokens=512, temperature=0.6, eos_ids=eos_ids)
+```
+
+```bash
+python -m vsa_lm serve --ckpt ... --donor ... --stream-window 8192
+```
+
+---
+
+## Checking a Checkpoint Before Publishing (`hubcheck`)
+
+One command checks everything a Hugging Face user relies on. It prints a pass/fail table and writes a JSON report.
+
+```bash
+python -m vsa_lm hubcheck --ckpt vsa_deepseek_r1_qwen_1.5b.pth --out hubcheck.json
+```
+
+| Check | What it verifies |
+|---|---|
+| `load` | checkpoint, tokenizer, chat template, stop tokens, donor profile, state size |
+| `chat` | replies through the profile's template and sampling stop at EOS, do not loop, and are correct |
+| `decode_parity` | recurrent decoder (eager and CUDA graph) matches the parallel forward |
+| `batch` | batched greedy generation matches single-sequence generation |
+| `stream_parity` | streaming matches exact decoding until the window fills |
+| `passkey` | needle recall by length and depth, exact vs streaming (beyond-window recall is reported, never failed) |
+| `stream_ppl` | perplexity over a long stream, flat memory once the window is full, cost of eviction vs exact |
+| `memory_bank` | `.vsa` cartridges: memorize, route, answer, erase |
+| `server` | the OpenAI-style completion path in streaming mode |
+
+Donor-specific settings (prompt template, sampling, Stage-3 prompts, healing data mix) come from a **profile**: `reasoning` (`<think>` in the chat template), `chat` (another chat template) or `base` (no template). The profile is detected from the donor tokenizer, and `--profile` overrides it on `heal`, `onpolicy`, `diagnose` and `hubcheck`.
+
 ---
 
 ## 4. Connecting to Coding Agents (`opencode`, `Aider`, `Continue.dev`, `Cline`) & Running on CPU-Only Laptops
@@ -156,6 +194,8 @@ opencode --model openai/vsa-lm
 * `vsa_lm/converter.py` & `vsa_lm/surgery.py` — Universal donor converter (`UniversalVSALM`) and Low-VRAM `VSA-FastDistill` healer supporting Llama, Qwen, DeepSeek-Distill, Mistral, and SmolLM.
 * `vsa_lm/thinking.py` — `OpenMythosEngine` and `LatentThinkController` for zero-KV-growth latent reasoning inside VSA states.
 * `vsa_lm/memory_bank.py` — `VSAMemoryBank` for disk-backed `.vsa` infinite context cartridges.
+* `vsa_lm/hubcheck.py` — pass/fail readiness check for Hub users, including infinite-context streaming.
+* `vsa_lm/config/profiles.py` — donor profiles (`reasoning`, `chat`, `base`): sampling, prompts, healing data mix.
 * `vsa_lm/server.py` — OpenAI-compatible `/v1/chat/completions` server with CPU Dynamic INT8 quantization for coding agents (`opencode`, `aider`).
 * `vsa_lm/train.py` & `vsa_lm/tests.py` — Hardware-auto-fitting scratch trainer and 8-gate parity test suite.
 

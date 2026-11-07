@@ -48,6 +48,7 @@ def _run_fast_heal(heal_args: list[str]):
         p.add_argument("--swa-window", type=int, default=None, help="VSA sliding-window softmax size (default: checkpoint value, else 64; 0 = off)")
         p.add_argument("--stage1-onpolicy", action="store_true", help="Stage-1: after the first 25%% of steps, train each VSA layer on the student's own hidden states (teacher attention as target)")
         p.add_argument("--freeze-mlp", action="store_true", help="Train only the VSA attention params in Stage-2 (MLPs/norms stay the teacher's); faster, less VRAM")
+        p.add_argument("--profile", choices=["reasoning", "chat", "base"], default=None, help="Donor profile for the healing data mix (default: detected from the tokenizer)")
         args, _ = p.parse_known_args(heal_args)
         from .converter import heal_universal_model
         heal_universal_model(
@@ -71,6 +72,7 @@ def _run_fast_heal(heal_args: list[str]):
             swa_window=args.swa_window,
             freeze_mlp=args.freeze_mlp,
             stage1_onpolicy=args.stage1_onpolicy,
+            profile=args.profile,
         )
         return
 
@@ -131,6 +133,7 @@ def main(argv: list[str] | None = None):
     p_serve.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     p_serve.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
     p_serve.add_argument("--no-quantize", action="store_true", help="Disable dynamic INT8 quantization on CPU")
+    p_serve.add_argument("--stream-window", type=int, default=None, help="Infinite-context streaming: softmax layers keep 4 sinks + the last N tokens (constant RAM)")
 
     p_scan = sub.add_parser("scan", help="Run static capacity & horizon diagnostics on a checkpoint")
     p_scan.add_argument("--ckpt", required=True, help="Path to .pth checkpoint")
@@ -147,10 +150,11 @@ def main(argv: list[str] | None = None):
     p_diag.add_argument("--ckpt", required=True, help="Path to VSA-LM .pth checkpoint")
     p_diag.add_argument("--donor", default=None, help="Optional HF donor repo ID")
     p_diag.add_argument("--n-prompts", type=int, default=16, help="GSM8K test prompts for the drift probe")
-    p_diag.add_argument("--max-new", type=int, default=2048)
+    p_diag.add_argument("--max-new", type=int, default=None, help="Default: the donor profile's")
     p_diag.add_argument("--parity-T", type=int, default=3072, help="Sequence length for the decode-parity check")
     p_diag.add_argument("--out", default=None, help="Output JSON path")
     p_diag.add_argument("--parity-only", action="store_true", help="Only run the decode + per-layer parity checks (minutes)")
+    p_diag.add_argument("--profile", choices=["reasoning", "chat", "base"], default=None)
 
     p_onp = sub.add_parser("onpolicy", help="Stage-3: distill on the student's own reasoning chains (teacher-scored)")
     p_onp.add_argument("--ckpt", required=True, help="Healed checkpoint to start from")
@@ -160,8 +164,8 @@ def main(argv: list[str] | None = None):
     p_onp.add_argument("--rounds", type=int, default=10)
     p_onp.add_argument("--prompts-per-round", type=int, default=256)
     p_onp.add_argument("--gen-bs", type=int, default=16)
-    p_onp.add_argument("--max-new", type=int, default=3072)
-    p_onp.add_argument("--temperature", type=float, default=0.6)
+    p_onp.add_argument("--max-new", type=int, default=None, help="Default: the donor profile's (reasoning: 2048)")
+    p_onp.add_argument("--temperature", type=float, default=None, help="Default: the donor profile's")
     p_onp.add_argument("--lr", type=float, default=5e-5)
     p_onp.add_argument("--seqs-per-step", type=int, default=8)
     p_onp.add_argument("--corpus-every", type=int, default=4, help="Every Nth micro-batch is a corpus window (0 = never)")
@@ -172,6 +176,18 @@ def main(argv: list[str] | None = None):
                        help="Stop when more than this fraction of probe chains hit the length cap")
     p_onp.add_argument("--chain-source", choices=["student", "teacher"], default="student",
                        help="Who writes the training chains: the student (on-policy) or the teacher (sequence-level KD)")
+    p_onp.add_argument("--profile", choices=["reasoning", "chat", "base"], default=None, help="Donor profile (default: detected from the tokenizer)")
+
+    p_hub = sub.add_parser("hubcheck", help="Pass/fail check of everything a Hub user relies on, incl. infinite-context streaming")
+    p_hub.add_argument("--ckpt", required=True, help="Path to VSA-LM .pth checkpoint")
+    p_hub.add_argument("--donor", default=None)
+    p_hub.add_argument("--profile", choices=["reasoning", "chat", "base"], default=None)
+    p_hub.add_argument("--stream-window", type=int, default=8192)
+    p_hub.add_argument("--stream-sinks", type=int, default=4)
+    p_hub.add_argument("--passkey-lengths", default="4096,16384,32768", help="Comma-separated context lengths")
+    p_hub.add_argument("--ppl-tokens", type=int, default=32768, help="Length of the long-stream perplexity run")
+    p_hub.add_argument("--skip", default="", help="Comma-separated checks to skip (e.g. passkey,stream_ppl)")
+    p_hub.add_argument("--out", default=None, help="Output JSON path")
 
     sub.add_parser("test", help="Run the Triton kernel, gradient, decoder, and erasure parity suite")
 
@@ -195,6 +211,7 @@ def main(argv: list[str] | None = None):
             host=args.host,
             port=args.port,
             quantize_cpu=not args.no_quantize,
+            stream_window=args.stream_window,
         )
     elif args.cmd == "scan":
         from .surgery import scan_checkpoint
@@ -212,7 +229,7 @@ def main(argv: list[str] | None = None):
     elif args.cmd == "diagnose":
         from .diagnose import run_diagnostics
         run_diagnostics(args.ckpt, donor_id=args.donor, n_prompts=args.n_prompts, max_new=args.max_new,
-                        parity_T=args.parity_T, out_json=args.out, parity_only=args.parity_only)
+                        parity_T=args.parity_T, out_json=args.out, parity_only=args.parity_only, profile=args.profile)
     elif args.cmd == "onpolicy":
         from .converter import onpolicy_distill
         onpolicy_distill(
@@ -220,7 +237,14 @@ def main(argv: list[str] | None = None):
             prompts_per_round=args.prompts_per_round, gen_bs=args.gen_bs, max_new=args.max_new,
             temperature=args.temperature, lr=args.lr, seqs_per_step=args.seqs_per_step,
             corpus_every=args.corpus_every, seed=args.seed, resume=args.resume, freeze_mlp=args.freeze_mlp,
-            stop_capped_frac=args.stop_capped_frac, chain_source=args.chain_source,
+            stop_capped_frac=args.stop_capped_frac, chain_source=args.chain_source, profile=args.profile,
+        )
+    elif args.cmd == "hubcheck":
+        from .hubcheck import run_hubcheck
+        run_hubcheck(
+            args.ckpt, donor_id=args.donor, profile=args.profile, stream_window=args.stream_window,
+            stream_sinks=args.stream_sinks, passkey_lengths=tuple(int(x) for x in args.passkey_lengths.split(",") if x),
+            ppl_tokens=args.ppl_tokens, skip=tuple(x for x in args.skip.split(",") if x), out_json=args.out,
         )
     elif args.cmd == "test":
         from .tests import run_all
