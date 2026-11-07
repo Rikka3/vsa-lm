@@ -230,11 +230,15 @@ def _print_rows(title: str, rows: list[dict], key: str = "mean"):
         print(f"    pos {r['pos']:>10}  {key}={r[key]}" + (f"  (n={r['n']})" if "n" in r else ""))
 
 
-def run_diagnostics(ckpt_path: str, donor_id: str | None = None, n_prompts: int = 16, max_new: int = 2048,
+def run_diagnostics(ckpt_path: str, donor_id: str | None = None, n_prompts: int = 16, max_new: int | None = None,
                     parity_T: int = 3072, out_json: str | None = None, parity_only: bool = False,
-                    skip_parity: bool = False) -> dict:
+                    skip_parity: bool = False, profile: str | None = None) -> dict:
+    """max_new and the drift probes' sampling default to the donor profile's (reasoning: 2048, 0.6, 0.95)."""
+    from .config.profiles import resolve_profile
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     stu, cfg, tok, donor_id, donor_dir, step, _ = _load_student(ckpt_path, donor_id, device)
+    prof = resolve_profile(tok, profile, donor_dir)
+    max_new = prof.max_new if max_new is None else max_new
     res = {"checkpoint": ckpt_path, "step": step}
 
     print("=" * 84)
@@ -264,8 +268,10 @@ def run_diagnostics(ckpt_path: str, donor_id: str | None = None, n_prompts: int 
     s_fn, t_fn = vsa_logits_fn(stu), hf_logits_fn(teacher)
     prompts = [gsm8k_prompt(tok, r["question"]) for r in _load_rows("openai/gsm8k", "main", "test", n_prompts)]
 
-    res["teacher_forced"] = teacher_forced_drift(teacher, s_fn, t_fn, tok, device, prompts, max_new=max_new)
-    res["free_run"] = student_drift(stu, s_fn, t_fn, tok, device, prompts, max_new=max_new)
+    res["teacher_forced"] = teacher_forced_drift(teacher, s_fn, t_fn, tok, device, prompts, max_new=max_new,
+                                                 temperature=prof.temperature, top_p=prof.top_p)
+    res["free_run"] = student_drift(stu, s_fn, t_fn, tok, device, prompts, max_new=max_new,
+                                    temperature=prof.temperature, top_p=prof.top_p)
 
     print(f"  [2] Teacher-forced: student reads the teacher's reasoning (median len {res['teacher_forced']['median_len']})")
     _print_rows("KL(teacher||student) by position", res["teacher_forced"]["kl"])

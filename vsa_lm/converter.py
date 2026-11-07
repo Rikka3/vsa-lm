@@ -179,19 +179,25 @@ def _format_conversation_donor_native(tok, msgs: list[dict]) -> str:
     return "\n".join(parts) if parts else "\n".join(f"{x['role']}: {x['content']}" for x in norm_m)
 
 
-def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str, target_tokens: int, max_T: int = 2048):
-    """P3 Fix: Mixes 40% Math/CoT (Bespoke-Stratos), 30% Code (Evol-Instruct-Code / Magicoder),
-    and 30% Chat/Web (UltraChat + FineWeb-Edu) so VSA layers heal on Python code & long math chains!
-    Strictly disjoint from evaluation benchmarks (GSM8K test, HumanEval, MBPP test, MMLU, HellaSwag).
+def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str, target_tokens: int, max_T: int = 2048,
+                                      profile: str | None = None):
+    """Mixes Math/CoT (Bespoke-Stratos), Code (Magicoder / Evol-Instruct-Code) and Chat (UltraChat) in the
+    donor profile's proportions (reasoning: 40/35/25). Strictly disjoint from evaluation benchmarks
+    (GSM8K test, HumanEval, MBPP test, MMLU, HellaSwag).
     """
     import pyarrow.parquet as pq
     from datasets import load_dataset
     from huggingface_hub import HfApi, hf_hub_download
     from transformers import AutoTokenizer
+    from .config.profiles import resolve_profile
 
+    tok = AutoTokenizer.from_pretrained(donor_dir)
+    prof = resolve_profile(tok, profile, donor_dir)
     safe_tag = donor_repo.split("/")[-1].lower().replace("-", "_").replace(".", "_")
-    train_cache = os.path.join(work, f"{safe_tag}_v12_code_math_train.pt")
-    eval_cache = os.path.join(work, f"{safe_tag}_v12_code_math_eval.pt")
+    # Reasoning keeps the original cache names, so existing caches stay valid.
+    mix_tag = "" if prof.name == "reasoning" else f"_{prof.name}"
+    train_cache = os.path.join(work, f"{safe_tag}_v12_code_math{mix_tag}_train.pt")
+    eval_cache = os.path.join(work, f"{safe_tag}_v12_code_math{mix_tag}_eval.pt")
 
     if os.path.isfile(train_cache) and os.path.isfile(eval_cache):
         tr_t = torch.load(train_cache, weights_only=True)
@@ -200,7 +206,6 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
             print(f"[vsa-data] Loaded v12 Code+Math+Chat cache ({len(tr_t)/1e6:.1f}M) & eval cache ({len(ev_t)/1e6:.2f}M)")
             return tr_t, ev_t
 
-    tok = AutoTokenizer.from_pretrained(donor_dir)
     eos_id = tok.eos_token_id if isinstance(tok.eos_token_id, int) else (tok.eos_token_id[0] if tok.eos_token_id else 0)
     bos_id = tok.bos_token_id if isinstance(tok.bos_token_id, int) else eos_id
     api = HfApi()
@@ -270,8 +275,8 @@ def _build_reasoning_and_eval_caches(work: str, donor_dir: str, donor_repo: str,
         torch.frombuffer(ev_chat_buf, dtype=torch.int32).clone(),
     ])
 
-    cot_budget = int(target_tokens * 0.40)
-    code_budget = int(target_tokens * 0.35)
+    cot_budget = int(target_tokens * prof.mix_cot)
+    code_budget = int(target_tokens * prof.mix_code)
     chat_budget = max(0, target_tokens - cot_budget - code_budget)
 
     tr_cot_buf, n_tr_cot = _tokenize_docs(cot_docs[eval_cot_cut:], cot_budget)
@@ -722,6 +727,7 @@ def heal_universal_model(
     swa_window: int | None = None,
     freeze_mlp: bool = False,
     stage1_onpolicy: bool = False,
+    profile: str | None = None,
 ):
     _purge_zombie_vram()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -757,7 +763,7 @@ def heal_universal_model(
 
     donor, is_hf_donor, w_lm_t, donor_dir = _load_tied_teacher(donor_repo, stu_cfg, stu, device)
     train_tokens, eval_tokens = _build_reasoning_and_eval_caches(
-        work, donor_dir, donor_repo, max(data_tokens, int(tokens_budget * 1.05)), max_T=T
+        work, donor_dir, donor_repo, max(data_tokens, int(tokens_budget * 1.05)), max_T=T, profile=profile
     )
 
     if start_step == 0 and stage1_tokens > 0:
@@ -865,12 +871,14 @@ def heal_universal_model(
         reattach_visual_tower(out_ckpt, vis_sidecar)
 
 
-def _onpolicy_prompt_batches(tok, gen_bs: int, seed: int, max_prompt_tokens: int = 512) -> list[list[list[int]]]:
-    """Reasoning prompts in the benchmark's exact chat template: GSM8K *train* (disjoint from the scored test
-    split) + Bespoke-Stratos user turns (the Stage-2 CoT source). Grouped into batches of identical token
-    length so batched generation can share one position counter; tiny length groups are dropped."""
+def _onpolicy_prompt_batches(tok, prof, gen_bs: int, seed: int, max_prompt_tokens: int = 512) -> list[list[list[int]]]:
+    """Stage-3 prompts: GSM8K *train* in the benchmark's exact prompt (disjoint from the scored test split),
+    plus the profile's extra source (reasoning: Bespoke-Stratos user turns, the Stage-2 CoT source; chat:
+    UltraChat user turns). Grouped into batches of identical token length so batched generation can share
+    one position counter; tiny length groups are dropped."""
     from datasets import load_dataset
     from .benchmark import gsm8k_prompt
+    from .config.profiles import format_user_prompt
 
     texts = []
     try:
@@ -878,16 +886,23 @@ def _onpolicy_prompt_batches(tok, gen_bs: int, seed: int, max_prompt_tokens: int
     except Exception as e:
         print(f"  [Stage-3] GSM8K train prompts skipped: {e}", flush=True)
     try:
-        for row in load_dataset("bespokelabs/Bespoke-Stratos-17k", split="train"):
-            msgs = row.get("conversations") or row.get("messages") or []
-            user = next((str(m.get("value", m.get("content", ""))) for m in msgs
-                         if str(m.get("from", m.get("role", ""))).lower() in ("user", "human")), "")
-            if user.strip():
-                texts.append(tok.apply_chat_template([{"role": "user", "content": user.strip()}], tokenize=False, add_generation_prompt=True))
+        if prof.stage3_extra == "stratos":
+            for row in load_dataset("bespokelabs/Bespoke-Stratos-17k", split="train"):
+                msgs = row.get("conversations") or row.get("messages") or []
+                user = next((str(m.get("value", m.get("content", ""))) for m in msgs
+                             if str(m.get("from", m.get("role", ""))).lower() in ("user", "human")), "")
+                if user.strip():
+                    texts.append(format_user_prompt(tok, prof, user))
+        elif prof.stage3_extra == "ultrachat":
+            for i, row in enumerate(load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True)):
+                if str(row.get("prompt", "")).strip():
+                    texts.append(format_user_prompt(tok, prof, row["prompt"]))
+                if i >= 20_000:
+                    break
     except Exception as e:
-        print(f"  [Stage-3] Bespoke-Stratos prompts skipped: {e}", flush=True)
+        print(f"  [Stage-3] {prof.stage3_extra} prompts skipped: {e}", flush=True)
     if not texts:
-        raise RuntimeError("No on-policy prompts could be loaded (GSM8K train and Bespoke-Stratos both failed)")
+        raise RuntimeError("No Stage-3 prompts could be loaded")
 
     by_len: dict[int, list[list[int]]] = {}
     for ids in tok(texts, add_special_tokens=False)["input_ids"]:
@@ -914,9 +929,9 @@ def onpolicy_distill(
     rounds: int = 10,
     prompts_per_round: int = 256,
     gen_bs: int = 16,
-    max_new: int = 3072,
-    temperature: float = 0.6,
-    top_p: float = 0.95,
+    max_new: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
     lr: float = 5e-5,
     warmup: int = 50,
     seqs_per_step: int = 8,
@@ -927,6 +942,7 @@ def onpolicy_distill(
     freeze_mlp: bool = False,
     stop_capped_frac: float = 0.5,
     chain_source: str = "student",
+    profile: str | None = None,
 ):
     """Stage-3 chain distillation. Each round reasoning chains are sampled with the benchmark's sampling
     settings, the teacher scores every token, and the student is trained with forward KL on the chain tokens
@@ -935,7 +951,9 @@ def onpolicy_distill(
     chain_source="student": on-policy. The student writes the chains, which removes the train/test mismatch
       of Stage-1/2 (corpus text only), but it never shows the student reasoning moves it does not make.
     chain_source="teacher": the teacher writes the chains (sequence-level KD), so the student learns the
-      teacher's own reasoning steps (self-checks, when to continue, when to stop)."""
+      teacher's own reasoning steps (self-checks, when to continue, when to stop).
+
+    max_new / temperature / top_p default to the donor profile's (reasoning: 2048 / 0.6 / 0.95)."""
     if chain_source not in ("student", "teacher"):
         raise ValueError(f"chain_source must be 'student' or 'teacher', got {chain_source!r}")
     from transformers import AutoTokenizer
@@ -963,17 +981,22 @@ def onpolicy_distill(
     groups, trainable = _setup_trainable(stu, stu_cfg, device, freeze_mlp)
     donor, is_hf_donor, w_lm_t, donor_dir = _load_tied_teacher(donor_repo, stu_cfg, stu, device)
     tok = AutoTokenizer.from_pretrained(donor_dir)
+    from .config.profiles import resolve_profile
+    prof = resolve_profile(tok, profile, donor_dir)
+    max_new = prof.max_new if max_new is None else max_new
+    temperature = prof.temperature if temperature is None else temperature
+    top_p = prof.top_p if top_p is None else top_p
     eos_ids = get_all_eos_ids(tok)
     T = int(stu_cfg["max_T"])
     L_num, every = int(stu_cfg["num_layers"]), stu_cfg["hybrid_every"]
-    train_tokens, _ = _build_reasoning_and_eval_caches(work, donor_dir, donor_repo, 20_000_000, max_T=T)
+    train_tokens, _ = _build_reasoning_and_eval_caches(work, donor_dir, donor_repo, 20_000_000, max_T=T, profile=prof.name)
     n_win = max(1, (len(train_tokens) - 1) // T)
     ar = torch.arange(T)
     corpus_gen = torch.Generator().manual_seed(seed + 1)
     for _ in range(opt_steps):
         torch.randint(0, n_win, (seqs_per_step,), generator=corpus_gen)
 
-    batches = _onpolicy_prompt_batches(tok, gen_bs, seed)
+    batches = _onpolicy_prompt_batches(tok, prof, gen_bs, seed)
     # Held-out drift probe: GSM8K test items 1000+ (the benchmark scores the first 40).
     eval_ps = [gsm8k_prompt(tok, r["question"]) for r in _load_rows("openai/gsm8k", "main", "test", 1000 + eval_prompts)[1000:]]
     s_fn = vsa_logits_fn(stu)
@@ -993,7 +1016,7 @@ def onpolicy_distill(
             g["lr"] = lr * m * g.get("lr_scale", 1.0)
 
     print("=" * 84)
-    print(f"VSA STAGE-3 CHAIN KD ({chain_source}-written chains): {donor_repo} | rounds {start_round}->{rounds} | "
+    print(f"VSA STAGE-3 CHAIN KD ({chain_source}-written chains, profile {prof.name}): {donor_repo} | rounds {start_round}->{rounds} | "
           f"{prompts_per_round} chains/round (gen_bs={gen_bs}, max_new={max_new}, temp={temperature}) | lr {lr}")
     print("=" * 84)
     set_lr(opt_steps)
