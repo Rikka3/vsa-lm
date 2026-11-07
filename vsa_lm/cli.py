@@ -188,6 +188,7 @@ def main(argv: list[str] | None = None):
     p_hub.add_argument("--ppl-tokens", type=int, default=32768, help="Length of the long-stream perplexity run")
     p_hub.add_argument("--skip", default="", help="Comma-separated checks to skip (e.g. passkey,stream_ppl)")
     p_hub.add_argument("--out", default=None, help="Output JSON path")
+    p_hub.add_argument("--no-donor", action="store_true", help="Skip the donor comparison (absolute thresholds only)")
 
     sub.add_parser("test", help="Run the Triton kernel, gradient, decoder, and erasure parity suite")
 
@@ -245,6 +246,7 @@ def main(argv: list[str] | None = None):
             args.ckpt, donor_id=args.donor, profile=args.profile, stream_window=args.stream_window,
             stream_sinks=args.stream_sinks, passkey_lengths=tuple(int(x) for x in args.passkey_lengths.split(",") if x),
             ppl_tokens=args.ppl_tokens, skip=tuple(x for x in args.skip.split(",") if x), out_json=args.out,
+            compare_donor=not args.no_donor,
         )
     elif args.cmd == "test":
         from .tests import run_all

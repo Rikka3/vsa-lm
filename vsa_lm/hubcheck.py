@@ -1,17 +1,22 @@
 """Hub readiness check (`python -m vsa_lm hubcheck`): everything a Hugging Face user relies on, as pass/fail.
 
+The target is a drop-in replacement for the donor, so every check runs the official HF donor on the same
+inputs and passes only when the student matches it:
+
   1 load            checkpoint, tokenizer, chat template, stop tokens, donor profile, state size
-  2 chat            chat replies through the profile's template and sampling: stop on EOS, no loops, correct
-  3 decode_parity   recurrent decoder (eager + CUDA graph) vs the parallel forward
-  4 batch           batched greedy generation vs single-sequence generation
+  2 chat            replies through the profile's template and sampling: stops and is correct wherever the donor does
+  3 decode_parity   recurrent decoder (eager + CUDA graph) vs the parallel forward, against the donor's own
+                    cached-decode vs forward agreement (the bf16 noise floor)
+  4 batch           batched vs single greedy generation, against the donor's own batch consistency
   5 stream_parity   infinite-context streaming vs exact decoding: identical until the window fills
-  6 passkey         needle recall by context length and depth, exact vs streaming (beyond-window recall)
-  7 stream_ppl      perplexity over a long stream in constant RAM; flat memory; cost of eviction vs exact
+  6 passkey         needle recall by length and depth: exact and streaming vs the donor
+  7 stream_ppl      perplexity on a long text: exact and streaming vs the donor, per 1k-token segment;
+                    flat memory in streaming
   8 memory_bank     .vsa cartridges: memorize -> route -> answer -> algebraic erase
   9 server          OpenAI-style completion function, in streaming mode
 
-Checks that measure a capability rather than a contract (passkey beyond the window, eviction cost) are
-reported as numbers and never fail the run.
+Streaming past its window has no donor equivalent (the donor has no constant-RAM mode): it is reported next
+to the donor's numbers but never fails the run.
 """
 from __future__ import annotations
 
@@ -25,7 +30,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from .benchmark import _load_rows, _load_student
+from .benchmark import _load_hf_donor, _load_rows, _load_student
 from .config.profiles import format_user_prompt, resolve_profile
 from .decode import VSARecurrentDecoder
 from .diagnose import _parity_tokens, decode_parity
@@ -50,6 +55,28 @@ def _feeder(dec: VSARecurrentDecoder, B: int, need_len: int, device, graph: bool
     return feed
 
 
+def _donor_generate(donor, tok, x: torch.Tensor, max_new: int, eos_ids, temperature: float = 0.0, top_p: float = 1.0):
+    """HF generate on equal-length rows (no padding). Returns (tokens [B, n], lengths up to and incl. EOS)."""
+    sample = temperature > 1e-5
+    out = donor.generate(x, max_new_tokens=max_new, do_sample=sample, temperature=temperature if sample else None,
+                         top_p=top_p if sample else None, eos_token_id=sorted(eos_ids) or None,
+                         pad_token_id=tok.eos_token_id if isinstance(tok.eos_token_id, int) else 0)
+    toks = out[:, x.shape[1]:]
+    hit = torch.isin(toks, torch.tensor(sorted(eos_ids), dtype=torch.long, device=toks.device))
+    n = torch.where(hit.any(1), hit.float().argmax(1) + 1, torch.full_like(hit[:, 0], toks.shape[1], dtype=torch.long))
+    return toks, n
+
+
+def _nll_from_hidden(h: torch.Tensor, head, ids: torch.Tensor, chunk: int = 1024) -> torch.Tensor:
+    """NLL of ids[t+1] given hidden h[t], for t < len-1, without materialising the full [T, V] logits."""
+    out = []
+    for i in range(0, h.shape[0] - 1, chunk):
+        j = min(i + chunk, h.shape[0] - 1)
+        logp = F.log_softmax(head(h[i:j]).float(), dim=-1)
+        out.append(-logp.gather(-1, ids[i + 1 : j + 1].unsqueeze(-1)).squeeze(-1))
+    return torch.cat(out).cpu()
+
+
 def _repeat_frac(ids: list[int], n: int = 8) -> float:
     """Fraction of n-grams that already occurred earlier in the text (loops push this toward 1)."""
     grams = [tuple(ids[i : i + n]) for i in range(len(ids) - n + 1)]
@@ -58,6 +85,10 @@ def _repeat_frac(ids: list[int], n: int = 8) -> float:
 
 def _ppl(mean_nll) -> float:
     return math.exp(min(50.0, float(mean_nll)))  # a broken model must still produce a report
+
+
+def _seg_ppl(nll: torch.Tensor, seg: int = 1024) -> list[float]:
+    return [round(_ppl(nll[i : i + seg].mean()), 2) for i in range(0, len(nll), seg)]
 
 
 def _final_answer(text: str) -> str:
@@ -89,47 +120,81 @@ SMOKE = (
 )
 
 
-def check_chat(dec, tok, prof, eos_ids, device) -> dict:
+def check_chat(dec, donor, tok, prof, eos_ids, device) -> dict:
     rows = []
     for i, (q, ok) in enumerate(SMOKE):
-        torch.manual_seed(100 + i)
         ids = tok.encode(format_user_prompt(tok, prof, q), add_special_tokens=False)
-        out = dec.generate(torch.tensor([ids], device=device), prof.max_new, temperature=prof.temperature,
-                           top_p=prof.top_p, eos_ids=eos_ids)[0, len(ids):].tolist()
+        x = torch.tensor([ids], device=device)
+        torch.manual_seed(100 + i)
+        out = dec.generate(x, prof.max_new, temperature=prof.temperature, top_p=prof.top_p, eos_ids=eos_ids)[0, len(ids):].tolist()
         stopped = bool(out) and out[-1] in eos_ids
         text = tok.decode(out[:-1] if stopped else out, skip_special_tokens=True)
-        rows.append({"prompt": q, "tokens": len(out), "stopped": stopped, "repeat_frac": round(_repeat_frac(out), 3),
-                     "correct": ok(_final_answer(text)), "answer_tail": _final_answer(text).strip()[-160:]})
-    n_ok = sum(r["correct"] for r in rows)
-    return {"rows": rows, "pass": all(r["stopped"] and r["repeat_frac"] < 0.5 for r in rows) and n_ok >= len(rows) - 1}
+        row = {"prompt": q, "tokens": len(out), "stopped": stopped, "repeat_frac": round(_repeat_frac(out), 3),
+               "correct": ok(_final_answer(text)), "answer_tail": _final_answer(text).strip()[-160:]}
+        if donor is not None:
+            torch.manual_seed(100 + i)
+            d_toks, d_n = _donor_generate(donor, tok, x, prof.max_new, eos_ids, prof.temperature, prof.top_p)
+            d_n = int(d_n[0])
+            d_stopped = d_n < d_toks.shape[1] or (d_n > 0 and int(d_toks[0, d_n - 1]) in eos_ids)
+            d_text = tok.decode(d_toks[0, :d_n].tolist(), skip_special_tokens=True)
+            row.update(donor_tokens=d_n, donor_stopped=d_stopped, donor_correct=ok(_final_answer(d_text)))
+        # Matching the donor: stop and be right wherever the donor does (one sample each, same settings).
+        row["ok"] = (row["repeat_frac"] < 0.5 and (row["stopped"] or not row.get("donor_stopped", True))
+                     and (row["correct"] or not row.get("donor_correct", True)))
+        rows.append(row)
+    return {"rows": rows, "pass": all(r["ok"] for r in rows)}
 
 
-def check_decode_parity(stu, tok, device, T: int) -> dict:
+@torch.no_grad()
+def _donor_cached_parity(donor, x: torch.Tensor) -> float:
+    """Top-1 agreement (%) of the donor's own cached step-by-step decode with its parallel forward."""
+    full = donor(x, use_cache=False).logits[0].argmax(-1)
+    pkv, agree = None, 0
+    for t in range(x.shape[1]):
+        out = donor(x[:, t : t + 1], past_key_values=pkv, use_cache=True)
+        pkv = out.past_key_values
+        agree += int(out.logits[0, -1].argmax() == full[t])
+    return 100.0 * agree / x.shape[1]
+
+
+def check_decode_parity(stu, donor, tok, device, T: int, ctx: dict) -> dict:
     rows = decode_parity(stu, tok, device, T=T)
-    # Judge agreement over all positions: in a 64-token bucket one bf16 near-tie flip is already 98.4%.
     sizes = [int(r["pos"].split("-")[1]) - int(r["pos"].split("-")[0]) for r in rows]
     res = {"rows": rows}
     for key in ("top1_agree_pct", "graph_top1_agree_pct"):
         if all(key in r for r in rows):
             res[key] = round(sum(r[key] * n for r, n in zip(rows, sizes)) / sum(sizes), 2)
-    res["pass"] = all(v >= 99.0 for k, v in res.items() if k != "rows")
+    # bf16 decode flips near-ties; the donor's own flip rate on the same tokens is the bar (99% without a donor).
+    floor = 99.0
+    if donor is not None:
+        res["donor_top1_agree_pct"] = round(_donor_cached_parity(donor, _parity_tokens(tok, device, T)), 2)
+        floor = res["donor_top1_agree_pct"] - 0.5
+    ctx["parity_floor"] = floor
+    res["pass"] = all(res[k] >= floor for k in ("top1_agree_pct", "graph_top1_agree_pct") if k in res)
     return res
 
 
-def check_batch(dec, tok, prof, device, n_new: int = 64, B: int = 4) -> dict:
+def check_batch(dec, donor, tok, prof, device, n_new: int = 64, B: int = 4) -> dict:
     ids = tok.encode(format_user_prompt(tok, prof, "Explain in two sentences why the sky is blue."), add_special_tokens=False)
     x = torch.tensor([ids], device=device)
+
+    def prefix(rows, single):
+        return [next((i for i, (a, b) in enumerate(zip(r, single)) if a != b), min(len(r), len(single))) for r in rows]
+
     single = dec.generate(x, n_new, temperature=0.0)[0, len(ids):].tolist()
-    batch, _ = dec.generate_batch(x.repeat(B, 1), n_new, temperature=0.0)
-    rows = batch.tolist()
-    prefix = [next((i for i, (a, b) in enumerate(zip(r, single)) if a != b), min(len(r), len(single))) for r in rows]
-    same_rows = all(r == rows[0] for r in rows)
-    # bf16 kernels at a different batch size round differently, so a near-tie may flip late; the first
-    # half must match exactly.
-    return {"match_prefix_tokens": prefix, "rows_identical": same_rows, "pass": same_rows and min(prefix) >= n_new // 2}
+    rows = dec.generate_batch(x.repeat(B, 1), n_new, temperature=0.0)[0].tolist()
+    res = {"match_prefix_tokens": prefix(rows, single), "rows_identical": all(r == rows[0] for r in rows)}
+    bar = n_new // 2
+    if donor is not None:
+        d_single = _donor_generate(donor, tok, x, n_new, set())[0][0].tolist()
+        d_rows = _donor_generate(donor, tok, x.repeat(B, 1), n_new, set())[0].tolist()
+        res["donor_match_prefix_tokens"] = prefix(d_rows, d_single)
+        bar = min(res["donor_match_prefix_tokens"])
+    res["pass"] = res["rows_identical"] and min(res["match_prefix_tokens"]) >= bar
+    return res
 
 
-def check_stream_parity(stu, tok, device, T: int, W: int, S: int) -> dict:
+def check_stream_parity(stu, tok, device, T: int, W: int, S: int, ctx: dict) -> dict:
     """Exact vs streaming (small window, so eviction happens inside T) on one real sequence, eager and graph."""
     x = _parity_tokens(tok, device, T)
     T = x.shape[1]
@@ -159,7 +224,9 @@ def check_stream_parity(stu, tok, device, T: int, W: int, S: int) -> dict:
         "after_eviction_top1_pct": round(100 * float(agree[full:].mean()), 2) if full < T else None,
         "graph_vs_eager_top1_pct": round(100 * float(g_agree.mean()), 2) if g_agree is not None else None,
     }
-    res["pass"] = res["before_eviction_top1_pct"] >= 99.0 and (g_agree is None or res["graph_vs_eager_top1_pct"] >= 99.0)
+    # Before eviction streaming is exact attention through a different kernel: same bf16 noise bar as decode parity.
+    floor = ctx.get("parity_floor", 99.0)
+    res["pass"] = res["before_eviction_top1_pct"] >= floor and (g_agree is None or res["graph_vs_eager_top1_pct"] >= floor)
     return res
 
 
@@ -193,20 +260,25 @@ def _passkey_batch(tok, prof, L: int, depths, reps: int) -> tuple[torch.Tensor, 
     return torch.tensor(rows), keys, ds
 
 
-def check_passkey(stu, tok, prof, eos_ids, device, lengths, depths, reps: int, W: int, S: int) -> dict:
+def check_passkey(stu, donor, tok, prof, eos_ids, device, lengths, depths, reps: int, W: int, S: int) -> dict:
     out = {"window": W, "runs": []}
     for L in lengths:
         x, keys, ds = _passkey_batch(tok, prof, L, depths, reps)
         x = x.to(device)
-        for mode in ("exact", "stream"):
-            dec = VSARecurrentDecoder(stu, max_cache_pos=max(65536, L + 64),
-                                      stream_window=(W if mode == "stream" else None), stream_sinks=S)
+        for mode in ("donor", "exact", "stream"):
+            if mode == "donor" and donor is None:
+                continue
+            dec = None if mode == "donor" else VSARecurrentDecoder(
+                stu, max_cache_pos=max(65536, L + 64), stream_window=(W if mode == "stream" else None), stream_sinks=S)
             torch.cuda.empty_cache()
             base = torch.cuda.memory_allocated() if device.type == "cuda" else 0
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats()
             t0 = time.perf_counter()
-            toks, n = dec.generate_batch(x, 8, temperature=0.0, eos_ids=eos_ids)
+            if mode == "donor":
+                toks, n = _donor_generate(donor, tok, x, 8, eos_ids)
+            else:
+                toks, n = dec.generate_batch(x, 8, temperature=0.0, eos_ids=eos_ids)
             secs = time.perf_counter() - t0
             peak = (torch.cuda.max_memory_allocated() - base) / 2**20 if device.type == "cuda" else 0.0
             hits = []
@@ -221,10 +293,11 @@ def check_passkey(stu, tok, prof, eos_ids, device, lengths, depths, reps: int, W
             print(f"    passkey {mode:>6} L={L:>6}: recall {run['recall_pct']:5.1f}%  by depth {by_depth}  "
                   f"peak +{run['peak_mb']:.0f} MB  {secs:.0f}s", flush=True)
             del dec
-    # Contract: streaming inside its window recalls as well as exact decoding (beyond the window is reported only).
-    inside = [(r["recall_pct"], e["recall_pct"]) for r in out["runs"] if r["mode"] == "stream" and not r["beyond_window"]
-              for e in out["runs"] if e["mode"] == "exact" and e["length"] == r["length"]]
-    out["pass"] = all(s >= e - 20.0 for s, e in inside)
+    # Contract: exact decoding, and streaming inside its window, recall as well as the donor (one miss of slack).
+    slack = 100.0 / (len(depths) * reps) + 0.1
+    ref = {r["length"]: r["recall_pct"] for r in out["runs"] if r["mode"] == "donor"}
+    judged = [r for r in out["runs"] if r["mode"] == "exact" or (r["mode"] == "stream" and not r["beyond_window"])]
+    out["pass"] = all(r["recall_pct"] >= ref.get(r["length"], 100.0) - slack for r in judged)
     return out
 
 
@@ -246,9 +319,9 @@ def _long_text_ids(tok, n_tokens: int) -> list[int]:
 
 
 @torch.no_grad()
-def check_stream_ppl(stu, tok, device, n_tokens: int, W: int, S: int, ref_len: int, seg: int = 1024) -> dict:
-    """Stream n_tokens through the streaming decoder (constant RAM), NLL per position; compare with the exact
-    parallel forward on the first ref_len tokens, where both see the same text."""
+def check_stream_ppl(stu, donor, tok, device, n_tokens: int, W: int, S: int, ref_len: int, seg: int = 1024) -> dict:
+    """Stream n_tokens through the streaming decoder (constant RAM); on the first ref_len tokens also run the
+    student's exact parallel forward and the donor, and compare per segment."""
     ids = torch.tensor([_long_text_ids(tok, n_tokens)], device=device)
     dec = VSARecurrentDecoder(stu, stream_window=W, stream_sinks=S)
     feed = _feeder(dec, 1, n_tokens, device, graph=True)
@@ -264,40 +337,47 @@ def check_stream_ppl(stu, tok, device, n_tokens: int, W: int, S: int, ref_len: i
         torch.cuda.synchronize()
     secs = time.perf_counter() - t0
     nll = nll.cpu()
-    segs = [round(_ppl(nll[i : i + seg].mean()), 2) for i in range(0, len(nll), seg)]
 
-    def ppl(a, b):
-        a, b = max(0, a), min(len(nll), b)
-        return round(_ppl(nll[a:b].mean()), 3) if b > a else None
+    def ppl(x, a, b):
+        a, b = max(0, a), min(len(x), b)
+        return round(_ppl(x[a:b].mean()), 3) if b > a else None
 
     res = {"tokens": n_tokens, "window": W, "sinks": S, "tok_s": round((n_tokens - 1) / secs, 1),
-           "segment_ppl": segs, "ppl_window_filling": ppl(W // 2, W), "ppl_last_quarter": ppl(3 * n_tokens // 4, n_tokens)}
+           "stream_segment_ppl": _seg_ppl(nll, seg),
+           "stream_ppl_window_filling": ppl(nll, W // 2, W), "stream_ppl_last_quarter": ppl(nll, 3 * n_tokens // 4, n_tokens)}
     if len(mem) == 2:
         a, b = sorted(mem)
         res["mem_growth_mb_after_window_full"] = round((mem[b] - mem[a]) / 2**20, 2)
 
-    # Exact reference: the parallel forward (full attention) on the first ref_len tokens.
+    # Same text, first ref_len tokens: the student's exact forward (full attention) and the donor.
     ref_len = (min(ref_len, n_tokens) // 32) * 32
-    if ref_len > W + S:
-        try:
-            with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-                h = stu(ids[:, :ref_len])[0]
-            w_lm = stu.lm_head.weight.float()
-            ref = torch.cat([-F.log_softmax(F.linear(h[i : i + 1024].float(), w_lm), dim=-1)
-                            .gather(-1, ids[0, i + 1 : i + 1025].unsqueeze(-1)).squeeze(-1)
-                             for i in range(0, ref_len - 1, 1024)])[: ref_len - 1].cpu()
-            del h, w_lm
-            res["exact_vs_stream_ppl_after_eviction"] = {
-                "range": f"{W + S}-{ref_len}",
-                "exact": round(_ppl(ref[W + S :].mean()), 3),
-                "stream": round(_ppl(nll[W + S : ref_len - 1].mean()), 3),
-            }
-        except torch.cuda.OutOfMemoryError:
-            res["exact_vs_stream_ppl_after_eviction"] = "skipped (OOM)"
-            torch.cuda.empty_cache()
-    late, filling = res["ppl_last_quarter"], res["ppl_window_filling"]
+    x = ids[:, :ref_len]
+    ref = {"stream": nll[: ref_len - 1]}
+    try:
+        with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+            h = stu(x)[0]
+            w_lm = stu.lm_head.weight
+            ref["exact"] = _nll_from_hidden(h, lambda z: F.linear(z, w_lm), x[0])
+            del h
+            if donor is not None:
+                h = donor.model(input_ids=x, use_cache=False).last_hidden_state[0]
+                ref["donor"] = _nll_from_hidden(h, donor.lm_head, x[0])
+                del h
+    except torch.cuda.OutOfMemoryError:
+        res["reference"] = "skipped (OOM)"
+        torch.cuda.empty_cache()
+    res["reference_range"] = f"0-{ref_len}"
+    for name, v in ref.items():
+        res[f"{name}_ref_segment_ppl"] = _seg_ppl(v, seg)
+        res[f"{name}_ref_ppl"] = ppl(v, 0, ref_len)
     flat = res.get("mem_growth_mb_after_window_full", 0.0) < 16.0
-    res["pass"] = flat and all(math.isfinite(s) for s in segs) and (late is None or filling is None or late <= 1.5 * filling)
+    stable = all(math.isfinite(s) for s in res["stream_segment_ppl"])
+    res["pass"] = flat and stable
+    if "donor" in ref and "exact" in ref:
+        # The contract: exact decoding is the donor (5% slack for bf16 and healing); streaming inside its window too.
+        res["exact_over_donor"] = round(res["exact_ref_ppl"] / res["donor_ref_ppl"], 3)
+        res["stream_over_donor_in_window"] = round(ppl(ref["stream"], 0, W) / ppl(ref["donor"], 0, W), 3)
+        res["pass"] = res["pass"] and res["exact_over_donor"] <= 1.05 and res["stream_over_donor_in_window"] <= 1.05
     return res
 
 
@@ -336,7 +416,7 @@ def run_hubcheck(ckpt_path: str, donor_id: str | None = None, profile: str | Non
                  stream_window: int = 8192, stream_sinks: int = 4,
                  passkey_lengths=(4096, 16384, 32768), passkey_depths=(0.1, 0.5, 0.9), passkey_reps: int = 2,
                  ppl_tokens: int = 32768, ppl_ref_len: int = 16384, parity_T: int = 1024,
-                 skip: tuple[str, ...] = (), out_json: str | None = None) -> dict:
+                 skip: tuple[str, ...] = (), compare_donor: bool = True, out_json: str | None = None) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cuda.matmul.allow_tf32 = True
     stu, cfg, tok, donor_id, donor_dir, step, conv_ver = _load_student(ckpt_path, donor_id, device)
@@ -344,20 +424,23 @@ def run_hubcheck(ckpt_path: str, donor_id: str | None = None, profile: str | Non
     eos_ids = get_all_eos_ids(tok)
     W, S = int(stream_window), int(stream_sinks)
     dec = VSARecurrentDecoder(stu)
+    donor = _load_hf_donor(donor_dir, device) if compare_donor else None
+    ctx: dict = {}
 
     print("=" * 84)
-    print(f"VSA-LM HUB CHECK: {ckpt_path} (step {step}, {conv_ver}) | donor {donor_id} | profile {prof.name} | "
-          f"stream window {W} + {S} sinks")
+    print(f"VSA-LM HUB CHECK: {ckpt_path} (step {step}, {conv_ver}) | donor {donor_id} "
+          f"({'compared' if donor is not None else 'not compared'}) | profile {prof.name} | stream window {W} + {S} sinks")
     print("=" * 84)
     checks = [
         ("load", lambda: check_load(stu, tok, prof, eos_ids, step, conv_ver, (S, W))),
-        ("chat", lambda: check_chat(dec, tok, prof, eos_ids, device)),
-        ("decode_parity", lambda: check_decode_parity(stu, tok, device, parity_T)),
-        ("batch", lambda: check_batch(dec, tok, prof, device)),
+        ("chat", lambda: check_chat(dec, donor, tok, prof, eos_ids, device)),
+        ("decode_parity", lambda: check_decode_parity(stu, donor, tok, device, parity_T, ctx)),
+        ("batch", lambda: check_batch(dec, donor, tok, prof, device)),
         # Small window so the sequence crosses it: tests eviction itself, not just the no-op case.
-        ("stream_parity", lambda: check_stream_parity(stu, tok, device, max(parity_T, 1024), 256, S)),
-        ("passkey", lambda: check_passkey(stu, tok, prof, eos_ids, device, passkey_lengths, passkey_depths, passkey_reps, W, S)),
-        ("stream_ppl", lambda: check_stream_ppl(stu, tok, device, ppl_tokens, W, S, ppl_ref_len)),
+        ("stream_parity", lambda: check_stream_parity(stu, tok, device, max(parity_T, 1024), 256, S, ctx)),
+        ("passkey", lambda: check_passkey(stu, donor, tok, prof, eos_ids, device, passkey_lengths, passkey_depths,
+                                          passkey_reps, W, S)),
+        ("stream_ppl", lambda: check_stream_ppl(stu, donor, tok, device, ppl_tokens, W, S, ppl_ref_len)),
         ("memory_bank", lambda: check_memory_bank(stu, tok)),
         ("server", lambda: check_server(stu, tok, device, prof, W, S)),
     ]
@@ -373,8 +456,8 @@ def run_hubcheck(ckpt_path: str, donor_id: str | None = None, profile: str | Non
             r = {"pass": False, "error": f"{type(e).__name__}: {e}"}
         r["secs"] = round(time.perf_counter() - t0, 1)
         res["checks"][name] = r
-        detail = {k: v for k, v in r.items() if k not in ("pass", "rows", "runs", "segment_ppl", "eos_ids")}
-        print(f"  [{name}] {'PASS' if r['pass'] else 'FAIL'}  {json.dumps(detail, default=str)[:600]}", flush=True)
+        detail = {k: v for k, v in r.items() if k not in ("pass", "rows", "runs", "eos_ids")}
+        print(f"  [{name}] {'PASS' if r['pass'] else 'FAIL'}  {json.dumps(detail, default=str)[:1500]}", flush=True)
         for row in r.get("rows", []):
             print(f"      {json.dumps(row, default=str)[:300]}", flush=True)
         if device.type == "cuda":
@@ -385,7 +468,7 @@ def run_hubcheck(ckpt_path: str, donor_id: str | None = None, profile: str | Non
     print(f"  {'check':<15} result")
     for name, c in res["checks"].items():
         print(f"  {name:<15} {'PASS' if c['pass'] else 'FAIL'}" + (f"  ({c['error']})" if "error" in c else ""))
-    print(f"  READY FOR HUB USERS: {'YES' if res['ready'] else 'NO'}")
+    print(f"  DROP-IN REPLACEMENT FOR THE DONOR: {'YES' if res['ready'] else 'NO'}")
     if out_json:
         with open(out_json, "w") as f:
             json.dump(res, f, indent=2, default=str)

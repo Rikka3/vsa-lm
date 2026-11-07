@@ -141,7 +141,7 @@ python -m vsa_lm serve --ckpt ... --donor ... --stream-window 8192
 
 ## Checking a Checkpoint Before Publishing (`hubcheck`)
 
-One command checks everything a Hugging Face user relies on. It prints a pass/fail table and writes a JSON report.
+One command checks everything a Hugging Face user relies on. It prints a pass/fail table and writes a JSON report. The target is a drop-in replacement, so each check also runs the official HF donor on the same inputs and passes only when the student matches it (`--no-donor` skips this).
 
 ```bash
 python -m vsa_lm hubcheck --ckpt vsa_deepseek_r1_qwen_1.5b.pth --out hubcheck.json
