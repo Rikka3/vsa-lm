@@ -56,9 +56,13 @@ def vsa_chunk_forward_kernel(
         y_ptrs = Y + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd
         tl.store(y_ptrs, y.to(Y.dtype.element_ty), mask=load_mask)
 
-        v_weighted = (v_raw.to(tl.float32) * chunk_decay[:, None]).to(k_raw.dtype)
+        c_len = tl.minimum(BLOCK_SIZE, T - i)
+        tail_powers = tl.maximum(0.0, tl.cast(c_len - 1 - local_t, tl.float32))
+        c_decay = tl.where(t_mask, tl.exp(tail_powers * log_gamma), 0.0)
+        c_total_decay = tl.exp(tl.cast(c_len, tl.float32) * log_gamma)
+        v_weighted = (v_raw.to(tl.float32) * c_decay[:, None]).to(k_raw.dtype)
         delta_M = tl.dot(tl.trans(k_raw), v_weighted)
-        M = chunk_total_decay * M + delta_M
+        M = c_total_decay * M + delta_M
 
         if i + BLOCK_SIZE < T:
             M_ptrs = M_out + M_offset + (i // BLOCK_SIZE) * stride_mc + d_offsets[:, None]*stride_mr + d_offsets[None,:]
