@@ -738,6 +738,11 @@ class VSARecurrentDecoder:
             if not trace:
                 continue
             ly = self.model.blocks[li].vsa
+            if not self.is_universal:
+                g = self._gamma(ly).view(1, ly.H, 1, 1)
+                delta = sum((g ** (next_pos - 1 - p)) * torch.einsum("he,hd->hed", k, v).unsqueeze(0) for p, k, v in trace)
+                states[li] = states[li] - delta
+                continue
             M_doc = torch.zeros_like(states[li])
             last_p = trace[-1][0]
             for (p, k, v) in trace:
