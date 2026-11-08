@@ -12,17 +12,17 @@ class VSAChunkFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, gamma, chunk_size):
         B, H, T, D = q.shape
-        if q.dtype in (torch.bfloat16, torch.float16) and T % 32 == 0:
+        if q.dtype in (torch.bfloat16, torch.float16) and T >= 32:
             eff_chunk = 32 if chunk_size >= 32 else chunk_size
         else:
-            eff_chunk = 16 if (D >= 128 and chunk_size >= 16 and T % 16 == 0) else chunk_size
-        if T % eff_chunk or T < eff_chunk:
-            raise ValueError(f"sequence length {T} must be a positive multiple of {eff_chunk}")
+            eff_chunk = 16 if (D >= 128 and chunk_size >= 16 and T >= 16) else chunk_size
+        if T < 1:
+            raise ValueError(f"sequence length {T} must be positive")
         q_flat = q.reshape(B*H, T, D).contiguous()
         k_flat = k.reshape(B*H, T, D).contiguous()
         v_flat = v.reshape(B*H, T, D).contiguous()
         y_flat = torch.empty(B*H, T, D, device=q.device, dtype=q.dtype)
-        num_chunks = T // eff_chunk
+        num_chunks = (T + eff_chunk - 1) // eff_chunk
         m_dtype = torch.bfloat16 if q.dtype == torch.bfloat16 else torch.float32
         M_saved = torch.empty(B*H, max(1, num_chunks - 1), D, D,
                               device=q.device, dtype=m_dtype)
