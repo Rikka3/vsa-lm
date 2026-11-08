@@ -1,4 +1,4 @@
-# Results — v2 (Phase 2 + binder)
+# Results — VSA (Phase 2 + binder)
 
 Supersedes the Run 1 results. Run 1 was the pilot: 500M FineWeb-Edu tokens, gap +0.069, plus a resume bug that fed the VSA arm ~1/3 less unique data. Everything below is Phase 2 (2B DCLM tokens) and the final binder run. Full logs and CSVs are on the HuggingFace repos linked at the bottom.
 

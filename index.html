@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VSA-LM v2 · Fixed-State &amp; Page-Slot Memory for Language Models</title>
+<title>VSA-LM · Fixed-State &amp; Page-Slot Memory for Language Models</title>
 <meta name="description" content="VSA-LM retrofits 75% of Transformer attention layers into fixed-size decayed outer-product memory + Abelian Page-Slot Banks. -74% KV RAM, 1.42x-2.43x faster decode at 64k, exact forgetting.">
 <meta name="theme-color" content="#120e1c">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -208,7 +208,7 @@ footer a{color:var(--lilac)}
       <b style="background:#f43f5e"></b><b style="background:#c084fc"></b><b style="background:#f43f5e"></b>
       <b style="background:#a855f7"></b><b style="background:#7c3aed"></b><b style="background:#a855f7"></b>
     </i>
-    VSA-LM v2
+    VSA-LM
   </a>
   <ul>
     <li><a href="#slots-sec">Page-Slots</a></li>
@@ -280,7 +280,7 @@ footer a{color:var(--lilac)}
         <div class="story-card">
           <span class="story-rate">Chapter 02 · Step 01</span>
           <h3>1 · GQA Un-Tying &amp; Mix-First RoPE</h3>
-          <p>Pretrained GQA donors have shared KV heads (`HKV=2`). VSA-LM v2 projects them via learned `k_head_mix` and `v_head_mix` <b>before</b> applying RoPE—giving 12 independent $D\times D$ heads with zero phase drift at any length.</p>
+          <p>Pretrained GQA donors have shared KV heads (`HKV=2`). VSA-LM projects them via learned `k_head_mix` and `v_head_mix` <b>before</b> applying RoPE—giving 12 independent $D\times D$ heads with zero phase drift at any length.</p>
         </div>
       </div>
       <div class="story-step">
@@ -310,7 +310,7 @@ footer a{color:var(--lilac)}
 </section>
 <div class="stripe"></div>
 
-<!-- 3. ABELIAN PAGE-SLOT BINDER (NEW V2 SCENE) -->
+<!-- 3. ABELIAN PAGE-SLOT BINDER -->
 <section class="scrolly-section" id="slots-sec" data-scene="slots">
   <div class="scrolly-container">
     <div class="story-graphic"><canvas></canvas></div>
@@ -326,7 +326,7 @@ footer a{color:var(--lilac)}
         <div class="story-card">
           <span class="story-rate">Chapter 03 · Step 02</span>
           <h3>Native Abelian Page-Slot Bank (8×4 Slots)</h3>
-          <p>Every VSA v2 layer includes <b>32 position-free (no-RoPE) slots</b> grouped into 8 pages. Salience router $w_{t,m} = \sigma(\text{router}(x_t))$ stays near <code>0</code> on filler text—meaning <b>zero decay across 32,768+ filler tokens</b>.</p>
+          <p>Every VSA layer includes <b>32 position-free (no-RoPE) slots</b> grouped into 8 pages. Salience router $w_{t,m} = \sigma(\text{router}(x_t))$ stays near <code>0</code> on filler text—meaning <b>zero decay across 32,768+ filler tokens</b>.</p>
         </div>
       </div>
       <div class="story-step">
@@ -455,7 +455,7 @@ footer a{color:var(--lilac)}
 <section class="sec" id="models">
   <p class="kicker">Live Hugging Face Hub Stream · @rikkathree</p>
   <h2>Public Models &amp; Datasets</h2>
-  <p>Streamed live from Hugging Face Hub API (<code>huggingface.co/api/models?author=rikkathree</code>). Click any repository to inspect checkpoints, benchmark JSONs, and diagnostics.</p>
+  <p>Streamed live from the Hugging Face Hub API (<code>huggingface.co/api/models?author=rikkathree</code>) — public repositories only, private ones are never listed. Click any repository to inspect checkpoints, benchmark JSONs, and diagnostics.</p>
   <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:18px">
     <div class="hf-status" id="hf-status"><span class="hf-dot"></span> Connecting to Hugging Face API...</div>
     <button class="btn" id="hf-refresh" type="button" style="padding:9px 14px;font-size:9px">↻ Refresh Live Feed</button>
@@ -521,15 +521,15 @@ footer a{color:var(--lilac)}
 cd vsa-lm
 pip install -r requirements.txt
 
-<span class="c"># 1. Surgically convert any HF donor into VSA-LM v2 (Page-Slots + Mix-First RoPE + 64-tok SWA)</span>
+<span class="c"># 1. Surgically convert any HF donor into VSA-LM (Page-Slots + Mix-First RoPE + 64-tok SWA)</span>
 python -m vsa_lm convert --donor deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-    --out deepseek_vsa_v2_init.pth --hybrid-every 4 --max-T 2048
+    --out deepseek_vsa_init.pth --hybrid-every 4 --max-T 2048
 
 <span class="c"># 2. Heal with Stage-1 Attention Transfer + Stage-2 Binder KD + Stage-3 Teacher-Chains</span>
-python -m vsa_lm heal --ckpt deepseek_vsa_v2_init.pth \
+python -m vsa_lm heal --ckpt deepseek_vsa_init.pth \
     --donor deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-    --out-prefix deepseek_vsa_v2 --tokens 60000000 --lr 1.5e-4 --kd 0.9 --highspeed
-python -m vsa_lm onpolicy --ckpt deepseek_vsa_v2_latest.pth \
+    --out-prefix deepseek_vsa --tokens 60000000 --lr 1.5e-4 --kd 0.9 --highspeed
+python -m vsa_lm onpolicy --ckpt deepseek_vsa_latest.pth \
     --donor deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --chain-source teacher --rounds 3
 
 <span class="c"># 3. Verify 9/9 readiness &amp; serve with constant-RAM streaming</span>
@@ -539,7 +539,7 @@ python -m vsa_lm serve --ckpt vsa_deepseek_r1_qwen_1.5b.pth --stream-window 8192
 </section>
 
 <footer>
-  VSA-LM v2 · MIT License · © 2026 Rikka3 · <a href="https://github.com/Rikka3/vsa-lm" target="_blank" rel="noopener">github.com/Rikka3/vsa-lm</a> · <a href="https://huggingface.co/rikkathree" target="_blank" rel="noopener">huggingface.co/rikkathree</a>
+  VSA-LM · MIT License · © 2026 Rikka3 · <a href="https://github.com/Rikka3/vsa-lm" target="_blank" rel="noopener">github.com/Rikka3/vsa-lm</a> · <a href="https://huggingface.co/rikkathree" target="_blank" rel="noopener">huggingface.co/rikkathree</a>
 </footer>
 
 <script>
@@ -633,17 +633,24 @@ const PAGES = ['P0:ORION','P1:LYRA','P2:MATH','P3:CODE','P4:USER','P5:SPEC','P6:
 function slots(c,w,h,p,t){
   const ph = p < 0.34 ? 0 : (p < 0.68 ? 1 : 2);
   txt(c,['1 · PASSIVE DECAY WIPES EARLY FACTS','2 · SALIENCE ROUTER  w_t = σ(router(x_t))','3 · 8×4 ABELIAN PAGE-SLOTS (0.0 DECAY)'][ph],w/2,22,small(w)?8:10,'#ffb83e','center');
-  const cols=8,rows=4,s=Math.max(18,Math.floor(Math.min((w-64)/cols,(h-190)/rows)));
-  const gw=cols*s,gh=rows*s,x0=Math.round((w-gw)/2),y0=Math.round(h*.36);
+  const cols=8,rows=4;
 
-  // Incoming token stream at top
-  const streamY = 66, bSz = Math.max(14, Math.round(s*0.58));
+  // Incoming token stream at top: block size bounded so all 14 blocks always fit the canvas width
+  const streamY = 66, bGap = 5;
+  const sCap = Math.max(8, Math.floor(Math.min((w-64)/cols,(h-190)/rows)));
+  const bSz = Math.max(10, Math.floor(Math.min(sCap*0.58,(w-40-13*bGap)/14)));
+  const sX0 = Math.round((w-(14*bSz+13*bGap))/2);
   mono(c,'incoming stream (filler vs high-salience facts):',w/2,44,small(w)?16:20,'#a99bbd','center');
   for(let i=0;i<14;i++){
     const isFact = (i===2 || i===7 || i===11);
-    const sx = Math.round(w/2 - 7*(bSz+6) + i*(bSz+6));
-    blk(c, sx, streamY, bSz, isFact ? '#ffb83e' : '#2a1f3d', isFact ? 1 : 0.55);
+    blk(c, sX0+i*(bSz+bGap), streamY, bSz, isFact ? '#ffb83e' : '#2a1f3d', isFact ? 1 : 0.55);
   }
+
+  // Grid cell size: fits the width and the vertical space between the stream and the captions
+  const gridTop = Math.max(Math.round(h*.36), streamY+bSz+14);
+  const s = Math.max(8, Math.floor(Math.min((w-64)/cols,(h-gridTop-62)/rows)));
+  const gw=cols*s,gh=rows*s,x0=Math.round((w-gw)/2),y0=gridTop;
+  const fy = Math.min(y0 + gh + 48, h - 14);
 
   // Draw 8x4 Page-Slot grid
   c.fillStyle='#000';c.fillRect(x0-5,y0-5,gw+10,gh+10);
@@ -662,10 +669,9 @@ function slots(c,w,h,p,t){
         blk(c, cellX, cellY, s-2, col);
       }
     }
-    mono(c, PAGES[pg].split(':')[0], x0 + pg*s + s/2, y0 + gh + 16, small(w)?14:18, (pg===0 && eraseP0)?'#f43f5e':'#c084fc', 'center');
+    mono(c, PAGES[pg].split(':')[0], x0 + pg*s + s/2, Math.min(y0+gh+16, fy-20), small(w)?14:18, (pg===0 && eraseP0)?'#f43f5e':'#c084fc', 'center');
   }
 
-  const fy = y0 + gh + 48;
   if(ph===0) mono(c,'Passive γ^3000 ≈ 0.00 → early passkeys lost in filler noise',w/2,fy,small(w)?16:21,'#f43f5e','center');
   else if(ph===1) mono(c,'Filler tokens: w_t ≈ 0 (decay = 1.0) · Salient facts: routed to Page-Slots',w/2,fy,small(w)?16:21,'#4ade80','center');
   else mono(c, eraseP0 ? 'erase_page(0) → Page 0 zeroed (0.0 residual), Pages 1..7 untouched!' : '100.00% block-cumsum / step() parity · No RoPE distance decay at 32k',w/2,fy,small(w)?16:21, eraseP0 ? '#ffb83e' : '#faf4eb','center');
@@ -677,8 +683,9 @@ function tower(c,w,h,p){
   const nb=Math.max(3,Math.min(6,Math.floor(w*.28/lh))),x0=Math.round(w*.06)+30,yb=h-16,tx=x0+nb*lh+lh;
   const grow=Math.floor(clamp(p*1.4-.3)*Math.max(0,(w-tx-16)/lh));
   txt(c,'21 VSA (PAGE-SLOTS + SWA) + 7 SOFTMAX',w/2,22,small(w)?8:10,'#ffb83e','center');
-  blk(c,18,40,14,'#a855f7');mono(c,'VSA + 32 Page-Slots (fixed O(1))',38,47,18,'#a99bbd');
-  blk(c,18,62,14,'#ffb83e');mono(c,'Softmax anchor (StreamKV / Split-KV)',38,69,18,'#a99bbd');
+  blk(c,18,40,14,'#a855f7');blk(c,36,40,14,'#c084fc');mono(c,'VSA state + local KV (fixed O(1))',56,47,small(w)?15:18,'#a99bbd');
+  blk(c,18,61,14,'#4ade80');mono(c,'32 Page-Slots (non-decaying)',38,68,small(w)?15:18,'#4ade80');
+  blk(c,18,82,14,'#ffb83e');blk(c,36,82,14,'#f43f5e');mono(c,'Softmax anchor + growing KV',56,89,small(w)?15:18,'#a99bbd');
   for(let i=0;i<N;i++){const a=clamp(shown-i);if(a<=0)break;const soft=i%4===3,y=yb-(i+1)*lh-Math.round((1-ease(a))*60);
     for(let k=0;k<nb;k++)blk(c,x0+k*lh,y,lh,soft?(k%2?'#ff7828':'#ffb83e'):(k%2?'#7c3aed':'#a855f7'),a);
     c.globalAlpha=a;mono(c,`L${i+1}`,x0-8,y+lh/2,Math.min(20,lh+2),'#6f5e88','right');c.globalAlpha=1;
@@ -877,11 +884,11 @@ async function loadHuggingFaceRepos(){
   statusEl.innerHTML = '<span class="hf-dot"></span> Streaming public repos from huggingface.co/rikkathree...';
   try {
     const [mRes, dRes] = await Promise.all([
-      fetch('https://huggingface.co/api/models?author=rikkathree&sort=lastModified&direction=-1&full=true'),
-      fetch('https://huggingface.co/api/datasets?author=rikkathree&sort=lastModified&direction=-1&full=true')
+      fetch('https://huggingface.co/api/models?author=rikkathree&sort=lastModified&direction=-1&full=true',{credentials:'omit'}),
+      fetch('https://huggingface.co/api/datasets?author=rikkathree&sort=lastModified&direction=-1&full=true',{credentials:'omit'})
     ]);
-    const models = mRes.ok ? await mRes.json() : [];
-    const datasets = dRes.ok ? await dRes.json() : [];
+    const models = (mRes.ok ? await mRes.json() : []).filter(repo => repo.private !== true);
+    const datasets = (dRes.ok ? await dRes.json() : []).filter(repo => repo.private !== true);
     const items = [
       ...models.map(m => ({...m, _kind: 'model', _url: `https://huggingface.co/${m.id}`})),
       ...datasets.map(d => ({...d, _kind: 'dataset', _url: `https://huggingface.co/datasets/${d.id}`}))
