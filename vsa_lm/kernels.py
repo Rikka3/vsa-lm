@@ -111,22 +111,21 @@ def vsa_chunk_backward_kernel(
     intra_decay = tl.exp(diff_clamped * log_gamma)
     intra_decay_dot = tl.where(diff >= 1, diff_clamped * tl.exp((diff_clamped - 1.0) * log_gamma), 0.0)
 
-    num_chunks = T // BLOCK_SIZE
+    num_chunks = tl.cdiv(T, BLOCK_SIZE)
     inv_sqrt_d = 1.0 / (D ** 0.5)
 
     for c_idx in range(num_chunks - 1, -1, -1):
         i = c_idx * BLOCK_SIZE
+        c_len = tl.minimum(BLOCK_SIZE, T - i)
         t_offsets = i + t_offsets_base
         t_mask = t_offsets < T
         load_mask = t_mask[:, None]
 
-        q_raw = tl.load(Q + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0)
-        k_raw = tl.load(K + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0)
-        v_raw = tl.load(V + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0)
-        y_sav = tl.load(Y_saved + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
-        dy_out = tl.load(dY + bh_offset + t_offsets[:, None]*stride_qt + d_offsets[None,:]*stride_qd, mask=load_mask, other=0.0).to(tl.float32)
-        dy = dy_out * one_minus_gamma
-        dy_dot = dy.to(q_raw.dtype)
+        cp_c = tl.maximum(0.0, tl.cast(c_len - 1 - local_t, tl.float32))
+        chunk_decay = tl.where(t_mask, tl.exp(cp_c * log_gamma), 0.0)
+        chunk_total_decay = tl.exp(tl.cast(c_len, tl.float32) * log_gamma)
+        chunk_total_decay_dot = tl.cast(c_len, tl.float32) * tl.exp((tl.cast(c_len, tl.float32) - 1.0) * log_gamma)
+        chunk_decay_dot = tl.where(t_mask & (cp_c >= 1.0), cp_c * tl.exp((cp_c - 1.0) * log_gamma), 0.0)
 
         if c_idx == 0:
             M = tl.zeros((D, D), dtype=tl.float32)
