@@ -96,11 +96,24 @@ class UniversalVSAAttn(nn.Module):
 
         qkv_bias = bool(cfg.get("vsa_qkv_bias", cfg.get("qkv_bias", False)))
         self.H, self.HKV, self.HD, self.G = H, HKV, HD, H // HKV
+        self.max_T = max_T
         self.q_proj = nn.Linear(D, H * HD, bias=qkv_bias)
         self.k_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
         self.v_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
         self.o_proj = nn.Linear(H * HD, D, bias=False)
-        self.rope = LlamaRoPE(HD, cfg["rope_theta"], cfg.get("rope_scaling"))
+
+        norm_cls = Qwen35ZeroCenteredRMSNorm if cfg.get("has_qwen35_lin", False) else LlamaRMSNorm
+        if cfg.get("qk_norm", False) and HD == (cfg.get("head_dim") or (D // cfg["num_heads"])):
+            self.q_norm = norm_cls(HD, cfg["eps"])
+            self.k_norm = norm_cls(HD, cfg["eps"])
+        else:
+            self.q_norm, self.k_norm = None, None
+
+        partial_factor = float(cfg.get("partial_rotary_factor", 1.0))
+        if partial_factor < 1.0:
+            self.rope = Qwen35PartialRoPE(HD, partial_factor=partial_factor, theta=cfg["rope_theta"])
+        else:
+            self.rope = LlamaRoPE(HD, cfg["rope_theta"], cfg.get("rope_scaling"))
         self.out_norm = LlamaRMSNorm(HD, cfg["eps"])
 
         self.log_gamma = nn.Parameter(torch.zeros(H))
