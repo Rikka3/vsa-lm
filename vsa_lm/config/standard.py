@@ -149,22 +149,38 @@ class UniversalVSAAttn(nn.Module):
 
     def head_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.H, self.HD).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.HKV, self.HD).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.HKV, self.HD).transpose(1, 2)
-        return q, k, v
+        q = self.q_proj(x).view(B, T, self.H, self.HD)
+        k = self.k_proj(x).view(B, T, self.HKV, self.HD)
+        v = self.v_proj(x).view(B, T, self.HKV, self.HD)
+        if getattr(self, "q_norm", None) is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
+        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
     def gamma(self) -> torch.Tensor:
         return (0.9999 * torch.sigmoid(self.log_gamma)).clamp(1e-4, 0.9999).float()
 
     def window_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Causal softmax over keys j with i-j < swa_window, plus key 0 (sink). q: (B,H,T,HD), k/v: (B,HKV,T,HD)."""
         T = q.shape[2]
         pos = torch.arange(T, device=q.device)
         dist = pos[:, None] - pos[None, :]
         mask = (dist >= 0) & ((dist < self.swa_window) | (pos[None, :] == 0))
-        # Expand KV heads explicitly: enable_gqa + attn_mask can fall back to the O(T^2)-memory math kernel.
-        return F.scaled_dot_product_attention(q, repeat_kv(k, self.G), repeat_kv(v, self.G), attn_mask=mask)
+        kr, vr = repeat_kv(k, self.G), repeat_kv(v, self.G)
+        if T <= self.max_T or not hasattr(self.rope, "inv_freq"):
+            return F.scaled_dot_product_attention(q, kr, vr, attn_mask=mask)
+        # Match recurrent decoder sink_cap when T > max_T: rotate query back by (t + 1 - max_T) for sink score
+        shift = (pos + 1 - self.max_T).clamp(min=0).float()
+        freqs = torch.outer(-shift, self.rope.inv_freq.to(q.device))
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos, sin = emb.cos().to(q.dtype)[None, None], emb.sin().to(q.dtype)[None, None]
+        q_Half = q.shape[-1] // 2
+        q_sink = q * cos + torch.cat((-q[..., q_Half:], q[..., :q_Half]), dim=-1) * sin
+        win_mask = (dist >= 0) & (dist < self.swa_window) & (pos[None, :] > 0)
+        scores = torch.matmul(q.float(), kr.float().transpose(-1, -2)) * (self.HD ** -0.5)
+        scores = scores.masked_fill(~win_mask, float("-inf"))
+        sink_score = (q_sink.float() * kr[:, :, :1].float()).sum(dim=-1, keepdim=True) * (self.HD ** -0.5)
+        scores[:, :, :, :1] = sink_score
+        probs = F.softmax(scores, dim=-1).to(vr.dtype)
+        return torch.matmul(probs, vr)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
