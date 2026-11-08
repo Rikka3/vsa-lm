@@ -245,7 +245,7 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 285,
     for idx_q, r in enumerate(rows):
         gold = r["answer"].split("####")[-1].strip().replace(",", "")
         p_str = gsm8k_prompt(tok, r["question"])
-        gen, n_new, hit_cap = _gen(p_str, max_new=2048, temperature=0.6, top_p=0.95, seed=1000 + idx_q)
+        gen, n_new, hit_cap = _gen(p_str, max_new=4096, temperature=0.6, top_p=0.95, seed=1000 + idx_q)
         lengths.append(n_new)
         trunc_cnt += int(hit_cap)
         ans_region = gen.split("</think>")[-1] if "</think>" in gen else gen

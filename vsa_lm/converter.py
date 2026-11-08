@@ -75,6 +75,9 @@ def convert_donor_model(
     hf_sd = load_all_safetensors(donor_dir)
     cfg = inspect_donor_config(donor_dir, hf_sd, max_T=max_T, chunk_size=chunk_size, hybrid_every=hybrid_every)
     cfg["vsa_swa_window"] = int(swa_window)
+    cfg["vsa_num_slots"] = 32
+    cfg["vsa_num_pages"] = 8
+    cfg["vsa_mix_before_rope"] = True
     if n_vis > 0:
         cfg["visual_sidecar_path"] = vis_path
         cfg["visual_tensors_count"] = n_vis
@@ -124,6 +127,13 @@ def convert_donor_model(
         sd[f"{p}.k_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
         if swa_window > 0:
             sd[f"{p}.swa_mix_logit"] = torch.full((H,), 2.0, dtype=torch.float32)
+        if hasattr(stu.blocks[li].vsa, "slot_router"):
+            sd[f"{p}.slot_router.weight"] = stu.blocks[li].vsa.slot_router.weight.detach().to(dtype).clone()
+            sd[f"{p}.slot_router.bias"] = stu.blocks[li].vsa.slot_router.bias.detach().to(dtype).clone()
+            sd[f"{p}.slot_gate"] = torch.zeros(H, dtype=torch.float32)
+        if getattr(stu.blocks[li].vsa, "q_norm", None) is not None:
+            sd.setdefault(f"{p}.q_norm.weight", stu.blocks[li].vsa.q_norm.weight.detach().to(dtype).clone())
+            sd.setdefault(f"{p}.k_norm.weight", stu.blocks[li].vsa.k_norm.weight.detach().to(dtype).clone())
 
     stu.load_state_dict(sd, strict=True)
     n_params = sum(p.numel() for p in stu.parameters())
@@ -705,6 +715,34 @@ def _kd_microbatch_backward(stu, donor, is_hf_donor: bool, w_lm_t: torch.Tensor,
     return loss
 
 
+
+def _build_procedural_binder_batch(tok, bs: int, T: int, step: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generates procedural multi-doc fact & passkey sequences buried in filler so Page-Slot Bank learns long-range recall."""
+    rng = random.Random(900000 + step)
+    filler = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
+    filler_ids = tok.encode(filler * 32, add_special_tokens=False)
+    sectors = ("Orion", "Hemlock", "Vanguard", "Chronos", "Lyra", "Titan", "Aegis", "Nova", "Cobalt", "Apex", "Helios", "Kestrel")
+    xs, ys = [], []
+    for b in range(bs):
+        chosen = rng.sample(sectors, 4)
+        facts = [(s, rng.randint(10000, 99999)) for s in chosen]
+        qa_str = "\n".join(f"What is the pass key for Project {s}? The pass key for Project {s} is {code}." for s, code in facts)
+        qa_ids = tok.encode("\n\n" + qa_str, add_special_tokens=False)
+        rem = max(64, T + 1 - len(qa_ids))
+        hay = (filler_ids * (rem // len(filler_ids) + 2))[:rem]
+        for idx_f, (s, code) in enumerate(facts):
+            needle = tok.encode(f" Memo: The pass key for Project {s} is {code}. Remember {code}. ", add_special_tokens=False)
+            pos_n = min(max(4, int(rem * (0.08 + 0.22 * idx_f))), max(4, rem - len(needle) - 4))
+            hay[pos_n : pos_n + len(needle)] = needle
+        seq = (hay + qa_ids)[: T + 1]
+        if len(seq) < T + 1:
+            seq = seq + filler_ids[: T + 1 - len(seq)]
+        t_seq = torch.tensor(seq, dtype=torch.long)
+        xs.append(t_seq[:-1])
+        ys.append(t_seq[1:])
+    return torch.stack(xs, dim=0), torch.stack(ys, dim=0)
+
+
 def heal_universal_model(
     ckpt_path: str,
     *,
@@ -815,10 +853,15 @@ def heal_universal_model(
     t_window = time.perf_counter()
     step_window = start_step
 
+    from transformers import AutoTokenizer
+    binder_tok = AutoTokenizer.from_pretrained(donor_dir)
     for step in range(start_step, total_steps):
-        idx = torch.randint(0, n_win, (bs,), generator=gen)
-        base = idx[:, None] * T + ar[None, :]
-        x, y = train_tokens[base].long(), train_tokens[base + 1].long()
+        if step % 5 == 0:
+            x, y = _build_procedural_binder_batch(binder_tok, bs, T, step, device)
+        else:
+            idx = torch.randint(0, n_win, (bs,), generator=gen)
+            base = idx[:, None] * T + ar[None, :]
+            x, y = train_tokens[base].long(), train_tokens[base + 1].long()
         opt.zero_grad(set_to_none=True)
         loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
 
