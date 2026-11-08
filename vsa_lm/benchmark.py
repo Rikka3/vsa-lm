@@ -64,7 +64,7 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
     stu = UniversalVSALM(**cfg)
     state_in = {k: v for k, v in ck["model"].items() if "pos_code" not in k and "head_pos_delta" not in k}
     missing, unexpected = stu.load_state_dict(state_in, strict=False)
-    allowed_missing = {"out_norm"}
+    allowed_missing = {"out_norm", "slot_router", "slot_gate"}
     real_missing = [m for m in missing if not any(a in m for a in allowed_missing)]
     if real_missing or unexpected:
         raise RuntimeError(f"Checkpoint mismatch! Missing: {real_missing}, Unexpected: {unexpected}")
@@ -74,7 +74,7 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
     del ck
 
     fp32_keys = ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate",
-                 "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "out_norm", "swa_mix")
+                 "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "out_norm", "swa_mix", "slot_gate")
     for n, p in stu.named_parameters():
         if any(k in n for k in fp32_keys):
             p.data = p.data.to(device, dtype=torch.float32)

@@ -512,7 +512,7 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
 
 # Parameters kept in fp32 everywhere (saved checkpoints, benchmark/server loaders).
 _FP32_KEYS = ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate",
-              "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix")
+              "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix", "slot_gate")
 
 
 def _load_student_ckpt(path: str, swa_window: int | None = None):
@@ -527,7 +527,7 @@ def _load_student_ckpt(path: str, swa_window: int | None = None):
     stu = UniversalVSALM(**stu_cfg)
     state_in = {k: v for k, v in ck["model"].items() if "pos_code" not in k and "head_pos_delta" not in k}
     missing, unexpected = stu.load_state_dict(state_in, strict=False)
-    allowed_missing = {"rope_mix", "v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix"}
+    allowed_missing = {"rope_mix", "v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix", "slot_router", "slot_gate"}
     real_missing = [m for m in missing if not any(a in m for a in allowed_missing)]
     if real_missing or unexpected:
         raise RuntimeError(f"Checkpoint mismatch! Missing: {real_missing[:10]}, Unexpected: {unexpected[:10]}")
@@ -545,7 +545,7 @@ def _setup_trainable(stu, stu_cfg: dict, device: torch.device, freeze_mlp: bool 
         if any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix")):
             p_.requires_grad_(True)
             vsa_conv.append(p_)
-        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm", "swa_mix")):
+        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm", "swa_mix", "slot_gate", "slot_router")):
             p_.requires_grad_(True)
             vsa_core.append(p_)
         elif ".vsa." in n_ and is_vsa_blk:

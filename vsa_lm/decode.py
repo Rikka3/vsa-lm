@@ -345,6 +345,11 @@ class VSARecurrentDecoder:
                     cache["swa_n"] = torch.zeros(1, dtype=torch.long, device=device)
                     cache["swa_ar"] = torch.arange(W + 1, device=device)
                     cache["swa_k0"] = torch.zeros(batch_size, v.HKV, 1, v.HD, device=device, dtype=dt)
+                if getattr(v, "num_slots", 0) > 0:
+                    S = v.num_slots
+                    cache["slot_C"] = torch.zeros(batch_size, v.HKV, S, v.HD, device=device, dtype=torch.float32)
+                    cache["slot_U"] = torch.zeros(batch_size, v.HKV, S, v.HD, device=device, dtype=torch.float32)
+                    cache["slot_Z"] = torch.full((batch_size, v.HKV, S, 1), 1e-6, device=device, dtype=torch.float32)
                 kv_caches[li] = cache or None
             else:
                 s = blk.attn if hasattr(blk, "attn") else blk.softmax_attn
@@ -365,7 +370,10 @@ class VSARecurrentDecoder:
             if isinstance(c, dict):
                 for key, t in c.items():
                     if torch.is_tensor(t) and key != "swa_ar":
-                        t.zero_()
+                        if key == "slot_Z":
+                            t.fill_(1e-6)
+                        else:
+                            t.zero_()
             elif isinstance(c, GraphKV):
                 c.k.zero_()
                 c.v.zero_()
@@ -479,7 +487,38 @@ class VSARecurrentDecoder:
                 vx = repeat_kv(v, G)
                 v_raw = v
 
-            q, k = self._rope_qk(ly, q, k, pos)
+            if getattr(ly, "q_norm", None) is not None:
+                q = ly.q_norm(q.transpose(1, 2)).transpose(1, 2)
+                k = ly.k_norm(k.transpose(1, 2)).transpose(1, 2)
+
+            y_slot = None
+            if getattr(ly, "num_slots", 0) > 0 and isinstance(kv_caches[li], dict) and "slot_C" in kv_caches[li]:
+                if v_raw is None:
+                    v_raw = ly.v_proj(h).view(B, 1, HKV, HD).transpose(1, 2)
+                S = ly.num_slots
+                w_s = torch.sigmoid(ly.slot_router(h)).view(B, 1, HKV, S).permute(0, 2, 3, 1).float()
+                k_cl = F.normalize(k.float(), p=2.0, dim=-1).squeeze(2).unsqueeze(2)
+                q_cl = F.normalize(q.float(), p=2.0, dim=-1).view(B, HKV, G, 1, HD)
+                v_cl = v_raw.float().squeeze(2).unsqueeze(2)
+                sc, su, sz = kv_caches[li]["slot_C"], kv_caches[li]["slot_U"], kv_caches[li]["slot_Z"]
+                sc.add_(w_s * k_cl)
+                su.add_(w_s * v_cl)
+                sz.add_(w_s)
+                K_sl = sc / sz
+                V_sl = su / sz
+                s_scores = torch.matmul(q_cl, K_sl.unsqueeze(2).transpose(-1, -2)) * (HD ** 0.5)
+                s_probs = F.softmax(s_scores, dim=-1)
+                y_slot = torch.matmul(s_probs, V_sl.unsqueeze(2)).view(B, H, 1, HD).to(q.dtype)
+
+            if getattr(ly, "mix_before_rope", False) and hasattr(ly, "_km_dt"):
+                kx_pre = torch.matmul(repeat_kv(k, G), ly._km_dt)
+                q, k = self._rope_qk(ly, q, k, pos)
+                _, kx = self._rope_qk(ly, q, kx_pre, pos)
+            else:
+                q, k = self._rope_qk(ly, q, k, pos)
+                kx = repeat_kv(k, G)
+                if hasattr(ly, "_km_dt"):
+                    kx = torch.matmul(kx, ly._km_dt)
 
             y_swa = None
             if getattr(ly, "swa_window", 0) > 0:
@@ -490,10 +529,6 @@ class VSARecurrentDecoder:
                     kv_caches[li], q, k, v_raw, ly.swa_window, G,
                     sink_cap=self.max_T, inv_freq64=inv64,
                 )
-
-            kx = repeat_kv(k, G)
-            if hasattr(ly, "_km_dt"):
-                kx = torch.matmul(kx, ly._km_dt)
 
             if hasattr(ly, "k_conv") and isinstance(kv_caches[li], dict) and getattr(ly, "_k_conv_active", False):
                 k_in = torch.cat([kv_caches[li]["k_buf"], kx.unsqueeze(-1)], dim=-1)
@@ -519,6 +554,9 @@ class VSARecurrentDecoder:
             if y_swa is not None:
                 a = ly._cached_swa_a.view(1, H, 1, 1).to(y.dtype)
                 y = y + a * (y_swa.to(y.dtype) - y)
+            if y_slot is not None:
+                sg = torch.tanh(ly.slot_gate.float()).view(1, H, 1, 1).to(y.dtype)
+                y = y + sg * y_slot
 
             if g_proj_out is not None:
                 y = y * (2.0 * torch.sigmoid(g_proj_out.view(B, 1, H, HD).transpose(1, 2)))
@@ -761,3 +799,15 @@ class VSARecurrentDecoder:
                 M_doc = M_doc * (ly._cached_gam.view(1, -1, 1, 1) ** rem_steps)
             states[li] = states[li] - M_doc
         return states
+
+    @staticmethod
+    def erase_page(kv_caches: list, page_idx: int, num_pages: int = 8):
+        """Surgically zero one page of slots across all VSA layers without touching other pages."""
+        for c in kv_caches:
+            if isinstance(c, dict) and "slot_C" in c:
+                S = c["slot_C"].shape[2]
+                sp = max(1, S // num_pages)
+                lo, hi = page_idx * sp, min(S, (page_idx + 1) * sp)
+                c["slot_C"][:, :, lo:hi].zero_()
+                c["slot_U"][:, :, lo:hi].zero_()
+                c["slot_Z"][:, :, lo:hi].fill_(1e-6)

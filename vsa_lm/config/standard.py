@@ -1,4 +1,4 @@
-"""Universal Softmax, VSA, Block, and LM classes."""
+"""Universal Softmax, VSA (with Abelian Page-Slot Bank & Mix-First RoPE), Block, and LM classes."""
 from __future__ import annotations
 
 import math
@@ -92,11 +92,12 @@ class UniversalVSAAttn(nn.Module):
         while HD > 128 and H * 2 <= 64:
             H, HKV, HD = H * 2, HKV * 2, HD // 2
         if HD & (HD - 1) != 0:
-            raise ValueError(f"VSA head_dim must be a power of two for Triton kernel, got {HD}")
+            raise ValueError(f"VSA head_dim must be power of two, got {HD}")
 
         qkv_bias = bool(cfg.get("vsa_qkv_bias", cfg.get("qkv_bias", False)))
         self.H, self.HKV, self.HD, self.G = H, HKV, HD, H // HKV
         self.max_T = max_T
+        self.mix_before_rope = bool(cfg.get("vsa_mix_before_rope", False))
         self.q_proj = nn.Linear(D, H * HD, bias=qkv_bias)
         self.k_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
         self.v_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
@@ -131,9 +132,6 @@ class UniversalVSAAttn(nn.Module):
             nn.init.zeros_(self.g_proj.weight)
             self.v_self_scale = nn.Parameter(torch.zeros(H))
 
-        # Sliding-window softmax branch: exact donor attention over the last `swa_window` tokens
-        # plus the first token (attention sink), reusing the donor's q/k/v. Mixed per head into the
-        # VSA output via sigmoid(swa_mix_logit); init 2.0 -> 88% window attention at start.
         self.swa_window = int(cfg.get("vsa_swa_window", 0) or 0)
         if self.swa_window > 0:
             self.swa_mix_logit = nn.Parameter(torch.full((H,), 2.0))
@@ -147,6 +145,15 @@ class UniversalVSAAttn(nn.Module):
             self.q_relu_mix = nn.Parameter(torch.zeros(H, 1, 1))
             self.k_relu_mix = nn.Parameter(torch.zeros(H, 1, 1))
 
+        # Native Abelian Page-Slot Bank (vsa_num_slots=32 -> 8 pages x 4 slots per KV head)
+        self.num_slots = int(cfg.get("vsa_num_slots", 0) or 0)
+        self.num_pages = int(cfg.get("vsa_num_pages", 8) or 8)
+        if self.num_slots > 0:
+            self.slot_router = nn.Linear(D, HKV * self.num_slots, bias=True)
+            nn.init.normal_(self.slot_router.weight, std=0.01)
+            nn.init.constant_(self.slot_router.bias, -3.0)
+            self.slot_gate = nn.Parameter(torch.zeros(H))
+
     def head_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, self.H, self.HD)
@@ -159,6 +166,47 @@ class UniversalVSAAttn(nn.Module):
     def gamma(self) -> torch.Tensor:
         return (0.9999 * torch.sigmoid(self.log_gamma)).clamp(1e-4, 0.9999).float()
 
+    def _slot_bank_forward(self, x: torch.Tensor, q_raw: torch.Tensor, k_raw: torch.Tensor, v_raw: torch.Tensor) -> torch.Tensor:
+        """Causal Abelian Page-Slot prefix sum (exact token-level match with recurrent step)."""
+        B, T, _ = x.shape
+        S = self.num_slots
+        w = torch.sigmoid(self.slot_router(x)).view(B, T, self.HKV, S).permute(0, 2, 1, 3).float()
+        k_c = F.normalize(k_raw.float(), p=2.0, dim=-1)
+        q_c = F.normalize(q_raw.float(), p=2.0, dim=-1)
+        v_c = v_raw.float()
+
+        C_state = torch.zeros(B, self.HKV, S, self.HD, device=x.device, dtype=torch.float32)
+        U_state = torch.zeros(B, self.HKV, S, self.HD, device=x.device, dtype=torch.float32)
+        Z_state = torch.full((B, self.HKV, S, 1), 1e-6, device=x.device, dtype=torch.float32)
+        outs = []
+        blk_sz = 128
+        for t0 in range(0, T, blk_sz):
+            t1 = min(t0 + blk_sz, T)
+            wb = w[:, :, t0:t1, :]
+            kb = k_c[:, :, t0:t1, :]
+            vb = v_c[:, :, t0:t1, :]
+            qb = q_c[:, :, t0:t1, :].view(B, self.HKV, self.G, t1 - t0, self.HD)
+
+            dC = (wb.unsqueeze(-1) * kb.unsqueeze(-2)).cumsum(dim=2)
+            dU = (wb.unsqueeze(-1) * vb.unsqueeze(-2)).cumsum(dim=2)
+            dZ = wb.cumsum(dim=2).unsqueeze(-1)
+
+            C_t = C_state.unsqueeze(2) + dC
+            U_t = U_state.unsqueeze(2) + dU
+            Z_t = Z_state.unsqueeze(2) + dZ
+
+            K_slot = C_t / Z_t
+            V_slot = U_t / Z_t
+            scores = torch.einsum("bhgtd,bhtsd->bhgts", qb, K_slot) * (self.HD ** 0.5)
+            probs = F.softmax(scores, dim=-1)
+            y_b = torch.einsum("bhgts,bhtsd->bhgtd", probs, V_slot).reshape(B, self.H, t1 - t0, self.HD)
+            outs.append(y_b.to(x.dtype))
+
+            C_state = C_t[:, :, -1]
+            U_state = U_t[:, :, -1]
+            Z_state = Z_t[:, :, -1]
+        return torch.cat(outs, dim=2)
+
     def window_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         T = q.shape[2]
         pos = torch.arange(T, device=q.device)
@@ -167,7 +215,6 @@ class UniversalVSAAttn(nn.Module):
         kr, vr = repeat_kv(k, self.G), repeat_kv(v, self.G)
         if T <= self.max_T or not hasattr(self.rope, "inv_freq"):
             return F.scaled_dot_product_attention(q, kr, vr, attn_mask=mask)
-        # Match recurrent decoder sink_cap when T > max_T: rotate query back by (t + 1 - max_T) for sink score
         shift = (pos + 1 - self.max_T).clamp(min=0).float()
         freqs = torch.outer(-shift, self.rope.inv_freq.to(q.device))
         emb = torch.cat((freqs, freqs), dim=-1)
@@ -184,14 +231,21 @@ class UniversalVSAAttn(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
-        q, k, v = self.head_qkv(x)
-        q, k = self.rope(q), self.rope(k)
-        y_swa = self.window_attn(q, k, v) if self.swa_window > 0 else None
-        kx, vx = repeat_kv(k, self.G), repeat_kv(v, self.G)
+        q_raw, k_raw, v_raw = self.head_qkv(x)
+        y_slot = self._slot_bank_forward(x, q_raw, k_raw, v_raw) if self.num_slots > 0 else None
 
-        if hasattr(self, "k_head_mix"):
-            kx = torch.einsum("bhtd,hde->bhte", kx, self.k_head_mix.to(kx.dtype))
-            vx = torch.einsum("bhtd,hde->bhte", vx, self.v_head_mix.to(vx.dtype))
+        q, k = self.rope(q_raw), self.rope(k_raw)
+        y_swa = self.window_attn(q, k, v_raw) if self.swa_window > 0 else None
+
+        if self.mix_before_rope and hasattr(self, "k_head_mix"):
+            kx = torch.einsum("bhtd,hde->bhte", repeat_kv(k_raw, self.G), self.k_head_mix.to(k_raw.dtype))
+            kx = self.rope(kx)
+            vx = torch.einsum("bhtd,hde->bhte", repeat_kv(v_raw, self.G), self.v_head_mix.to(v_raw.dtype))
+        else:
+            kx, vx = repeat_kv(k, self.G), repeat_kv(v_raw, self.G)
+            if hasattr(self, "k_head_mix"):
+                kx = torch.einsum("bhtd,hde->bhte", kx, self.k_head_mix.to(kx.dtype))
+                vx = torch.einsum("bhtd,hde->bhte", vx, self.v_head_mix.to(vx.dtype))
 
         if hasattr(self, "k_conv"):
             kx_flat = kx.permute(0, 1, 3, 2).reshape(B, self.H * self.HD, T)
@@ -217,6 +271,9 @@ class UniversalVSAAttn(nn.Module):
         if y_swa is not None:
             a = torch.sigmoid(self.swa_mix_logit.float()).view(1, self.H, 1, 1).to(y.dtype)
             y = y + a * (y_swa.to(y.dtype) - y)
+        if y_slot is not None:
+            sg = torch.tanh(self.slot_gate.float()).view(1, self.H, 1, 1).to(y.dtype)
+            y = y + sg * y_slot
         if hasattr(self, "g_proj"):
             y = y * (2.0 * torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2)))
         return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD))
