@@ -1067,9 +1067,9 @@ def onpolicy_distill(
             train_pool = []
         random.Random(seed + rnd).shuffle(train_pool)
         loss_sum, n_steps = 0.0, 0
-        n_corpus = (seqs_per_step // max(1, corpus_every - 1)) if corpus_every > 1 else 0
         for s0 in range(0, len(train_pool), seqs_per_step):
             chunk = train_pool[s0 : s0 + seqs_per_step]
+            n_corpus = max(1, len(chunk) // max(1, corpus_every - 1)) if corpus_every > 1 else 0
             w = 1.0 / (len(chunk) + n_corpus)
             opt.zero_grad(set_to_none=True)
             loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
