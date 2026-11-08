@@ -660,7 +660,7 @@ class VSARecurrentDecoder:
             else:
                 q, k = _rope(q, pos), _rope(k, pos)
                 pk, pv = kv_caches[li].append(k, v)
-                y = F.scaled_dot_product_attention(q, pk, pv)
+                y = F.scaled_dot_product_attention(q, pk.to(q.dtype), pv.to(q.dtype))
             y = (y.to(x.dtype) * g).transpose(1, 2).reshape(B, 1, -1)
             x = x + layer.to_out(y)
             u = block.ffn_up(block.norm2(x))
