@@ -492,7 +492,7 @@ class VSARecurrentDecoder:
                 k = ly.k_norm(k.transpose(1, 2)).transpose(1, 2)
 
             y_slot = None
-            if getattr(ly, "num_slots", 0) > 0 and isinstance(kv_caches[li], dict) and "slot_C" in kv_caches[li]:
+            if getattr(ly, "num_slots", 0) > 0 and isinstance(kv_caches[li], dict) and "slot_C" in kv_caches[li] and bool(ly.slot_gate.detach().abs().max().item() > 0.05):
                 if v_raw is None:
                     v_raw = ly.v_proj(h).view(B, 1, HKV, HD).transpose(1, 2)
                 S = ly.num_slots
