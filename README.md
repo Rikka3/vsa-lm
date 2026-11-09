@@ -15,51 +15,61 @@ By converting **75% of pretrained Transformer attention layers** into **Bolt Att
 For pretrained donors with $H$ query heads and $H_{KV} < H$ key-value heads ($G = H / H_{KV}$), shared KV heads are projected into $H$ independent subspaces **before** rotary position encoding so relative position phases never drift past training length:
 
 $$
-\begin{aligned}
-\tilde{k}_{t,h} &= \mathrm{RoPE}_t\!\left(\mathrm{repeat\_kv}(k_t)_h W^{\mathrm{mix}}_{k,h}\right)
-+ \mathrm{Conv1D}_4(\tilde{k})_{t,h}, \\
-v'_{t,h} &= \mathrm{repeat\_kv}(v_t)_h W^{\mathrm{mix}}_{v,h}.
-\end{aligned}
+\tilde{k}_{t,h} = \mathrm{RoPE}_t\!\left(\mathrm{repeat\_kv}(k_t)_h W^{\mathrm{mix}}_{k,h}\right) + \mathrm{Conv1D}_4(\tilde{k})_{t,h}
 $$
 
 $$
-\begin{aligned}
-q_{t,h} &\leftarrow \sqrt{D}\,\frac{\phi_q(q_{t,h})}{\left\|\phi_q(q_{t,h})\right\|_2}, \\
-k_{t,h} &\leftarrow \frac{\phi_k(\tilde{k}_{t,h})}{\left\|\phi_k(\tilde{k}_{t,h})\right\|_2}, \\
-\phi(z) &= z + \alpha \mathrm{ReLU}(z).
-\end{aligned}
+v'_{t,h} = \mathrm{repeat\_kv}(v_t)_h W^{\mathrm{mix}}_{v,h}
+$$
+
+$$
+q_{t,h} \leftarrow \sqrt{D}\,\frac{\phi_q(q_{t,h})}{\left\|\phi_q(q_{t,h})\right\|_2}
+$$
+
+$$
+k_{t,h} \leftarrow \frac{\phi_k(\tilde{k}_{t,h})}{\left\|\phi_k(\tilde{k}_{t,h})\right\|_2}
+$$
+
+$$
+\phi(z) = z + \alpha \mathrm{ReLU}(z)
 $$
 
 ### 2. Decayed Outer-Product State & Steady-State Readout
 Each head $h \in \{1, \dots, H\}$ maintains fixed $D \times D$ associative matrix $M_{t,h}$ with learnable decay $\gamma_h = 0.9999\,\sigma(\ell_h)$:
 
 $$
-\begin{aligned}
-M_{t,h} &= \gamma_h M_{t-1,h} + k_{t,h} \otimes v'_{t,h}, \\
-y^{\mathrm{vsa}}_{t,h} &= \mathrm{RMSNorm}\left(\frac{1 - \gamma_h}{\sqrt{D}} M_{t,h} q_{t,h}\right)
-+ s_h v'_{t,h} \\
-&\quad + 2\sigma\left(q_{t,h}^{\top} g^{\mathrm{loc}}_h\right)
-\mathrm{Conv1D}_8(v')_{t,h}.
-\end{aligned}
+M_{t,h} = \gamma_h M_{t-1,h} + k_{t,h} \otimes v'_{t,h}
+$$
+
+$$
+y^{\mathrm{vsa}}_{t,h} = \mathrm{RMSNorm}\left(\frac{1 - \gamma_h}{\sqrt{D}} M_{t,h} q_{t,h}\right) + s_h v'_{t,h} + 2\sigma\left(q_{t,h}^{\top} g^{\mathrm{loc}}_h\right)\mathrm{Conv1D}_8(v')_{t,h}
 $$
 
 ### 3. Abelian Page-Slot Binder (Non-Decaying Prefix-Sum Slots)
 To retain early numbers, passkeys, and definitions across long filler without exponential decay or RoPE distance attenuation, each layer maintains $S = 32$ position-free slots (8 pages $\times$ 4 slots) updated via salience gate $w_{t,m} = \sigma(\mathrm{Router}_m(x_t)) \in (0, 1)$:
 
 $$
-\begin{aligned}
-C_{t,m} &= C_{t-1,m} + w_{t,m}\hat{k}_t, \\
-U_{t,m} &= U_{t-1,m} + w_{t,m}v_t, \\
-Z_{t,m} &= Z_{t-1,m} + w_{t,m}.
-\end{aligned}
+C_{t,m} = C_{t-1,m} + w_{t,m}\hat{k}_t
 $$
 
 $$
-\begin{aligned}
-\hat{K}_{t,m} &= \frac{C_{t,m}}{Z_{t,m} + \epsilon}, \\
-\hat{V}_{t,m} &= \frac{U_{t,m}}{Z_{t,m} + \epsilon}, \\
-y^{\mathrm{slot}}_t &= \mathrm{Softmax}\left(\sqrt{D}\,\hat{q}_t\hat{K}_t^{\top}\right)\hat{V}_t.
-\end{aligned}
+U_{t,m} = U_{t-1,m} + w_{t,m}v_t
+$$
+
+$$
+Z_{t,m} = Z_{t-1,m} + w_{t,m}
+$$
+
+$$
+\hat{K}_{t,m} = \frac{C_{t,m}}{Z_{t,m} + \epsilon}
+$$
+
+$$
+\hat{V}_{t,m} = \frac{U_{t,m}}{Z_{t,m} + \epsilon}
+$$
+
+$$
+y^{\mathrm{slot}}_t = \mathrm{Softmax}\left(\sqrt{D}\,\hat{q}_t\hat{K}_t^{\top}\right)\hat{V}_t
 $$
 
 ### 4. Intra-Layer Local Window & Combined Output
@@ -75,11 +85,11 @@ $$
 Because $M_t$ and $(C_t, U_t, Z_t)$ are strictly additive over tokens, any memorized document span $[t_0, t_1]$ or slot page $p \in \{0,\dots,7\}$ can be removed in $<1\,\mathrm{ms}$:
 
 $$
-\begin{aligned}
-M_t &\leftarrow M_t - \sum_{j=t_0}^{t_1}\gamma^{t-j}(k_j\otimes v'_j), \\
-\left(C_{t,4p:4p+4},U_{t,4p:4p+4},Z_{t,4p:4p+4}\right)
-&\leftarrow (0,0,\epsilon).
-\end{aligned}
+M_t \leftarrow M_t - \sum_{j=t_0}^{t_1}\gamma^{t-j}(k_j\otimes v'_j)
+$$
+
+$$
+\left(C_{t,4p:4p+4},U_{t,4p:4p+4},Z_{t,4p:4p+4}\right) \leftarrow (0,0,\epsilon)
 $$
 
 ### 6. OpenMythos Gated Latent Thinking ($0$-Byte Softmax KV Growth)
