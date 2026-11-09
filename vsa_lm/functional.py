@@ -1,16 +1,15 @@
-"""Autograd wrapper and fp32 reference implementations for VSA attention."""
+"""Autograd wrapper and fp32/CPU reference implementations for VSA attention."""
 import torch
+import torch.nn.functional as F
 
-from .kernels import vsa_chunk_forward_kernel, vsa_chunk_backward_kernel, vsa_recurrent_step_kernel
+from .kernels import HAS_TRITON, vsa_chunk_forward_kernel, vsa_chunk_backward_kernel, vsa_recurrent_step_kernel
 
 
 class VSAChunkFunction(torch.autograd.Function):
-    """Chunkwise VSA attention with exact gradients, including d/dgamma.
-    Uses BF16 TensorCore tl.dot at BLOCK_SIZE=32 (even for D=128) and reuses Y_saved in backward.
-    """
-
     @staticmethod
     def forward(ctx, q, k, v, gamma, chunk_size):
+        if not HAS_TRITON or not q.is_cuda:
+            return vsa_parallel_attention(q.float(), k.float(), v.float(), gamma.float()).to(q.dtype)
         B, H, T, D = q.shape
         if q.dtype in (torch.bfloat16, torch.float16) and T >= 32:
             eff_chunk = 32 if chunk_size >= 32 else chunk_size
@@ -67,8 +66,25 @@ def fused_vsa_recurrent_step(q: torch.Tensor, kx: torch.Tensor, vx: torch.Tensor
                              v_self: torch.Tensor, q_relu: torch.Tensor | None = None,
                              k_relu: torch.Tensor | None = None, norm_w: torch.Tensor | None = None,
                              v_loc: torch.Tensor | None = None, local_q_gate: torch.Tensor | None = None) -> torch.Tensor:
-    """Launch the Fused Triton O(1) VSA recurrent decode step kernel."""
     B, H, _, D = q.shape
+    if not HAS_TRITON or not q.is_cuda:
+        qf, kf, vf = q.float(), kx.float(), vx.float()
+        if q_relu is not None:
+            qf = qf + q_relu.view(1, H, 1, 1) * F.relu(qf)
+        if k_relu is not None:
+            kf = kf + k_relu.view(1, H, 1, 1) * F.relu(kf)
+        qf = F.normalize(qf, p=2.0, dim=-1) * (D ** 0.5)
+        kf = F.normalize(kf, p=2.0, dim=-1)
+        M.mul_(gam.view(1, H, 1, 1)).add_(torch.matmul(kf.transpose(-1, -2), vf))
+        y = torch.matmul(qf, M) * omg_scale.view(1, H, 1, 1)
+        if norm_w is not None:
+            y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + 1e-6) * norm_w.view(1, 1, 1, D)
+        y = y + v_self.view(1, H, 1, 1) * vf
+        if v_loc is not None and local_q_gate is not None:
+            q_mod = torch.sigmoid((qf * local_q_gate.view(1, H, 1, D)).sum(-1, keepdim=True))
+            y = y + (2.0 * q_mod) * v_loc.float()
+        return y.to(q.dtype)
+
     out = torch.empty_like(q)
     z_h = torch.zeros_like(gam)
     qr = q_relu.view(-1) if q_relu is not None else z_h
@@ -86,7 +102,6 @@ def fused_vsa_recurrent_step(q: torch.Tensor, kx: torch.Tensor, vx: torch.Tensor
 
 
 def vsa_parallel_attention(q, k, v, gamma):
-    """Dense fp32 reference: decayed causal attention with (1-gamma) read scaling."""
     B, H, T, Dh = q.shape
     t = torch.arange(T, device=q.device, dtype=torch.float32)
     diff = (t[:, None] - t[None, :]).clamp_min(0)
@@ -97,7 +112,6 @@ def vsa_parallel_attention(q, k, v, gamma):
 
 
 def vsa_recurrent_reference(q, k, v, gamma):
-    """Step-by-step fp32 reference; returns (outputs, final state)."""
     B, H, T, Dh = q.shape
     M = torch.zeros(B, H, Dh, Dh, device=q.device, dtype=torch.float32)
     ys = []
