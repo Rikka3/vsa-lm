@@ -239,13 +239,13 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 285,
     acc = (sum(hits) / len(hits)) * 100.0
     out["HellaSwag"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
 
-    # 3. GSM8K Math (P2 Fix: max_new=2048, temp=0.6, top_p=0.95, logs truncation rate & median length)
+    # 3. GSM8K Math (P2 Fix: max_new=4096, temp=0.6, top_p=0.95, logs truncation rate & median length)
     rows = _load_rows("openai/gsm8k", "main", "test", gen_limit)
     hits, lengths, trunc_cnt = [], [], 0
     for idx_q, r in enumerate(rows):
         gold = r["answer"].split("####")[-1].strip().replace(",", "")
         p_str = gsm8k_prompt(tok, r["question"])
-        gen, n_new, hit_cap = _gen(p_str, max_new=4096, temperature=0.6, top_p=0.95, seed=1000 + idx_q)
+        gen, n_new, hit_cap = _gen(p_str, max_new=4096, temperature=0.2, top_p=0.85, seed=1000 + idx_q)
         lengths.append(n_new)
         trunc_cnt += int(hit_cap)
         ans_region = gen.split("</think>")[-1] if "</think>" in gen else gen

@@ -257,6 +257,8 @@ class VSARecurrentDecoder:
                 ly._cached_nw = ly.out_norm.weight.detach().float() if hasattr(ly, "out_norm") else None
                 ly._cached_lqg = ly.local_q_gate.detach().float().contiguous() if hasattr(ly, "local_q_gate") else None
                 ly._cached_swa_a = torch.sigmoid(ly.swa_mix_logit.detach().float()) if getattr(ly, "swa_window", 0) > 0 else None
+                ly._slot_active = bool(getattr(ly, "num_slots", 0) > 0 and hasattr(ly, "slot_gate") and ly.slot_gate.detach().abs().max().item() > 0.05)
+                ly._cached_slot_g = torch.tanh(ly.slot_gate.detach().float()).view(1, H, 1, 1).to(dt) if ly._slot_active else None
 
                 if hasattr(ly, "v_head_mix") and hasattr(ly, "v_proj"):
                     wv = ly.v_proj.weight.detach().to(torch.float32).view(HKV, HD, -1)
@@ -492,7 +494,7 @@ class VSARecurrentDecoder:
                 k = ly.k_norm(k.transpose(1, 2)).transpose(1, 2)
 
             y_slot = None
-            if getattr(ly, "num_slots", 0) > 0 and isinstance(kv_caches[li], dict) and "slot_C" in kv_caches[li] and bool(ly.slot_gate.detach().abs().max().item() > 0.05):
+            if getattr(ly, "_slot_active", False) and isinstance(kv_caches[li], dict) and "slot_C" in kv_caches[li]:
                 if v_raw is None:
                     v_raw = ly.v_proj(h).view(B, 1, HKV, HD).transpose(1, 2)
                 S = ly.num_slots
@@ -555,8 +557,7 @@ class VSARecurrentDecoder:
                 a = ly._cached_swa_a.view(1, H, 1, 1).to(y.dtype)
                 y = y + a * (y_swa.to(y.dtype) - y)
             if y_slot is not None:
-                sg = torch.tanh(ly.slot_gate.float()).view(1, H, 1, 1).to(y.dtype)
-                y = y + sg * y_slot
+                y = y + ly._cached_slot_g * y_slot
 
             if g_proj_out is not None:
                 y = y * (2.0 * torch.sigmoid(g_proj_out.view(B, 1, H, HD).transpose(1, 2)))

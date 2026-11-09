@@ -555,7 +555,7 @@ def _setup_trainable(stu, stu_cfg: dict, device: torch.device, freeze_mlp: bool 
         if any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix")):
             p_.requires_grad_(True)
             vsa_conv.append(p_)
-        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm", "swa_mix", "slot_gate", "slot_router")):
+        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm", "swa_mix", "slot_gate")):
             p_.requires_grad_(True)
             vsa_core.append(p_)
         elif ".vsa." in n_ and is_vsa_blk:
@@ -575,7 +575,7 @@ def _setup_trainable(stu, stu_cfg: dict, device: torch.device, freeze_mlp: bool 
     groups = [
         {"params": vsa_conv,     "weight_decay": 0.0, "lr_scale": 5.0},
         {"params": vsa_core,     "weight_decay": 0.0, "lr_scale": 5.0},
-        {"params": vsa_proj,     "weight_decay": 0.0, "lr_scale": 1.0},
+        {"params": vsa_proj,     "weight_decay": 0.01, "lr_scale": 1.0},
         {"params": mlp_and_norm, "weight_decay": 0.0, "lr_scale": 0.08},
     ]
     groups = [g for g in groups if g["params"]]
