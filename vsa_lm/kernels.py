@@ -1,7 +1,20 @@
 """Triton kernels for chunkwise VSA attention."""
-import triton
-import triton.language as tl
-
+"""Triton kernels for chunkwise VSA attention (with CPU no-Triton fallback)."""
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+    class _DummyTriton:
+        @staticmethod
+        def jit(fn):
+            return fn
+    class _DummyTL:
+        constexpr = int
+        float32 = float
+    triton = _DummyTriton()
+    tl = _DummyTL()
 
 @triton.jit
 def _dot(x, y):
