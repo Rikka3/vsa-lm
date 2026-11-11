@@ -262,7 +262,7 @@ class VSARecurrentDecoder:
                 ly._cached_lqg = ly.local_q_gate.detach().float().contiguous() if hasattr(ly, "local_q_gate") else None
                 ly._cached_swa_a = torch.sigmoid(ly.swa_mix_logit.detach().float()) if getattr(ly, "swa_window", 0) > 0 else None
                 ly._slot_active = bool(getattr(ly, "num_slots", 0) > 0 and hasattr(ly, "slot_gate") and ly.slot_gate.detach().abs().max().item() > 0.05)
-                ly._cached_slot_g = torch.tanh(ly.slot_gate.detach().float()).view(1, H, 1, 1).to(dt) if ly._slot_active else None
+                ly._cached_slot_g = (0.5 * torch.tanh(ly.slot_gate.detach().float())).view(1, H, 1, 1).to(dt) if ly._slot_active else None
 
                 if hasattr(ly, "v_head_mix"):
                     ly._km_dt = ly.k_head_mix.detach().to(dt).contiguous()
@@ -347,11 +347,11 @@ class VSARecurrentDecoder:
                     cache["k_buf"] = torch.zeros(batch_size, v.H, 1, v.HD, 3, device=device, dtype=dt)
                     cache["v_buf"] = torch.zeros(batch_size, v.H, 1, v.HD, 7, device=device, dtype=dt)
                 if getattr(v, "swa_window", 0) > 0:
-                    W = v.swa_window
-                    cache["swa_k"] = torch.zeros(batch_size, v.HKV, W + 1, v.HD, device=device, dtype=dt)
+                    W_tot = max(512, v.swa_window + 1)
+                    cache["swa_k"] = torch.zeros(batch_size, v.HKV, W_tot, v.HD, device=device, dtype=dt)
                     cache["swa_v"] = torch.zeros_like(cache["swa_k"])
                     cache["swa_n"] = torch.zeros(1, dtype=torch.long, device=device)
-                    cache["swa_ar"] = torch.arange(W + 1, device=device)
+                    cache["swa_ar"] = torch.arange(W_tot, device=device)
                     cache["swa_k0"] = torch.zeros(batch_size, v.HKV, 1, v.HD, device=device, dtype=dt)
                 if getattr(v, "num_slots", 0) > 0:
                     S = v.num_slots
@@ -424,8 +424,11 @@ class VSARecurrentDecoder:
         n = cache["swa_n"]
         if not torch.is_tensor(n):
             n = cache["swa_n"] = torch.tensor([int(n)], dtype=torch.long, device=k.device)
-            cache["swa_ar"] = torch.arange(W + 1, device=k.device)
-        slot = ((n - 1).remainder(W) + 1) * (n != 0)
+            cache["swa_ar"] = torch.arange(cache["swa_k"].shape[2], device=k.device)
+        W_tot = cache["swa_k"].shape[2]
+        P_pin = 128 if W_tot >= 512 else 1
+        W_ring = W_tot - P_pin
+        slot = torch.where(n < P_pin, n, P_pin + (n - P_pin).remainder(W_ring))
         cache["swa_k"].index_copy_(2, slot, k.to(cache["swa_k"].dtype))
         cache["swa_v"].index_copy_(2, slot, v.to(cache["swa_v"].dtype))
         if sink_cap is not None and "swa_k0" in cache:
