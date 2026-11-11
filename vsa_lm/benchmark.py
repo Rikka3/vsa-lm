@@ -335,7 +335,8 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200,
         ids = tok.encode(prompt_str, add_special_tokens=False)
         x_in = torch.tensor([ids], dtype=torch.long, device=device)
         if not is_hf:
-            gen_t = dec.generate(x_in, max_new_tokens=max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids)
+            close_ids = tok.encode("\n</think>\nTherefore, the final answer is \\boxed{", add_special_tokens=False) if "<think>" in prompt_str else None
+            gen_t = dec.generate(x_in, max_new_tokens=max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids, close_think_ids=close_ids)
             gen_ids = gen_t[0, len(ids):].tolist()
         else:
             sample = temperature > 1e-5
