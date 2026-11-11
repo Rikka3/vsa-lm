@@ -143,7 +143,7 @@ def main(argv: list[str] | None = None):
     p_bench.add_argument("--donor", default=None, help="Optional HF donor repo ID")
     p_bench.add_argument("--no-donor-compare", action="store_true", help="Skip evaluating the donor model")
     p_bench.add_argument("--limit", type=int, default=200, help="Samples per multiple-choice task (default: 200)")
-    p_bench.add_argument("--gsm8k-limit", type=int, default=40, help="Samples for generative GSM8K (default: 40)")
+    p_bench.add_argument("--gsm8k-limit", type=int, default=200, help="Samples for generative GSM8K (default: 40)")
     p_bench.add_argument("--out", default=None, help="Output JSON report path")
 
     p_diag = sub.add_parser("diagnose", help="Decode parity + KL-by-position drift (teacher-forced vs free-run) vs the HF donor")
