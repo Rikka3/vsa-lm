@@ -718,15 +718,35 @@ class VSARecurrentDecoder:
         return m.norm_f(x), states, kv_caches
 
     @torch.no_grad()
-    def generate(self, prompt: torch.Tensor, max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, top_p: float = 0.95, eos_ids: set[int] | None = None):
+    def generate(self, prompt: torch.Tensor, max_new_tokens: int, temperature: float = 0.0, top_k: int = 40, top_p: float = 0.95, eos_ids: set[int] | None = None, close_think_ids: list[int] | None = None):
         out = prompt.clone()
         logits, feed = self._start(prompt, max_new_tokens)
         pos = prompt.shape[1] - 1
-        for _ in range(max_new_tokens):
-            nxt = self._sample(logits, temperature, top_k=top_k, top_p=top_p)
+        gen_hist: list[int] = []
+        seen_blocks: set[tuple[int, ...]] = set()
+        end_think_id = close_think_ids[1] if (close_think_ids and len(close_think_ids) > 1) else None
+        closed_think = False
+        forced_queue: list[int] = []
+        budget_trigger = max(64, max_new_tokens - 64)
+
+        for step_i in range(max_new_tokens):
+            if forced_queue:
+                nxt = torch.tensor([[forced_queue.pop(0)]], dtype=torch.long, device=prompt.device)
+            else:
+                nxt = self._sample(logits, temperature, top_k=top_k, top_p=top_p)
+            tok_id = int(nxt[0, 0].item())
+            if end_think_id is not None and tok_id == end_think_id:
+                closed_think = True
+            gen_hist.append(tok_id)
             out = torch.cat([out, nxt], dim=1)
-            if eos_ids and int(nxt[0, 0].item()) in eos_ids:
+            if eos_ids and tok_id in eos_ids:
                 break
+
+            # In-stream </think> budget exit at max_new_tokens - 64 (never cuts early mid-chain)
+            if close_think_ids and not closed_think and not forced_queue and step_i == budget_trigger:
+                forced_queue = list(close_think_ids)
+                closed_think = True
+
             pos += 1
             logits = feed(nxt, pos)
         return out

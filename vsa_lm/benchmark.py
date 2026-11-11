@@ -396,12 +396,7 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200,
         gold = r["answer"].split("####")[-1].strip().replace(",", "")
         p_str = gsm8k_prompt(tok, r["question"])
         gen, n_new, hit_cap = _gen(p_str, max_new=2048, temperature=0.2, top_p=0.85, seed=1000 + idx)
-        if hit_cap or ("\\boxed" not in gen and "</think>" not in gen):
-            for retry_s, retry_t in ((5000 + idx, 0.45), (9000 + idx, 0.6)):
-                g2, n2, hc2 = _gen(p_str, max_new=2048, temperature=retry_t, top_p=0.92, seed=retry_s)
-                if not hc2:
-                    gen, n_new, hit_cap = g2, n2, hc2
-                    break
+
         lengths.append(n_new)
         trunc_cnt += int(hit_cap)
         ans_region = gen.split("</think>")[-1] if "</think>" in gen else gen
