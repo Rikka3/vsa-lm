@@ -790,7 +790,7 @@ def heal_universal_model(
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
 
     # Frozen MLPs drop ~14 GB of fp32 master weights + Adam moments, so no-checkpoint mode fits on smaller GPUs.
-    if highspeed and vram_gb >= (32.0 if freeze_mlp else 45.0) and n_params < 3_000_000_000:
+    if highspeed and vram_gb >= (32.0 if freeze_mlp else 45.0) and n_params < 6_000_000_000:
         micro_bs = 4 if T <= 1024 else 2
         use_ckpt = False
         mode_str = f"HIGHSPEED (use_ckpt=False, micro_bs={micro_bs}, T={T})"

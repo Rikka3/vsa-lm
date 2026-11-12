@@ -508,7 +508,8 @@ class VSARecurrentDecoder:
                 if v_raw is None:
                     v_raw = ly.v_proj(h).view(B, 1, HKV, HD).transpose(1, 2)
                 S = ly.num_slots
-                w_s = torch.sigmoid(ly.slot_router(h)).view(B, 1, HKV, S).permute(0, 2, 3, 1).float()
+                r_raw = ly.slot_router(h).view(B, 1, HKV, S).permute(0, 2, 3, 1).float()
+                w_s = F.softmax(r_raw, dim=2) * torch.sigmoid(r_raw)
                 k_cl = F.normalize(k.float(), p=2.0, dim=-1).squeeze(2).unsqueeze(2)
                 q_cl = F.normalize(q.float(), p=2.0, dim=-1).view(B, HKV, G, 1, HD)
                 v_cl = v_raw.float().squeeze(2).unsqueeze(2)
@@ -587,9 +588,12 @@ class VSARecurrentDecoder:
             elif hasattr(ly, "_wqkv_packed"):
                 qkv = F.linear(h, ly._wqkv_packed, ly._bqkv_packed)
                 q, k, v = torch.split(qkv, [H * HD, HKV * HD, HKV * HD], dim=-1)
-                q = q.view(B, 1, H, HD).transpose(1, 2)
-                k = k.view(B, 1, HKV, HD).transpose(1, 2)
-                v = v.view(B, 1, HKV, HD).transpose(1, 2)
+                q = q.view(B, 1, H, HD)
+                k = k.view(B, 1, HKV, HD)
+                v = v.view(B, 1, HKV, HD)
+                if getattr(ly, "q_norm", None) is not None:
+                    q, k = ly.q_norm(q), ly.k_norm(k)
+                q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
                 gate = None
                 q, k = self._rope_qk(ly, q, k, pos)
             else:

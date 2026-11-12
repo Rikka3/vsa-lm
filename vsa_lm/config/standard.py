@@ -171,7 +171,8 @@ class UniversalVSAAttn(nn.Module):
         B, T, _ = x.shape
         S = self.num_slots
         dt = x.dtype
-        w = torch.sigmoid(self.slot_router(x)).view(B, T, self.HKV, S).permute(0, 2, 1, 3).to(dt)
+        r_raw = self.slot_router(x).view(B, T, self.HKV, S).permute(0, 2, 1, 3).float()
+        w = (F.softmax(r_raw, dim=-1) * torch.sigmoid(r_raw)).to(dt)
         k_c = F.normalize(k_raw.float(), p=2.0, dim=-1).to(dt)
         q_c = F.normalize(q_raw.float(), p=2.0, dim=-1).to(dt)
         v_c = v_raw.to(dt)
