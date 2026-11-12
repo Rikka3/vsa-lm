@@ -75,7 +75,7 @@ def convert_donor_model(
     hf_sd = load_all_safetensors(donor_dir)
     cfg = inspect_donor_config(donor_dir, hf_sd, max_T=max_T, chunk_size=chunk_size, hybrid_every=hybrid_every)
     cfg["vsa_swa_window"] = int(swa_window)
-    cfg["vsa_num_slots"] = 32
+    cfg["vsa_num_slots"] = max(8, 64 // max(1, int(cfg.get("vsa_num_kv_heads", 2))))
     cfg["vsa_num_pages"] = 8
     cfg["vsa_mix_before_rope"] = True
     if n_vis > 0:
@@ -475,8 +475,11 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
                         with torch.no_grad():
                             a_tgt = donor.blocks[li].attn(h_n)
                         a_hat = blk.vsa(h_n)
-                        total_loss = total_loss + _attn_transfer_loss(a_hat, a_tgt) / len(vsa_indices)
+                        loss_li = _attn_transfer_loss(a_hat, a_tgt) / len(vsa_indices)
+                        loss_li.backward()
+                        total_loss = total_loss + loss_li.detach()
                         a_out = a_hat.detach()
+                        del a_hat, a_tgt, loss_li
                     else:
                         with torch.no_grad():
                             a_out = blk.attn(h_n)
@@ -510,10 +513,11 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
             with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
                 for li, h_n in norm_inputs.items():
                     a_hat = stu.blocks[li].vsa(h_n)
-                    total_loss = total_loss + _attn_transfer_loss(a_hat, attn_targets[li]) / max(1, len(norm_inputs))
+                    loss_li = _attn_transfer_loss(a_hat, attn_targets[li]) / max(1, len(norm_inputs))
+                    loss_li.backward()
+                    total_loss = total_loss + loss_li.detach()
+                    del a_hat, loss_li
             del norm_inputs, attn_targets
-
-        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(vsa_params, 1.0)
         opt.step()
         if (s + 1) in (1, max(1, steps // 4), max(1, steps // 2), steps):
@@ -790,7 +794,7 @@ def heal_universal_model(
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
 
     # Frozen MLPs drop ~14 GB of fp32 master weights + Adam moments, so no-checkpoint mode fits on smaller GPUs.
-    if highspeed and vram_gb >= (32.0 if freeze_mlp else 45.0) and n_params < 6_000_000_000:
+    if highspeed and vram_gb >= (32.0 if freeze_mlp else 45.0) and n_params < 3_000_000_000:
         micro_bs = 4 if T <= 1024 else 2
         use_ckpt = False
         mode_str = f"HIGHSPEED (use_ckpt=False, micro_bs={micro_bs}, T={T})"
