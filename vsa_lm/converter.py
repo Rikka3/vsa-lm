@@ -437,11 +437,15 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
     for p in stu.parameters():
         p.requires_grad_(False)
     vsa_params = []
+    _pretrained_proj = ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
     for li in vsa_indices:
-        for p in stu.blocks[li].vsa.parameters():
-            p.data = p.data.to(device, dtype=torch.float32)
-            p.requires_grad_(True)
-            vsa_params.append(p)
+        for n_p, p in stu.blocks[li].vsa.named_parameters():
+            if any(k in n_p for k in _pretrained_proj):
+                p.requires_grad_(False)
+            else:
+                p.data = p.data.to(device, dtype=torch.float32)
+                p.requires_grad_(True)
+                vsa_params.append(p)
 
     opt = torch.optim.AdamW(vsa_params, lr=1e-3, weight_decay=0.0, fused=(device.type == "cuda"))
     n_win = max(1, (len(train_tokens) - 1) // T)
@@ -860,7 +864,7 @@ def heal_universal_model(
     from transformers import AutoTokenizer
     binder_tok = AutoTokenizer.from_pretrained(donor_dir)
     for step in range(start_step, total_steps):
-        if step % 5 == 0:
+        if False:
             x, y = _build_procedural_binder_batch(binder_tok, bs, T, step, device)
         else:
             idx = torch.randint(0, n_win, (bs,), generator=gen)
