@@ -335,7 +335,7 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200,
         ids = tok.encode(prompt_str, add_special_tokens=False)
         x_in = torch.tensor([ids], dtype=torch.long, device=device)
         if not is_hf:
-            close_ids = tok.encode("\n</think>\nTherefore, the final answer is \\boxed{", add_special_tokens=False) if "<think>" in prompt_str else None
+            close_ids = tok.encode("\n</think>\nTherefore, the final answer is \\boxed{", add_special_tokens=False) if (max_new >= 1024 and ("<think>" in prompt_str or "</think>" in tok.get_vocab()) and "</think>" not in prompt_str) else None
             gen_t = dec.generate(x_in, max_new_tokens=max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids, close_think_ids=close_ids)
             gen_ids = gen_t[0, len(ids):].tolist()
         else:
@@ -425,9 +425,14 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200,
         prompt_code = r["prompt"]
         msgs = [{"role": "user", "content": f"Complete this Python function. Output ONLY valid Python code inside ```python```:\n```python\n{prompt_code}\n```"}]
         try:
-            p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            try:
+                p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            except TypeError:
+                p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             if "<think>" in p_str and "</think>" not in p_str:
                 p_str = p_str.rstrip() + "\n</think>\n\n```python\n" + prompt_code
+            elif p_str.rstrip().endswith("</think>"):
+                p_str = p_str.rstrip() + "\n\n```python\n" + prompt_code
         except Exception:
             p_str = prompt_code
         gen, _, _ = _gen(p_str, max_new=256, temperature=0.0, seed=2000 + idx)
@@ -452,9 +457,14 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200,
         p_code = f"# {r['prompt'].strip()}\n{sig_line}\n"
         msgs = [{"role": "user", "content": f"Complete this Python function:\n```python\n{p_code}\n```"}]
         try:
-            p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            try:
+                p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            except TypeError:
+                p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             if "<think>" in p_str and "</think>" not in p_str:
                 p_str = p_str.rstrip() + "\n</think>\n\n```python\n" + p_code
+            elif p_str.rstrip().endswith("</think>"):
+                p_str = p_str.rstrip() + "\n\n```python\n" + p_code
         except Exception:
             p_str = p_code
         gen, _, _ = _gen(p_str, max_new=256, temperature=0.0, seed=3000 + idx)
@@ -477,7 +487,10 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200,
         def _eval_ifeval(idx, r):
             msgs = [{"role": "user", "content": r["prompt"]}]
             try:
-                p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+                try:
+                    p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                except TypeError:
+                    p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                 if "<think>" in p_str and "</think>" not in p_str:
                     p_str = p_str.rstrip() + "\n</think>\n\n"
             except Exception:
