@@ -114,7 +114,7 @@ def convert_donor_model(
             continue
         p = f"blocks.{li}.vsa"
         sd[f"{p}.log_gamma"] = lg_init.clone()
-        sd[f"{p}.out_norm.weight"] = torch.full((HD,), 0.05, dtype=torch.float32)
+        sd[f"{p}.out_norm.weight"] = torch.full((HD,), 0.05 if swa_window > 0 else 1.0, dtype=torch.float32)
         eye = torch.eye(HD, dtype=torch.float32).unsqueeze(0).repeat(H, 1, 1)
         sd[f"{p}.k_head_mix"] = eye.clone()
         sd[f"{p}.v_head_mix"] = eye.clone()
@@ -798,9 +798,9 @@ def heal_universal_model(
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
 
     # Frozen MLPs drop ~14 GB of fp32 master weights + Adam moments, so no-checkpoint mode fits on smaller GPUs.
-    max_hs_params = 5_000_000_000 if (vram_gb >= 80.0 and freeze_mlp) else 3_000_000_000
+    max_hs_params = 5_000_000_000 if (vram_gb >= 80.0 and freeze_mlp and T <= 2048) else 3_000_000_000
     if highspeed and vram_gb >= (32.0 if freeze_mlp else 45.0) and n_params < max_hs_params:
-        micro_bs = 4 if T <= 1024 else 2
+        micro_bs = 4 if (T <= 1024 and n_params < 3_000_000_000) else 2
         use_ckpt = False
         mode_str = f"HIGHSPEED (use_ckpt=False, micro_bs={micro_bs}, T={T})"
     else:
@@ -814,11 +814,12 @@ def heal_universal_model(
     )
 
     if start_step == 0 and stage1_tokens > 0:
-        _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor, train_tokens, device, stage1_tokens=stage1_tokens, bs=max(2, micro_bs), on_policy=stage1_onpolicy)
+        _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor, train_tokens, device, stage1_tokens=stage1_tokens, bs=(4 if vram_gb >= 45.0 else max(2, micro_bs)), on_policy=stage1_onpolicy)
         for p_ in trainable:
             p_.data = p_.data.to(device, dtype=torch.float32)
             p_.requires_grad_(True)
         _purge_zombie_vram()
+        _save_student(stu, stu_cfg, ck, os.path.join(work, f"{out_prefix}_stage1.pth"), 0)
 
     start_ppl, donor_ppl, start_kl, start_top1 = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
     total_steps = max(start_step + 1, math.ceil(tokens_budget / (bs * T)))
