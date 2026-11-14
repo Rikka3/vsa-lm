@@ -18,6 +18,7 @@ import torch.utils.checkpoint
 
 from .config import (
     fetch_any_donor,
+    get_model_spec,
     load_all_safetensors,
     inspect_donor_config,
     map_any_hf_to_student,
@@ -58,13 +59,15 @@ def convert_donor_model(
     donor_id_or_dir: str,
     out_ckpt: str,
     *,
-    hybrid_every: int = 4,
-    max_T: int = 2048,
+    hybrid_every: int | None = None,
+    max_T: int | None = None,
     chunk_size: int = 32,
     gamma_cap: float = 0.9995,
     hf_token: str | None = None,
     visual_sidecar_out: str | None = None,
-    swa_window: int = 64,
+    swa_window: int | None = None,
+    pin_endpoints: bool | None = None,
+    center_unbinding: bool | None = None,
 ) -> str:
     t0 = time.perf_counter()
     donor_dir = fetch_any_donor(donor_id_or_dir, hf_token=hf_token)
@@ -72,9 +75,21 @@ def convert_donor_model(
     vis_path = visual_sidecar_out or os.path.join(os.path.dirname(os.path.abspath(out_ckpt)), f"{safe_tag}_visual_tower.safetensors")
     n_vis, vis_mb = preserve_visual_tower(donor_dir, vis_path)
 
+    from .config.inspector import compute_layer_types
     hf_sd = load_all_safetensors(donor_dir)
-    cfg = inspect_donor_config(donor_dir, hf_sd, max_T=max_T, chunk_size=chunk_size, hybrid_every=hybrid_every)
+    cfg = inspect_donor_config(donor_dir, hf_sd, max_T=max_T or 2048, chunk_size=chunk_size, hybrid_every=hybrid_every or 4)
+    spec = get_model_spec(cfg)
+    hybrid_every = spec.hybrid_every if hybrid_every is None else hybrid_every
+    max_T = spec.max_T if max_T is None else max_T
+    swa_window = spec.swa_window if swa_window is None else swa_window
+    eff_pin = spec.pin_endpoints if pin_endpoints is None else pin_endpoints
+    eff_center = spec.center_unbinding if center_unbinding is None else center_unbinding
+    cfg["hybrid_every"] = int(hybrid_every)
+    cfg["max_T"] = int(max_T)
+    cfg["pin_endpoints"] = bool(eff_pin)
+    cfg["layer_types"] = compute_layer_types(cfg["num_layers"], int(hybrid_every), cfg.get("donor_layer_types"), pin_endpoints=bool(eff_pin))
     cfg["vsa_swa_window"] = int(swa_window)
+    cfg["vsa_center_unbinding"] = bool(eff_center)
     cfg["vsa_num_slots"] = max(8, 64 // max(1, int(cfg.get("vsa_num_kv_heads", 2))))
     cfg["vsa_num_pages"] = 8
     cfg["vsa_mix_before_rope"] = True
@@ -114,7 +129,8 @@ def convert_donor_model(
             continue
         p = f"blocks.{li}.vsa"
         sd[f"{p}.log_gamma"] = lg_init.clone()
-        sd[f"{p}.out_norm.weight"] = torch.full((HD,), 0.05 if swa_window > 0 else 1.0, dtype=torch.float32)
+        out_init = spec.out_norm_init if int(swa_window) > 0 else 1.0
+        sd[f"{p}.out_norm.weight"] = torch.full((HD,), out_init, dtype=torch.float32)
         eye = torch.eye(HD, dtype=torch.float32).unsqueeze(0).repeat(H, 1, 1)
         sd[f"{p}.k_head_mix"] = eye.clone()
         sd[f"{p}.v_head_mix"] = eye.clone()
@@ -127,6 +143,9 @@ def convert_donor_model(
         sd[f"{p}.k_relu_mix"] = torch.zeros(H, 1, 1, dtype=torch.float32)
         if swa_window > 0:
             sd[f"{p}.swa_mix_logit"] = torch.full((H,), 2.0, dtype=torch.float32)
+        if eff_center:
+            sd[f"{p}.center_proj.weight"] = torch.zeros(H, D, dtype=torch.float32)
+            sd[f"{p}.center_proj.bias"] = torch.zeros(H, dtype=torch.float32)
         if hasattr(stu.blocks[li].vsa, "slot_router"):
             sd[f"{p}.slot_router.weight"] = stu.blocks[li].vsa.slot_router.weight.detach().to(dtype).clone()
             sd[f"{p}.slot_router.bias"] = stu.blocks[li].vsa.slot_router.bias.detach().to(dtype).clone()
@@ -530,7 +549,7 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
 
 # Parameters kept in fp32 everywhere (saved checkpoints, benchmark/server loaders).
 _FP32_KEYS = ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate",
-              "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix", "slot_gate")
+              "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix", "slot_gate", "center_proj")
 
 
 def _load_student_ckpt(path: str, swa_window: int | None = None):
@@ -545,7 +564,7 @@ def _load_student_ckpt(path: str, swa_window: int | None = None):
     stu = UniversalVSALM(**stu_cfg)
     state_in = {k: v for k, v in ck["model"].items() if "pos_code" not in k and "head_pos_delta" not in k}
     missing, unexpected = stu.load_state_dict(state_in, strict=False)
-    allowed_missing = {"rope_mix", "v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix", "slot_router", "slot_gate"}
+    allowed_missing = {"rope_mix", "v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix", "slot_router", "slot_gate", "center_proj"}
     real_missing = [m for m in missing if not any(a in m for a in allowed_missing)]
     if real_missing or unexpected:
         raise RuntimeError(f"Checkpoint mismatch! Missing: {real_missing[:10]}, Unexpected: {unexpected[:10]}")
@@ -563,7 +582,7 @@ def _setup_trainable(stu, stu_cfg: dict, device: torch.device, freeze_mlp: bool 
         if any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix")):
             p_.requires_grad_(True)
             vsa_conv.append(p_)
-        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm", "swa_mix", "slot_gate")):
+        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm", "swa_mix", "slot_gate", "center_proj")):
             p_.requires_grad_(True)
             vsa_core.append(p_)
         elif ".vsa." in n_ and is_vsa_blk:
@@ -798,13 +817,12 @@ def heal_universal_model(
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
 
     # Frozen MLPs drop ~14 GB of fp32 master weights + Adam moments, so no-checkpoint mode fits on smaller GPUs.
-    max_hs_params = 5_000_000_000 if (vram_gb >= 80.0 and freeze_mlp and T <= 2048) else 3_000_000_000
-    if highspeed and vram_gb >= (32.0 if freeze_mlp else 45.0) and n_params < max_hs_params:
+    if highspeed and vram_gb >= (32.0 if freeze_mlp else 45.0) and (n_params < 3_000_000_000 or (vram_gb >= 80.0 and freeze_mlp and T <= 2048)):
         micro_bs = 4 if (T <= 1024 and n_params < 3_000_000_000) else 2
         use_ckpt = False
         mode_str = f"HIGHSPEED (use_ckpt=False, micro_bs={micro_bs}, T={T})"
     else:
-        micro_bs = 2
+        micro_bs = 4 if (vram_gb >= 80.0 and not freeze_mlp and T <= 1024) else 2
         use_ckpt = True
         mode_str = f"LOW-VRAM (use_ckpt=True, micro_bs={micro_bs}, T={T})"
 

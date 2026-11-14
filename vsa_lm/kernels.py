@@ -200,8 +200,9 @@ def vsa_recurrent_step_kernel(
     Q_ptr, K_ptr, V_ptr, VLOC_ptr, M_ptr, Out_ptr,
     GAM_ptr, OMG_SCALE_ptr, VSELF_ptr,
     Q_RELU_ptr, K_RELU_ptr, NORM_W_ptr, LQG_ptr,
-    HAS_NORM: tl.constexpr, HAS_VLOC: tl.constexpr,
-    H: tl.constexpr, D: tl.constexpr,
+    KB_ptr, VB_ptr, ZB_ptr, CALPHA_ptr,
+    HAS_NORM: tl.constexpr, HAS_VLOC: tl.constexpr, HAS_CENTER: tl.constexpr,
+    H: tl.constexpr, D: tl.constexpr, EPS: tl.constexpr = 1e-6,
 ):
     pid = tl.program_id(0)
     h_idx = pid % H
@@ -233,9 +234,22 @@ def vsa_recurrent_step_kernel(
     tl.store(M_ptr + mat_off, M_new.to(M_ptr.dtype.element_ty))
 
     y = tl.sum(M_new * q[:, None], axis=0) * omg_s
+    if HAS_CENTER:
+        kb = tl.load(KB_ptr + vec_off).to(tl.float32)
+        vb = tl.load(VB_ptr + vec_off).to(tl.float32)
+        zb = tl.load(ZB_ptr + pid).to(tl.float32)
+        calpha = tl.load(CALPHA_ptr + pid).to(tl.float32)
+        kb = gam * kb + k
+        vb = gam * vb + v
+        zb = gam * zb + 1.0
+        tl.store(KB_ptr + vec_off, kb.to(KB_ptr.dtype.element_ty))
+        tl.store(VB_ptr + vec_off, vb.to(VB_ptr.dtype.element_ty))
+        tl.store(ZB_ptr + pid, zb.to(ZB_ptr.dtype.element_ty))
+        kq_dot = tl.sum(kb * q, axis=0)
+        y = y - (calpha * omg_s * kq_dot / (zb + 1e-6)) * vb
     if HAS_NORM:
         nw = tl.load(NORM_W_ptr + d_idx).to(tl.float32)
-        y = y * tl.rsqrt(tl.sum(y * y, axis=0) / D + 1e-6) * nw
+        y = y * tl.rsqrt(tl.sum(y * y, axis=0) / D + EPS) * nw
     y = y + v_self * v
 
     if HAS_VLOC:

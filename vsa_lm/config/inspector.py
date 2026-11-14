@@ -39,11 +39,9 @@ def load_all_safetensors(donor_dir: str) -> dict[str, torch.Tensor]:
     return sd
 
 
-def compute_layer_types(num_layers: int, hybrid_every: int, donor_layer_types: list[str] | None = None) -> list[str]:
-    """A1 Fix: Never replace native GatedDeltaNet (`linear_attention`) layers with static VSA.
-    If donor already has `linear_attention` layers, preserve them (`gated_deltanet`) and convert
-    half of its `full_attention` layers to VSA so KV cache actually shrinks by 50%!
-    """
+def compute_layer_types(num_layers: int, hybrid_every: int, donor_layer_types: list[str] | None = None,
+                        pin_endpoints: bool = False) -> list[str]:
+    """Preserve native GatedDeltaNet layers and optionally pin L0 + final layer as Softmax."""
     if donor_layer_types and "linear_attention" in donor_layer_types:
         out = []
         full_seen = 0
@@ -52,11 +50,10 @@ def compute_layer_types(num_layers: int, hybrid_every: int, donor_layer_types: l
                 out.append("gated_deltanet")
             else:
                 full_seen += 1
-                # Convert every odd full_attention layer to VSA, keep every even full_attention layer as Softmax
                 out.append("softmax" if (hybrid_every > 0 and full_seen % 2 == 0) else "vsa")
         return out
     return [
-        "softmax" if (hybrid_every > 0 and (li + 1) % hybrid_every == 0) else "vsa"
+        "softmax" if ((pin_endpoints and (li == 0 or li == num_layers - 1)) or (hybrid_every > 0 and (li + 1) % hybrid_every == 0)) else "vsa"
         for li in range(num_layers)
     ]
 
@@ -138,7 +135,7 @@ def inspect_donor_config(donor_dir: str, hf_sd: dict[str, torch.Tensor],
 def map_any_hf_to_student(hf_sd: dict[str, torch.Tensor], cfg: dict, hybrid_every: int) -> dict[str, torch.Tensor]:
     sd = {}
     L = cfg["num_layers"]
-    layer_types = cfg.get("layer_types") or compute_layer_types(L, hybrid_every, cfg.get("donor_layer_types"))
+    layer_types = cfg.get("layer_types") or compute_layer_types(L, hybrid_every, cfg.get("donor_layer_types"), pin_endpoints=bool(cfg.get("pin_endpoints", False)))
     H, HKV, HD = cfg["num_heads"], cfg["num_kv_heads"], cfg["head_dim"]
     vH, vHKV, vHD = cfg["vsa_num_heads"], cfg["vsa_num_kv_heads"], cfg["vsa_head_dim"]
     D = cfg["dim"]

@@ -229,7 +229,9 @@ class VSARecurrentDecoder:
         if not self.is_universal:
             return
         device = next(self.model.parameters()).device
-        dt = torch.bfloat16 if device.type == "cuda" else torch.float32
+        m_dt = self.model.lm_head.weight.dtype if hasattr(self.model, "lm_head") else torch.float32
+        dt = m_dt if (device.type == "cuda" and m_dt in (torch.bfloat16, torch.float16)) else torch.float32
+        self._step_dt = dt
         if isinstance(getattr(self.model.lm_head, "weight", None), torch.Tensor):
             self.model.lm_head.weight.data = self.model.lm_head.weight.data.to(dt)
         t = torch.arange(max_pos, device=device, dtype=torch.float32)
@@ -259,10 +261,15 @@ class VSARecurrentDecoder:
                 ly._cached_qr = ly.q_relu_mix.detach().float().view(-1) if hasattr(ly, "q_relu_mix") else torch.zeros_like(gam)
                 ly._cached_kr = ly.k_relu_mix.detach().float().view(-1) if hasattr(ly, "k_relu_mix") else torch.zeros_like(gam)
                 ly._cached_nw = ly.out_norm.weight.detach().float() if hasattr(ly, "out_norm") else None
+                ly._cached_norm_eps = float(ly.out_norm.eps) if hasattr(ly, "out_norm") else 1e-6
                 ly._cached_lqg = ly.local_q_gate.detach().float().contiguous() if hasattr(ly, "local_q_gate") else None
                 ly._cached_swa_a = torch.sigmoid(ly.swa_mix_logit.detach().float()) if getattr(ly, "swa_window", 0) > 0 else None
                 ly._slot_active = bool(getattr(ly, "num_slots", 0) > 0 and hasattr(ly, "slot_gate") and ly.slot_gate.detach().abs().max().item() > 0.05)
                 ly._cached_slot_g = torch.tanh(ly.slot_gate.detach().float()).view(1, H, 1, 1).to(dt) if ly._slot_active else None
+                ly._center_unbinding = bool(getattr(ly, "center_unbinding", False) and hasattr(ly, "center_proj"))
+                if ly._center_unbinding:
+                    ly._center_w = ly.center_proj.weight.detach().to(dt).contiguous()
+                    ly._center_b = ly.center_proj.bias.detach().to(dt).contiguous()
 
                 if hasattr(ly, "v_head_mix"):
                     ly._km_dt = ly.k_head_mix.detach().to(dt).contiguous()
@@ -337,7 +344,8 @@ class VSARecurrentDecoder:
     def blank_state(model, batch_size: int, device, max_kv_len: int = 4096, state_dtype=torch.float32, graph: bool = False,
                     stream: tuple[int, int] | None = None):
         states, kv_caches = [None] * len(model.blocks), [None] * len(model.blocks)
-        dt = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
+        m_dt = model.lm_head.weight.dtype if hasattr(model, "lm_head") else torch.float32
+        dt = m_dt if (str(device).startswith("cuda") and m_dt in (torch.bfloat16, torch.float16)) else torch.float32
         for li, blk in enumerate(model.blocks):
             if hasattr(blk, "vsa"):
                 v = blk.vsa
@@ -358,6 +366,10 @@ class VSARecurrentDecoder:
                     cache["slot_C"] = torch.zeros(batch_size, v.HKV, S, v.HD, device=device, dtype=torch.float32)
                     cache["slot_U"] = torch.zeros(batch_size, v.HKV, S, v.HD, device=device, dtype=torch.float32)
                     cache["slot_Z"] = torch.full((batch_size, v.HKV, S, 1), 1e-6, device=device, dtype=torch.float32)
+                if getattr(v, "center_unbinding", False):
+                    cache["k_bar"] = torch.zeros(batch_size, v.H, 1, v.HD, device=device, dtype=torch.float32)
+                    cache["v_bar"] = torch.zeros(batch_size, v.H, 1, v.HD, device=device, dtype=torch.float32)
+                    cache["z_bar"] = torch.zeros(batch_size, v.H, 1, 1, device=device, dtype=torch.float32)
                 kv_caches[li] = cache or None
             else:
                 s = blk.attn if hasattr(blk, "attn") else blk.softmax_attn
@@ -557,11 +569,16 @@ class VSARecurrentDecoder:
                 kv_caches[li]["v_buf"].copy_(v_in[..., -7:])
                 v_loc = (v_in * ly._v_conv_w.to(vx.dtype)).sum(dim=-1)
 
+            kb_t = vb_t = zb_t = c_alpha = None
+            if getattr(ly, "_center_unbinding", False) and isinstance(kv_caches[li], dict) and "k_bar" in kv_caches[li]:
+                c_alpha = torch.tanh(F.linear(h, ly._center_w, ly._center_b).float()).transpose(1, 2).unsqueeze(-1).contiguous()
+                kb_t, vb_t, zb_t = kv_caches[li]["k_bar"], kv_caches[li]["v_bar"], kv_caches[li]["z_bar"]
             y = fused_vsa_recurrent_step(
                 q.contiguous(), kx.contiguous(), vx.contiguous(),
                 states[li], ly._cached_gam, ly._cached_omg, ly._cached_vself,
                 q_relu=ly._cached_qr, k_relu=ly._cached_kr, norm_w=ly._cached_nw,
                 v_loc=v_loc, local_q_gate=ly._cached_lqg,
+                k_bar=kb_t, v_bar=vb_t, z_bar=zb_t, center_alpha=c_alpha, norm_eps=getattr(ly, '_cached_norm_eps', 1e-6),
             )
 
             if y_swa is not None:
@@ -672,7 +689,8 @@ class VSARecurrentDecoder:
     def step(self, token: torch.Tensor, pos: int, states, kv_caches, record=None, write_scale: float = 1.0):
         m = self.model
         if self.is_universal:
-            with torch.autocast("cuda", torch.bfloat16, enabled=token.is_cuda, cache_enabled=False):
+            use_amp = token.is_cuda and getattr(self, "_step_dt", torch.bfloat16) in (torch.bfloat16, torch.float16)
+            with torch.autocast("cuda", torch.bfloat16, enabled=use_amp, cache_enabled=False):
                 self._step_rope = self._step_rope_for(pos, token.device) if self.stream is not None else None
                 x = m.embed_tokens(token)
                 for li, blk in enumerate(m.blocks):
@@ -817,6 +835,11 @@ class VSARecurrentDecoder:
                 states[li] = states[li] - delta
                 continue
             M_doc = torch.zeros_like(states[li])
+            has_c = (kv_caches is not None and isinstance(kv_caches[li], dict) and "k_bar" in kv_caches[li])
+            kb_doc = torch.zeros_like(kv_caches[li]["k_bar"]) if has_c else None
+            vb_doc = torch.zeros_like(kv_caches[li]["v_bar"]) if has_c else None
+            zb_doc = torch.zeros_like(kv_caches[li]["z_bar"]) if has_c else None
+            ca_zero = torch.zeros_like(zb_doc) if has_c else None
             last_p = trace[-1][0]
             for (p, k, v) in trace:
                 kt = k.to(states[li].device)
@@ -828,11 +851,21 @@ class VSARecurrentDecoder:
                     kt.contiguous(), kt.contiguous(), vt.contiguous(),
                     M_doc, ly._cached_gam, ly._cached_omg, ly._cached_vself,
                     q_relu=ly._cached_qr, k_relu=ly._cached_kr, norm_w=ly._cached_nw,
+                    k_bar=kb_doc, v_bar=vb_doc, z_bar=zb_doc, center_alpha=ca_zero, norm_eps=getattr(ly, '_cached_norm_eps', 1e-6),
                 )
             rem_steps = float(next_pos - 1 - last_p)
             if rem_steps > 0:
-                M_doc = M_doc * (ly._cached_gam.view(1, -1, 1, 1) ** rem_steps)
+                decay_r = ly._cached_gam.view(1, -1, 1, 1) ** rem_steps
+                M_doc = M_doc * decay_r
+                if has_c:
+                    kb_doc = kb_doc * decay_r
+                    vb_doc = vb_doc * decay_r
+                    zb_doc = zb_doc * decay_r
             states[li] = states[li] - M_doc
+            if has_c:
+                kv_caches[li]["k_bar"].sub_(kb_doc)
+                kv_caches[li]["v_bar"].sub_(vb_doc)
+                kv_caches[li]["z_bar"].sub_(zb_doc)
         return states
 
     @staticmethod

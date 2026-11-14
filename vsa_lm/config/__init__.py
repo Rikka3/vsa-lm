@@ -5,6 +5,7 @@ from .inspector import (
     inspect_donor_config,
     map_any_hf_to_student,
 )
+from .models import ModelFamilySpec, MODEL_FAMILIES, get_model_spec
 from .qwen35 import (
     Qwen35ZeroCenteredRMSNorm,
     Qwen35RMSNormGated,
@@ -25,6 +26,9 @@ __all__ = [
     "load_all_safetensors",
     "inspect_donor_config",
     "map_any_hf_to_student",
+    "ModelFamilySpec",
+    "MODEL_FAMILIES",
+    "get_model_spec",
     "Qwen35ZeroCenteredRMSNorm",
     "Qwen35RMSNormGated",
     "Qwen35PartialRoPE",

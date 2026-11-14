@@ -57,7 +57,7 @@ def load_model_for_serving(ckpt_path: str, donor_tokenizer: str | None = None, q
     del ck
 
     fp32_keys = ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta",
-                 "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "swa_mix")
+                 "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "swa_mix", "center_proj")
     if device.type == "cuda":
         for n, p in model.named_parameters():
             p.data = p.data.to(device, dtype=torch.float32 if any(k in n for k in fp32_keys) else torch.bfloat16)

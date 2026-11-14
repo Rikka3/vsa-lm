@@ -65,8 +65,11 @@ def fused_vsa_recurrent_step(q: torch.Tensor, kx: torch.Tensor, vx: torch.Tensor
                              M: torch.Tensor, gam: torch.Tensor, omg_scale: torch.Tensor,
                              v_self: torch.Tensor, q_relu: torch.Tensor | None = None,
                              k_relu: torch.Tensor | None = None, norm_w: torch.Tensor | None = None,
-                             v_loc: torch.Tensor | None = None, local_q_gate: torch.Tensor | None = None) -> torch.Tensor:
+                             v_loc: torch.Tensor | None = None, local_q_gate: torch.Tensor | None = None,
+                             k_bar: torch.Tensor | None = None, v_bar: torch.Tensor | None = None,
+                             z_bar: torch.Tensor | None = None, center_alpha: torch.Tensor | None = None, norm_eps: float = 1e-6) -> torch.Tensor:
     B, H, _, D = q.shape
+    has_center = (k_bar is not None and v_bar is not None and z_bar is not None and center_alpha is not None)
     if not HAS_TRITON or not q.is_cuda:
         qf, kf, vf = q.float(), kx.float(), vx.float()
         if q_relu is not None:
@@ -77,8 +80,14 @@ def fused_vsa_recurrent_step(q: torch.Tensor, kx: torch.Tensor, vx: torch.Tensor
         kf = F.normalize(kf, p=2.0, dim=-1)
         M.mul_(gam.view(1, H, 1, 1)).add_(torch.matmul(kf.transpose(-1, -2), vf))
         y = torch.matmul(qf, M) * omg_scale.view(1, H, 1, 1)
+        if has_center:
+            k_bar.mul_(gam.view(1, H, 1, 1)).add_(kf)
+            v_bar.mul_(gam.view(1, H, 1, 1)).add_(vf)
+            z_bar.mul_(gam.view(1, H, 1, 1)).add_(1.0)
+            kq_dot = (k_bar * qf).sum(dim=-1, keepdim=True)
+            y = y - center_alpha.float() * omg_scale.view(1, H, 1, 1) * (kq_dot / (z_bar + 1e-6)) * v_bar
         if norm_w is not None:
-            y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + 1e-6) * norm_w.view(1, 1, 1, D)
+            y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + norm_eps) * norm_w.view(1, 1, 1, D)
         y = y + v_self.view(1, H, 1, 1) * vf
         if v_loc is not None and local_q_gate is not None:
             q_mod = torch.sigmoid((qf * local_q_gate.view(1, H, 1, D)).sum(-1, keepdim=True))
@@ -94,9 +103,14 @@ def fused_vsa_recurrent_step(q: torch.Tensor, kx: torch.Tensor, vx: torch.Tensor
     has_vloc = (v_loc is not None and local_q_gate is not None)
     vl = v_loc.contiguous() if has_vloc else vx
     lqg = local_q_gate if has_vloc else z_h
+    kb_p = k_bar if has_center else q
+    vb_p = v_bar if has_center else vx
+    zb_p = z_bar if has_center else z_h
+    ca_p = center_alpha.contiguous() if has_center else z_h
     vsa_recurrent_step_kernel[(B * H,)](
         q, kx, vx, vl, M, out, gam, omg_scale, v_self, qr, kr, nw, lqg,
-        HAS_NORM=has_norm, HAS_VLOC=has_vloc, H=H, D=D, num_warps=4,
+        kb_p, vb_p, zb_p, ca_p,
+        HAS_NORM=has_norm, HAS_VLOC=has_vloc, HAS_CENTER=has_center, H=H, D=D, EPS=float(norm_eps), num_warps=4,
     )
     return out
 

@@ -79,7 +79,7 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
     stu = UniversalVSALM(**cfg)
     state_in = {k: v for k, v in ck["model"].items() if "pos_code" not in k and "head_pos_delta" not in k}
     missing, unexpected = stu.load_state_dict(state_in, strict=False)
-    allowed_missing = {"out_norm", "slot_router", "slot_gate"}
+    allowed_missing = {"out_norm", "slot_router", "slot_gate", "center_proj"}
     real_missing = [m for m in missing if not any(a in m for a in allowed_missing)]
     if real_missing or unexpected:
         raise RuntimeError(f"Checkpoint mismatch! Missing: {real_missing}, Unexpected: {unexpected}")
@@ -89,7 +89,7 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
     del ck
 
     fp32_keys = ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate",
-                 "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "out_norm", "swa_mix", "slot_gate")
+                 "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "out_norm", "swa_mix", "slot_gate", "center_proj")
     for n, p in stu.named_parameters():
         if any(k in n for k in fp32_keys):
             p.data = p.data.to(device, dtype=torch.float32)
@@ -242,6 +242,31 @@ def _verify_ifeval_instruction(resp: str, inst_ids: list[str], kwargs_list: list
     return True
 
 
+class _CloseThinkLogitsProcessor:
+    def __init__(self, prompt_len: int, close_ids: list[int], trigger_step: int):
+        self.prompt_len = prompt_len
+        self.close_ids = close_ids
+        self.end_think_id = close_ids[1] if len(close_ids) > 1 else close_ids[0]
+        self.trigger_step = trigger_step
+        self.start_step = None
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        gen = input_ids[0, self.prompt_len:]
+        step_i = int(gen.shape[0])
+        if self.start_step is None:
+            if (gen == self.end_think_id).any().item():
+                return scores
+            if step_i == self.trigger_step:
+                self.start_step = step_i
+        if self.start_step is not None:
+            offset = step_i - self.start_step
+            if offset < len(self.close_ids):
+                tgt = self.close_ids[offset]
+                scores.fill_(-1e9)
+                scores[:, tgt] = 0.0
+        return scores
+
+
 def gsm8k_prompt(tok, question: str) -> str:
     msgs = [{"role": "user", "content": f"Solve this math problem step by step and put the final numerical answer inside \\boxed{{}}:\n{question.strip()}"}]
     try:
@@ -334,18 +359,24 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200,
         torch.manual_seed(seed)
         ids = tok.encode(prompt_str, add_special_tokens=False)
         x_in = torch.tensor([ids], dtype=torch.long, device=device)
+        need_think_close = (max_new >= 1024) and ("<think>" in prompt_str or "</think>" in tok.get_vocab()) and ("</think>" not in prompt_str)
+        close_ids = tok.encode("
+</think>
+Therefore, final answer is \boxed{", add_special_tokens=False) if need_think_close else None
         if not is_hf:
-            close_ids = tok.encode("\n</think>\nTherefore, the final answer is \\boxed{", add_special_tokens=False) if (max_new >= 1024 and ("<think>" in prompt_str or "</think>" in tok.get_vocab()) and "</think>" not in prompt_str) else None
             gen_t = dec.generate(x_in, max_new_tokens=max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids, close_think_ids=close_ids)
             gen_ids = gen_t[0, len(ids):].tolist()
         else:
             sample = temperature > 1e-5
+            from transformers import LogitsProcessorList
+            lp = LogitsProcessorList([_CloseThinkLogitsProcessor(len(ids), close_ids, max(64, max_new - 64))]) if close_ids else None
             gen_t = model.generate(
                 x_in,
                 max_new_tokens=max_new,
                 do_sample=sample,
                 temperature=temperature if sample else None,
                 top_p=top_p if sample else None,
+                logits_processor=lp,
                 eos_token_id=list(eos_ids),
                 pad_token_id=tok.eos_token_id or 0,
             )

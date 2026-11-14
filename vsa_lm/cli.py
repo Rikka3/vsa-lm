@@ -114,11 +114,11 @@ def main(argv: list[str] | None = None):
     p_conv = sub.add_parser("convert", help="Convert any Llama/Qwen/Mistral/SmolLM model into a VSA hybrid")
     p_conv.add_argument("--donor", required=True, help="HuggingFace repo ID or local snapshot directory")
     p_conv.add_argument("--out", default="vsa_student_init.pth", help="Output .pth checkpoint path")
-    p_conv.add_argument("--hybrid-every", type=int, default=4, help="Keep 1 Softmax layer every N layers (default: 4)")
-    p_conv.add_argument("--max-T", type=int, default=1024, help="Training sequence length (default: 1024)")
+    p_conv.add_argument("--hybrid-every", type=int, default=None, help="Keep 1 Softmax layer every N layers (default: 4)")
+    p_conv.add_argument("--max-T", type=int, default=None, help="Training sequence length (default: 1024)")
     p_conv.add_argument("--gamma-cap", type=float, default=0.992, help="Max initial decay horizon (default: 0.992)")
     p_conv.add_argument("--hf-token", default=None, help="Optional HuggingFace token for gated models")
-    p_conv.add_argument("--swa-window", type=int, default=64, help="Sliding-window softmax tokens inside each VSA layer (0 = off)")
+    p_conv.add_argument("--swa-window", type=int, default=None, help="Sliding-window softmax tokens inside each VSA layer (0 = off)")
 
     sub.add_parser("heal", help="Run memory-optimal anchored healing on any converted VSA checkpoint")
 

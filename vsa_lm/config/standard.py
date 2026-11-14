@@ -12,6 +12,56 @@ from .inspector import compute_layer_types
 from .qwen35 import Qwen35ZeroCenteredRMSNorm, Qwen35PartialRoPE, Qwen35VSAAttn
 
 
+def _centered_ema_scan(kx: torch.Tensor, vx: torch.Tensor, gam: torch.Tensor, chunk_size: int = 32):
+    """Loop-free chunked 1D EMA scan for (k_bar, v_bar, z_bar) with exact causal parity."""
+    B, H, T, D = kx.shape
+    C = min(chunk_size, 32)
+    N_c = (T + C - 1) // C
+    T_pad = N_c * C
+    pad = T_pad - T
+    if pad > 0:
+        kx_p = F.pad(kx.float(), (0, 0, 0, pad))
+        vx_p = F.pad(vx.float(), (0, 0, 0, pad))
+        ones_p = torch.cat([
+            torch.ones(1, 1, T, 1, device=kx.device, dtype=torch.float32),
+            torch.zeros(1, 1, pad, 1, device=kx.device, dtype=torch.float32),
+        ], dim=2)
+    else:
+        kx_p, vx_p = kx.float(), vx.float()
+        ones_p = torch.ones(1, 1, T_pad, 1, device=kx.device, dtype=torch.float32)
+
+    kx_c = kx_p.view(B, H, N_c, C, D)
+    vx_c = vx_p.view(B, H, N_c, C, D)
+    ones_c = ones_p.view(1, 1, N_c, C, 1).expand(1, H, N_c, C, 1)
+
+    idx_c = torch.arange(C, device=kx.device)
+    d_intra = (idx_c[:, None] - idx_c[None, :]).clamp_min(0).float()
+    m_intra = (idx_c[:, None] >= idx_c[None, :]).float()
+    W_intra = (gam[:, None, None] ** d_intra[None]) * m_intra[None]
+
+    k_intra = torch.einsum("hij,nhajd->nhaid", W_intra, kx_c)
+    v_intra = torch.einsum("hij,nhajd->nhaid", W_intra, vx_c)
+    z_intra = torch.einsum("hij,nhajk->nhaik", W_intra, ones_c)
+
+    if N_c > 1:
+        idx_n = torch.arange(N_c, device=kx.device)
+        d_inter = (idx_n[:, None] - idx_n[None, :] - 1).clamp_min(0).float()
+        m_inter = (idx_n[:, None] > idx_n[None, :]).float()
+        W_inter = (gam[:, None, None] ** (C * d_inter[None])) * m_inter[None]
+        r_pow = (gam[:, None] ** (idx_c[None] + 1).float()).view(1, H, 1, C, 1)
+        k_carry = torch.einsum("hcs,nhsd->nhcd", W_inter, k_intra[:, :, :, -1, :]).unsqueeze(3)
+        v_carry = torch.einsum("hcs,nhsd->nhcd", W_inter, v_intra[:, :, :, -1, :]).unsqueeze(3)
+        z_carry = torch.einsum("hcs,nhsk->nhck", W_inter, z_intra[:, :, :, -1, :]).unsqueeze(3)
+        k_bar = (k_intra + r_pow * k_carry).reshape(B, H, T_pad, D)[:, :, :T, :]
+        v_bar = (v_intra + r_pow * v_carry).reshape(B, H, T_pad, D)[:, :, :T, :]
+        z_bar = (z_intra + r_pow * z_carry).reshape(1, H, T_pad, 1)[:, :, :T, :]
+    else:
+        k_bar = k_intra.reshape(B, H, T_pad, D)[:, :, :T, :]
+        v_bar = v_intra.reshape(B, H, T_pad, D)[:, :, :T, :]
+        z_bar = z_intra.reshape(1, H, T_pad, 1)[:, :, :T, :]
+    return k_bar, v_bar, z_bar
+
+
 class UniversalSoftmaxAttn(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
@@ -153,6 +203,11 @@ class UniversalVSAAttn(nn.Module):
             nn.init.normal_(self.slot_router.weight, std=0.01)
             nn.init.constant_(self.slot_router.bias, -3.0)
             self.slot_gate = nn.Parameter(torch.zeros(H))
+        self.center_unbinding = bool(cfg.get("vsa_center_unbinding", False))
+        if self.center_unbinding:
+            self.center_proj = nn.Linear(D, H, bias=True)
+            nn.init.zeros_(self.center_proj.weight)
+            nn.init.zeros_(self.center_proj.bias)
 
     def head_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
@@ -240,6 +295,12 @@ class UniversalVSAAttn(nn.Module):
 
         gam = self.gamma()
         y = _vsa_apply(q, kx, vx, gam, self.chunk_size)
+        if getattr(self, "center_unbinding", False):
+            k_bar, v_bar, z_bar = _centered_ema_scan(kx, vx, gam, 32)
+            c_alpha = torch.tanh(self.center_proj(x).float()).transpose(1, 2).unsqueeze(-1)
+            kq_dot = (k_bar * q.float()).sum(dim=-1, keepdim=True)
+            omg = ((1.0 - gam) / (self.HD ** 0.5)).view(1, self.H, 1, 1)
+            y = (y.float() - c_alpha * omg * (kq_dot / (z_bar + 1e-6)) * v_bar).to(y.dtype)
         y = self.out_norm(y)
 
         if hasattr(self, "v_self_scale"):
@@ -294,7 +355,7 @@ class UniversalVSALM(nn.Module):
         super().__init__()
         head_dim = head_dim or (dim // num_heads)
         layer_types = extra_cfg.pop("layer_types", None) or compute_layer_types(
-            num_layers, hybrid_every, extra_cfg.get("donor_layer_types")
+            num_layers, hybrid_every, extra_cfg.get("donor_layer_types"), pin_endpoints=bool(extra_cfg.get("pin_endpoints", False))
         )
         self.config = dict(
             vocab_size=vocab_size, dim=dim, num_layers=num_layers,
