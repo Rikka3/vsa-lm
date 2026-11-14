@@ -229,7 +229,8 @@ class VSARecurrentDecoder:
         if not self.is_universal:
             return
         device = next(self.model.parameters()).device
-        m_dt = self.model.lm_head.weight.dtype if hasattr(self.model, "lm_head") else torch.float32
+        w_lm = getattr(getattr(self.model, "lm_head", None), "weight", None)
+        m_dt = w_lm.dtype if isinstance(w_lm, torch.Tensor) else torch.float32
         dt = m_dt if (device.type == "cuda" and m_dt in (torch.bfloat16, torch.float16)) else torch.float32
         self._step_dt = dt
         if isinstance(getattr(self.model.lm_head, "weight", None), torch.Tensor):
@@ -344,7 +345,8 @@ class VSARecurrentDecoder:
     def blank_state(model, batch_size: int, device, max_kv_len: int = 4096, state_dtype=torch.float32, graph: bool = False,
                     stream: tuple[int, int] | None = None):
         states, kv_caches = [None] * len(model.blocks), [None] * len(model.blocks)
-        m_dt = model.lm_head.weight.dtype if hasattr(model, "lm_head") else torch.float32
+        w_lm = getattr(getattr(model, "lm_head", None), "weight", None)
+        m_dt = w_lm.dtype if isinstance(w_lm, torch.Tensor) else torch.float32
         dt = m_dt if (str(device).startswith("cuda") and m_dt in (torch.bfloat16, torch.float16)) else torch.float32
         for li, blk in enumerate(model.blocks):
             if hasattr(blk, "vsa"):
