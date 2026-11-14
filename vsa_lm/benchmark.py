@@ -360,9 +360,7 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200,
         ids = tok.encode(prompt_str, add_special_tokens=False)
         x_in = torch.tensor([ids], dtype=torch.long, device=device)
         need_think_close = (max_new >= 1024) and ("<think>" in prompt_str or "</think>" in tok.get_vocab()) and ("</think>" not in prompt_str)
-        close_ids = tok.encode("
-</think>
-Therefore, final answer is \boxed{", add_special_tokens=False) if need_think_close else None
+        close_ids = tok.encode("\n</think>\nTherefore, final answer is \\boxed{", add_special_tokens=False) if need_think_close else None
         if not is_hf:
             gen_t = dec.generate(x_in, max_new_tokens=max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids, close_think_ids=close_ids)
             gen_ids = gen_t[0, len(ids):].tolist()
