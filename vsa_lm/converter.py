@@ -649,7 +649,7 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
 
 def _kd_microbatch_backward(stu, donor, is_hf_donor: bool, w_lm_t: torch.Tensor, xm: torch.Tensor, ym: torch.Tensor,
                             w: float, kd: float, use_ckpt: bool, loss_mask: torch.Tensor | None = None,
-                            tok_slice: int = 512) -> torch.Tensor:
+                            tok_slice: int = 2048, ckpt_stride: int = 1) -> torch.Tensor:
     """One distillation micro-batch: teacher forward, student forward, hidden-state cosine at every softmax
     anchor + final norm, and the KD(+CE) gradient pushed through the LM head in fp32 token slices.
     Gradients accumulate into .grad scaled by `w`; returns the detached loss contribution.
@@ -675,7 +675,8 @@ def _kd_microbatch_backward(stu, donor, is_hf_donor: bool, w_lm_t: torch.Tensor,
         xs = stu.embed_tokens(xm)
         s_mids = []
         for li, blk in enumerate(stu.blocks):
-            xs = torch.utils.checkpoint.checkpoint(blk, xs, use_reentrant=False) if use_ckpt else blk(xs)
+            do_ckpt = use_ckpt and (li % ckpt_stride == 0)
+            xs = torch.utils.checkpoint.checkpoint(blk, xs, use_reentrant=False) if do_ckpt else blk(xs)
             if li < L_num - 1 and (li + 1) % every == 0:
                 s_mids.append(xs)
         h_student = stu.norm(xs)
@@ -793,6 +794,8 @@ def heal_universal_model(
     freeze_mlp: bool = False,
     stage1_onpolicy: bool = False,
     profile: str | None = None,
+    ckpt_stride: int = 1,
+    micro_bs_override: int | None = None,
 ):
     _purge_zombie_vram()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -826,6 +829,9 @@ def heal_universal_model(
         use_ckpt = True
         mode_str = f"LOW-VRAM (use_ckpt=True, micro_bs={micro_bs}, T={T})"
 
+    if micro_bs_override is not None:
+        micro_bs = int(micro_bs_override)
+        mode_str = f"OVERRIDE (use_ckpt={use_ckpt}, ckpt_stride={ckpt_stride}, micro_bs={micro_bs}, T={T})"
     donor, is_hf_donor, w_lm_t, donor_dir = _load_tied_teacher(donor_repo, stu_cfg, stu, device)
     train_tokens, eval_tokens = _build_reasoning_and_eval_caches(
         work, donor_dir, donor_repo, max(data_tokens, int(tokens_budget * 1.05)), max_T=T, profile=profile
@@ -896,7 +902,7 @@ def heal_universal_model(
         for lo in range(0, bs, micro_bs):
             hi = min(lo + micro_bs, bs)
             xm, ym = x[lo:hi].to(device, non_blocking=True), y[lo:hi].to(device, non_blocking=True)
-            loss_gpu += _kd_microbatch_backward(stu, donor, is_hf_donor, w_lm_t, xm, ym, (hi - lo) / bs, kd, use_ckpt)
+            loss_gpu += _kd_microbatch_backward(stu, donor, is_hf_donor, w_lm_t, xm, ym, (hi - lo) / bs, kd, use_ckpt, ckpt_stride=ckpt_stride)
 
         gn_tensor = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         if torch.isfinite(gn_tensor):
