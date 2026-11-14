@@ -36,25 +36,66 @@ def get_all_eos_ids(tokenizer) -> set[int]:
     return eos_ids
 
 
-def load_model_for_serving(ckpt_path: str, donor_tokenizer: str | None = None, quantize_cpu: bool = False):
+def _quantize_cpu_low_ram(model):
+    q_fn = getattr(getattr(torch, "ao", torch), "quantization", torch.quantization).quantize_dynamic
+    emb = model.embed_tokens if hasattr(model, "embed_tokens") else model.embed
+    emb.weight.data = emb.weight.data.to(torch.bfloat16)
+    emb.register_forward_hook(lambda _m, _in, out: out.float())
+
+    norm_m = model.norm if hasattr(model, "norm") else model.norm_f
+    norm_m.float()
+
+    head_w = model.lm_head.weight.detach().float()
+    tmp_head = nn.Linear(model.lm_head.in_features, model.lm_head.out_features, bias=False)
+    tmp_head.weight = nn.Parameter(head_w)
+    model.lm_head = q_fn(nn.ModuleDict({"h": tmp_head}), {nn.Linear}, dtype=torch.qint8)["h"]
+    del tmp_head, head_w
+    gc.collect()
+
+    for li in range(len(model.blocks)):
+        blk = model.blocks[li].float()
+        model.blocks[li] = q_fn(blk, {nn.Linear}, dtype=torch.qint8)
+        del blk
+        if li % 4 == 3:
+            gc.collect()
+    gc.collect()
+    return model.eval()
+
+
+def load_model_for_serving(ckpt_path: str, donor_tokenizer: str | None = None, quantize_cpu: bool = True):
     from transformers import AutoTokenizer
     from .converter import UniversalVSALM, fetch_any_donor
     from .surgery import LlamaVSALM
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[vsa-serve] Loading {ckpt_path} on {device}...")
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    try:
+        ck = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
+    except Exception:
+        ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = dict(ck["config"])
     donor_id = donor_tokenizer or ck.get("donor") or (ck.get("injection") or {}).get("donor")
     if not donor_id:
         raise ValueError("Checkpoint lacks donor metadata; pass --donor <hf_repo_id> explicitly.")
 
-    if cfg.get("donor_arch") not in (None, "llama") or cfg.get("qkv_bias", False) or cfg.get("has_qwen35_lin", False):
-        model = UniversalVSALM(**cfg)
-    else:
-        model = LlamaVSALM(**cfg)
-    model.load_state_dict(ck["model"], strict=False)
-    del ck
+    sd = ck["model"]
+    sd_keys = set(sd.keys())
+    with torch.device("meta"):
+        if cfg.get("donor_arch") not in (None, "llama") or cfg.get("qkv_bias", False) or cfg.get("has_qwen35_lin", False):
+            model = UniversalVSALM(**cfg)
+        else:
+            model = LlamaVSALM(**cfg)
+    model.load_state_dict(sd, strict=False, assign=True)
+    if "lm_head.weight" not in sd_keys or cfg.get("tie_word_embeddings", True):
+        model.lm_head.weight = (model.embed_tokens if hasattr(model, "embed_tokens") else model.embed).weight
+    for n, p in list(model.named_parameters()):
+        if p.device.type == "meta":
+            parent_n, _, attr_n = n.rpartition(".")
+            mod = model.get_submodule(parent_n) if parent_n else model
+            init_fn = torch.ones if ("norm" in n and not cfg.get("has_qwen35_lin", False)) else torch.zeros
+            setattr(mod, attr_n, nn.Parameter(init_fn(p.shape, dtype=torch.float32), requires_grad=False))
+    del ck, sd
+    gc.collect()
 
     fp32_keys = ("pos_code", "log_gamma", "k_head_mix", "v_head_mix", "head_pos_delta",
                  "v_self_scale", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "swa_mix", "center_proj")
@@ -65,10 +106,11 @@ def load_model_for_serving(ckpt_path: str, donor_tokenizer: str | None = None, q
             b.data = b.data.to(device)
         model.eval()
     else:
-        model = model.float().eval()
         if quantize_cpu:
-            print("[vsa-serve] Applying Dynamic INT8 CPU Quantization...")
-            model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+            print("[vsa-serve] Applying low-RAM layerwise INT8 CPU quantization...")
+            model = _quantize_cpu_low_ram(model)
+        else:
+            model = model.float().eval()
 
     donor_dir = fetch_any_donor(donor_id)
     tokenizer = AutoTokenizer.from_pretrained(donor_dir)
@@ -92,8 +134,9 @@ def generate_completion(model, tokenizer, device, messages: list[dict], max_toke
     eos_ids = get_all_eos_ids(tokenizer)
 
     # D1 Fix: Use stateful VSARecurrentDecoder so context never drops out at 1,024 tokens!
+    # D1 Fix: Use stateful VSARecurrentDecoder so context never drops out at 1,024 tokens!
     if decoder is None:
-        decoder = VSARecurrentDecoder(model, wrap_positions=False)
+        decoder = VSARecurrentDecoder(model, wrap_positions=False, max_cache_pos=(8192 if device.type == "cpu" else 65536))
     prompt_tensor = torch.tensor([ids], dtype=torch.long, device=device)
     out_tensor = decoder.generate(
         prompt_tensor,
@@ -111,7 +154,7 @@ def run_server(ckpt_path: str, donor_tokenizer: str | None = None, host: str = "
                stream_window: int | None = None):
     """stream_window=W: infinite-context mode (constant RAM per request at any prompt length; see decode.StreamKV)."""
     model, tokenizer, device = load_model_for_serving(ckpt_path, donor_tokenizer, quantize_cpu=quantize_cpu)
-    decoder = VSARecurrentDecoder(model, wrap_positions=False, stream_window=stream_window)
+    decoder = VSARecurrentDecoder(model, wrap_positions=False, max_cache_pos=(8192 if device.type == "cpu" else 65536), stream_window=stream_window)
 
     class OpenAIHandler(BaseHTTPRequestHandler):
         def do_GET(self):
