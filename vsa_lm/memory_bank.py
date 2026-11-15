@@ -115,8 +115,8 @@ class VSAMemoryBank:
         erased_states = self.decoder.forget(traces, states_to_erase, next_pos=doc_next_pos)
         max_erase_err = max(
             float(es.abs().max().item())
-            for es in erased_states
-            if es is not None
+            for li_e, es in enumerate(erased_states)
+            if es is not None and hasattr(self.model.blocks[li_e], "vsa") and getattr(self.model.blocks[li_e].vsa, "mode", None) != "gated_deltanet"
         )
 
         q_prompt = f"Question: {question.strip()}\nAnswer:"

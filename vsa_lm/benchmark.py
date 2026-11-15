@@ -618,18 +618,39 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
         L = cfg["num_layers"]
         HKV = cfg["num_kv_heads"]
         HD = cfg["head_dim"]
-        donor_kv_mb = (L * 2 * HKV * HD * T_c * 2) / (1024 ** 2)
+        donor_lt = cfg.get("donor_layer_types") or []
         inner_hf = getattr(getattr(hf_donor, "model", hf_donor), "language_model", getattr(hf_donor, "model", hf_donor))
-        from transformers.cache_utils import DynamicCache
-        cache_hf = DynamicCache()
-        for li in range(L):
-            cache_hf.update(
-                torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16),
-                torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16),
-                li,
-            )
+        if cfg.get("has_qwen35_lin", False) and donor_lt:
+            n_full = sum(1 for x in donor_lt if x == "full_attention")
+            n_lin = sum(1 for x in donor_lt if x == "linear_attention")
+            l_vh, l_kh = cfg["linear_num_value_heads"], cfg["linear_num_key_heads"]
+            l_vd, l_kd, l_ck = cfg["linear_value_head_dim"], cfg["linear_key_head_dim"], cfg["linear_conv_kernel_dim"]
+            gdn_mb = n_lin * (l_vh * l_kd * l_vd * 4 + (l_kh * l_kd * 2 + l_vh * l_vd) * (l_ck - 1) * 2) / (1024 ** 2)
+            donor_kv_mb = gdn_mb + (n_full * 2 * HKV * HD * T_c * 2) / (1024 ** 2)
+            with torch.autocast("cuda", torch.bfloat16):
+                cache_hf = inner_hf(input_ids=nxt_tok, use_cache=True).past_key_values
+            if hasattr(cache_hf, "key_cache"):
+                for li in range(L):
+                    if cache_hf.key_cache[li] is not None and cache_hf.key_cache[li].numel() > 0:
+                        cache_hf.key_cache[li] = torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16)
+                        cache_hf.value_cache[li] = torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16)
+            elif hasattr(cache_hf, "layers"):
+                for ly_c in cache_hf.layers:
+                    if getattr(ly_c, "keys", None) is not None:
+                        ly_c.keys = torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16)
+                        ly_c.values = torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16)
+        else:
+            donor_kv_mb = (L * 2 * HKV * HD * T_c * 2) / (1024 ** 2)
+            from transformers.cache_utils import DynamicCache
+            cache_hf = DynamicCache()
+            for li in range(L):
+                cache_hf.update(
+                    torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16),
+                    torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16),
+                    li,
+                )
         with torch.autocast("cuda", torch.bfloat16):
-            _ = hf_donor(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
+            _ = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.autocast("cuda", torch.bfloat16):
