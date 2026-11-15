@@ -8,6 +8,8 @@ Fixes from Audit:
 """
 from __future__ import annotations
 
+import gc
+
 import json
 import time
 import uuid
