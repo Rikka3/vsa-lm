@@ -811,15 +811,34 @@ class VSARecurrentDecoder:
 
     @torch.no_grad()
     def generate_batch(self, ids: torch.Tensor, max_new_tokens: int, temperature: float = 0.6, top_k: int = 40,
-                       top_p: float = 0.95, eos_ids: set[int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                       top_p: float = 0.95, eos_ids: set[int] | None = None,
+                       close_think_ids: list[int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         B, T = ids.shape
         logits, feed = self._start(ids, max_new_tokens)
         eos = torch.tensor(sorted(eos_ids or ()), device=ids.device, dtype=torch.long)
         done = torch.zeros(B, dtype=torch.bool, device=ids.device)
         lengths = torch.full((B,), max_new_tokens, dtype=torch.long, device=ids.device)
+        end_think_id = close_think_ids[1] if (close_think_ids and len(close_think_ids) > 1) else None
+        closed_think = torch.zeros(B, dtype=torch.bool, device=ids.device)
+        q_pos = torch.full((B,), -1, dtype=torch.long, device=ids.device)
+        budget_trigger = max(64, max_new_tokens - 64)
         out, pos = [], T - 1
         for i in range(max_new_tokens):
             nxt = self._sample(logits, temperature, top_k=top_k, top_p=top_p)
+            if close_think_ids:
+                if i == budget_trigger:
+                    need = (~closed_think) & (~done) & (q_pos < 0)
+                    q_pos[need] = 0
+                active_q = q_pos >= 0
+                if bool(active_q.any()):
+                    for r in torch.nonzero(active_q, as_tuple=False).view(-1).tolist():
+                        nxt[r, 0] = close_think_ids[int(q_pos[r])]
+                        q_pos[r] += 1
+                        if q_pos[r] >= len(close_think_ids):
+                            q_pos[r] = -1
+                            closed_think[r] = True
+                if end_think_id is not None:
+                    closed_think |= (nxt[:, 0] == end_think_id)
             out.append(nxt)
             if eos.numel():
                 hit = torch.isin(nxt[:, 0], eos) & ~done

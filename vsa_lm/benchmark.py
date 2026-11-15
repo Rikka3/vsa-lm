@@ -259,27 +259,28 @@ def _verify_ifeval_instruction(resp: str, inst_ids: list[str], kwargs_list: list
 
 
 class _CloseThinkLogitsProcessor:
-    def __init__(self, prompt_len: int, close_ids: list[int], trigger_step: int):
+    def __init__(self, prompt_len: int, close_ids: list[int], trigger_step: int, batch_size: int = 1):
         self.prompt_len = prompt_len
         self.close_ids = close_ids
         self.end_think_id = close_ids[1] if len(close_ids) > 1 else close_ids[0]
         self.trigger_step = trigger_step
-        self.start_step = None
+        self.start_steps = [None] * batch_size
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        gen = input_ids[0, self.prompt_len:]
-        step_i = int(gen.shape[0])
-        if self.start_step is None:
-            if (gen == self.end_think_id).any().item():
-                return scores
-            if step_i == self.trigger_step:
-                self.start_step = step_i
-        if self.start_step is not None:
-            offset = step_i - self.start_step
-            if offset < len(self.close_ids):
-                tgt = self.close_ids[offset]
-                scores.fill_(-1e9)
-                scores[:, tgt] = 0.0
+        step_i = int(input_ids.shape[1]) - self.prompt_len
+        for r in range(input_ids.shape[0]):
+            if self.start_steps[r] is None:
+                gen_r = input_ids[r, self.prompt_len:]
+                if (gen_r == self.end_think_id).any().item():
+                    continue
+                if step_i == self.trigger_step:
+                    self.start_steps[r] = step_i
+            if self.start_steps[r] is not None:
+                offset = step_i - self.start_steps[r]
+                if offset < len(self.close_ids):
+                    tgt = self.close_ids[offset]
+                    scores[r].fill_(-1e9)
+                    scores[r, tgt] = 0.0
         return scores
 
 
@@ -363,191 +364,298 @@ def _run_inspect_or_direct_task(task_name: str, samples_data: list[dict], eval_f
 
 
 @torch.no_grad()
-def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200, gsm8k_limit: int = 200) -> dict:
-    out = {}
+def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200, gsm8k_limit: int = 200,
+                cached: dict | None = None, on_save=None, gsm_max_new: int = 2048) -> dict:
+    out = dict(cached) if cached else {}
     eos_ids = get_all_eos_ids(tok)
     dec = VSARecurrentDecoder(model, wrap_positions=False, max_cache_pos=16384) if not is_hf else None
     _ACTIVE_ENGINE["name"] = "Donor" if is_hf else "VSA-LM"
     log_dir = os.path.join(os.getcwd(), "inspect_logs", "donor" if is_hf else "vsa_lm")
     os.makedirs(log_dir, exist_ok=True)
+    has_think_vocab = "</think>" in tok.get_vocab()
+    close_toks = tok.encode("\n</think>\nTherefore, final answer is \\boxed{", add_special_tokens=False)
+    is_qwen35 = (not is_hf and bool(getattr(model, "config", {}).get("has_qwen35_lin", False)))
+    stu_max_bs = 8 if is_qwen35 else 4
 
-    def _gen(prompt_str: str, max_new: int = 2048, temperature: float = 0.0, top_p: float = 1.0, seed: int = 0) -> tuple[str, int, bool]:
-        torch.manual_seed(seed)
-        ids = tok.encode(prompt_str, add_special_tokens=False)
-        x_in = torch.tensor([ids], dtype=torch.long, device=device)
-        need_think_close = (max_new >= 1024) and ("<think>" in prompt_str or "</think>" in tok.get_vocab()) and ("</think>" not in prompt_str)
-        close_ids = tok.encode("\n</think>\nTherefore, final answer is \\boxed{", add_special_tokens=False) if need_think_close else None
+    def _gen_batch(prompts: list[str], max_new: int = 2048, temperature: float = 0.0, top_p: float = 1.0, base_seed: int = 0, label: str = "") -> list[tuple[str, int, bool]]:
+        n_tot = len(prompts)
+        res: list[tuple[str, int, bool]] = [("", 0, False)] * n_tot
+        t0 = time.perf_counter()
+        done_cnt = 0
+
         if not is_hf:
-            gen_t = dec.generate(x_in, max_new_tokens=max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids, close_think_ids=close_ids)
-            gen_ids = gen_t[0, len(ids):].tolist()
-        else:
-            sample = temperature > 1e-5
-            from transformers import LogitsProcessorList
-            lp = LogitsProcessorList([_CloseThinkLogitsProcessor(len(ids), close_ids, max(64, max_new - 64))]) if close_ids else None
+            groups: dict[tuple[int, bool], list[int]] = {}
+            enc_map: list[list[int]] = []
+            for idx_p, p_s in enumerate(prompts):
+                ids = tok.encode(p_s, add_special_tokens=False)
+                enc_map.append(ids)
+                need_close = (max_new >= 1024) and ("<think>" in p_s or has_think_vocab) and ("</think>" not in p_s)
+                groups.setdefault((len(ids), need_close), []).append(idx_p)
+
+            for (_, need_close), idxs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+                c_ids = close_toks if need_close else None
+                for off in range(0, len(idxs), stu_max_bs):
+                    ch = idxs[off : off + stu_max_bs]
+                    if is_qwen35:
+                        b_tgt = len(ch)
+                    else:
+                        b_tgt = 1 if len(ch) == 1 else 4
+                    rows = [enc_map[i] for i in ch]
+                    if len(rows) < b_tgt:
+                        rows = rows + [rows[-1]] * (b_tgt - len(rows))
+                    x_in = torch.tensor(rows, dtype=torch.long, device=device)
+                    torch.manual_seed(base_seed + ch[0])
+                    toks, n_lens = dec.generate_batch(
+                        x_in, max_new_tokens=max_new, temperature=temperature, top_p=top_p,
+                        eos_ids=eos_ids, close_think_ids=c_ids,
+                    )
+                    for r_i, orig_idx in enumerate(ch):
+                        n_r = int(n_lens[r_i].item())
+                        g_ids = toks[r_i, :n_r].tolist()
+                        hit_eos = bool(eos_ids and g_ids and g_ids[-1] in eos_ids)
+                        if hit_eos:
+                            g_ids = g_ids[:-1]
+                        res[orig_idx] = (tok.decode(g_ids, skip_special_tokens=True), n_r, (not hit_eos and n_r >= max_new))
+                    done_cnt += len(ch)
+                    if label:
+                        print(f"    [{_ACTIVE_ENGINE['name']} | {label:<13}] gen {done_cnt:3d}/{n_tot} | {time.perf_counter()-t0:.1f}s", flush=True)
+            return res
+
+        from transformers import LogitsProcessorList
+        pad_id = tok.pad_token_id if isinstance(tok.pad_token_id, int) else (tok.eos_token_id if isinstance(tok.eos_token_id, int) else 0)
+        sample = temperature > 1e-5
+        for off in range(0, n_tot, 16):
+            ch_idx = list(range(off, min(off + 16, n_tot)))
+            enc_list = [tok.encode(prompts[i], add_special_tokens=False) for i in ch_idx]
+            max_l = max(len(e) for e in enc_list)
+            x_in = torch.full((len(ch_idx), max_l), pad_id, dtype=torch.long, device=device)
+            attn_m = torch.zeros((len(ch_idx), max_l), dtype=torch.long, device=device)
+            for r_i, e in enumerate(enc_list):
+                x_in[r_i, max_l - len(e):] = torch.tensor(e, dtype=torch.long, device=device)
+                attn_m[r_i, max_l - len(e):] = 1
+            need_close = (max_new >= 1024) and any(("<think>" in prompts[i] or has_think_vocab) and ("</think>" not in prompts[i]) for i in ch_idx)
+            lp = LogitsProcessorList([_CloseThinkLogitsProcessor(max_l, close_toks, max(64, max_new - 64), batch_size=len(ch_idx))]) if need_close else None
+            torch.manual_seed(base_seed + ch_idx[0])
             gen_t = model.generate(
-                x_in,
+                input_ids=x_in,
+                attention_mask=attn_m,
                 max_new_tokens=max_new,
                 do_sample=sample,
                 temperature=temperature if sample else None,
                 top_p=top_p if sample else None,
                 logits_processor=lp,
                 eos_token_id=list(eos_ids),
-                pad_token_id=tok.eos_token_id or 0,
+                pad_token_id=pad_id,
             )
-            gen_ids = gen_t[0, len(ids):].tolist()
-        hit_cap = len(gen_ids) >= max_new and (not gen_ids or gen_ids[-1] not in eos_ids)
-        if eos_ids and gen_ids and gen_ids[-1] in eos_ids:
-            gen_ids = gen_ids[:-1]
-        return tok.decode(gen_ids, skip_special_tokens=True), len(gen_ids), hit_cap
+            for r_i, orig_idx in enumerate(ch_idx):
+                raw_ids = gen_t[r_i, max_l:].tolist()
+                cut = next((k for k, tid in enumerate(raw_ids) if tid in eos_ids), None)
+                hit_cap = (cut is None and len(raw_ids) >= max_new)
+                g_ids = raw_ids[:cut] if cut is not None else raw_ids
+                res[orig_idx] = (tok.decode(g_ids, skip_special_tokens=True), len(g_ids), hit_cap)
+            done_cnt += len(ch_idx)
+            if label:
+                print(f"    [{_ACTIVE_ENGINE['name']} | {label:<13}] gen {done_cnt:3d}/{n_tot} | {time.perf_counter()-t0:.1f}s", flush=True)
+        return res
 
-    # 1. MMLU (200 stratified across 57 subjects)
-    rows = _load_mmlu_stratified(limit)
-    def _eval_mmlu(idx, r):
-        ch = r["choices"]
-        subj = r.get("subject", "general").replace("_", " ")
-        prompt = f"The following is a multiple-choice question about {subj}.\nQuestion: {r['question'].strip()}\nOptions:\n- {ch[0]}\n- {ch[1]}\n- {ch[2]}\n- {ch[3]}\nCorrect Answer:"
-        pred = _score_choices(model, is_hf, tok, prompt, ch, device, norm_len=True)
-        return (pred == int(r["answer"])), str(pred)
-    hits = _run_inspect_or_direct_task("MMLU", rows, _eval_mmlu, log_dir)
-    acc = (sum(hits) / len(hits)) * 100.0
-    out["MMLU"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
+    # 1. MMLU
+    if "MMLU" not in out:
+        rows = _load_mmlu_stratified(limit)
+        def _eval_mmlu(idx, r):
+            ch = r["choices"]
+            subj = r.get("subject", "general").replace("_", " ")
+            prompt = f"The following is a multiple-choice question about {subj}.\nQuestion: {r['question'].strip()}\nOptions:\n- {ch[0]}\n- {ch[1]}\n- {ch[2]}\n- {ch[3]}\nCorrect Answer:"
+            pred = _score_choices(model, is_hf, tok, prompt, ch, device, norm_len=True)
+            return (pred == int(r["answer"])), str(pred)
+        hits = _run_inspect_or_direct_task("MMLU", rows, _eval_mmlu, log_dir)
+        acc = (sum(hits) / len(hits)) * 100.0
+        out["MMLU"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
+        if on_save:
+            on_save(out)
+    else:
+        print(f"    [{_ACTIVE_ENGINE['name']} | MMLU         ] cached {out['MMLU']['acc']:.2f}%", flush=True)
 
-    # 2. ARC-Challenge (200 scientific reasoning questions)
-    rows = _load_rows("allenai/ai2_arc", "ARC-Challenge", "test", limit)
-    def _eval_arc(idx, r):
-        ch_texts = r["choices"]["text"]
-        ch_labels = r["choices"]["label"]
-        gold_idx = ch_labels.index(r["answerKey"]) if r["answerKey"] in ch_labels else 0
-        prompt = f"Question: {r['question'].strip()}\nAnswer:"
-        pred = _score_choices(model, is_hf, tok, prompt, ch_texts, device, norm_len=True)
-        return (pred == gold_idx), str(pred)
-    hits = _run_inspect_or_direct_task("ARC-Challenge", rows, _eval_arc, log_dir)
-    acc = (sum(hits) / len(hits)) * 100.0
-    out["ARC-Challenge"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
+    # 2. ARC-Challenge
+    if "ARC-Challenge" not in out:
+        rows = _load_rows("allenai/ai2_arc", "ARC-Challenge", "test", limit)
+        def _eval_arc(idx, r):
+            ch_texts = r["choices"]["text"]
+            ch_labels = r["choices"]["label"]
+            gold_idx = ch_labels.index(r["answerKey"]) if r["answerKey"] in ch_labels else 0
+            prompt = f"Question: {r['question'].strip()}\nAnswer:"
+            pred = _score_choices(model, is_hf, tok, prompt, ch_texts, device, norm_len=True)
+            return (pred == gold_idx), str(pred)
+        hits = _run_inspect_or_direct_task("ARC-Challenge", rows, _eval_arc, log_dir)
+        acc = (sum(hits) / len(hits)) * 100.0
+        out["ARC-Challenge"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
+        if on_save:
+            on_save(out)
+    else:
+        print(f"    [{_ACTIVE_ENGINE['name']} | ARC-Challenge] cached {out['ARC-Challenge']['acc']:.2f}%", flush=True)
 
-    # 3. HellaSwag (200 commonsense completion questions)
-    rows = _load_rows("Rowan/hellaswag", None, "validation", limit)
-    def _eval_hellaswag(idx, r):
-        pred = _score_choices(model, is_hf, tok, r["ctx"].strip(), r["endings"], device)
-        return (pred == int(r["label"])), str(pred)
-    hits = _run_inspect_or_direct_task("HellaSwag", rows, _eval_hellaswag, log_dir)
-    acc = (sum(hits) / len(hits)) * 100.0
-    out["HellaSwag"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
+    # 3. HellaSwag
+    if "HellaSwag" not in out:
+        rows = _load_rows("Rowan/hellaswag", None, "validation", limit)
+        def _eval_hellaswag(idx, r):
+            pred = _score_choices(model, is_hf, tok, r["ctx"].strip(), r["endings"], device)
+            return (pred == int(r["label"])), str(pred)
+        hits = _run_inspect_or_direct_task("HellaSwag", rows, _eval_hellaswag, log_dir)
+        acc = (sum(hits) / len(hits)) * 100.0
+        out["HellaSwag"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
+        if on_save:
+            on_save(out)
+    else:
+        print(f"    [{_ACTIVE_ENGINE['name']} | HellaSwag    ] cached {out['HellaSwag']['acc']:.2f}%", flush=True)
 
-    # 4. GSM8K Multi-Step Math (200 count, native <think> CoT, temp=0.2, top_p=0.85, cap=2048)
-    rows = _load_rows("openai/gsm8k", "main", "test", gsm8k_limit)
-    lengths, trunc_cnt = [], 0
-    def _eval_gsm(idx, r):
-        nonlocal trunc_cnt
-        gold = r["answer"].split("####")[-1].strip().replace(",", "")
-        p_str = gsm8k_prompt(tok, r["question"])
-        gen, n_new, hit_cap = _gen(p_str, max_new=2048, temperature=0.2, top_p=0.85, seed=1000 + idx)
+    # 4. GSM8K
+    if "GSM8K" not in out:
+        rows = _load_rows("openai/gsm8k", "main", "test", gsm8k_limit)
+        prompts_gsm = [gsm8k_prompt(tok, r["question"]) for r in rows]
+        gens_gsm = _gen_batch(prompts_gsm, max_new=gsm_max_new, temperature=0.2, top_p=0.85, base_seed=1000, label="GSM8K")
+        lengths, trunc_cnt = [], 0
+        def _eval_gsm(idx, r):
+            nonlocal trunc_cnt
+            gold = r["answer"].split("####")[-1].strip().replace(",", "")
+            gen, n_new, hit_cap = gens_gsm[idx]
+            lengths.append(n_new)
+            trunc_cnt += int(hit_cap)
+            ans_region = gen.split("</think>")[-1] if "</think>" in gen else gen
+            boxed = re.findall(r"\\boxed\{([^}]+)\}", ans_region)
+            nums = re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", boxed[-1] if boxed else ans_region)
+            pred = nums[-1].replace(",", "") if nums else None
+            hit = False
+            if pred is not None and not hit_cap:
+                try:
+                    hit = abs(float(pred) - float(gold)) < 1e-3
+                except Exception:
+                    hit = (pred == gold)
+            return hit, gen
+        hits = _run_inspect_or_direct_task("GSM8K", rows, _eval_gsm, log_dir)
+        acc = (sum(hits) / len(hits)) * 100.0
+        out["GSM8K"] = {
+            "acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2),
+            "correct": sum(hits), "total": len(hits), "items": hits,
+            "truncated": f"{trunc_cnt}/{len(hits)}", "median_len": int(statistics.median(lengths)) if lengths else 0,
+        }
+        if on_save:
+            on_save(out)
+    else:
+        print(f"    [{_ACTIVE_ENGINE['name']} | GSM8K        ] cached {out['GSM8K']['acc']:.2f}%", flush=True)
 
-        lengths.append(n_new)
-        trunc_cnt += int(hit_cap)
-        ans_region = gen.split("</think>")[-1] if "</think>" in gen else gen
-        boxed = re.findall(r"\\boxed\{([^}]+)\}", ans_region)
-        nums = re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", boxed[-1] if boxed else ans_region)
-        pred = nums[-1].replace(",", "") if nums else None
-        hit = False
-        if pred is not None and not hit_cap:
-            try:
-                hit = abs(float(pred) - float(gold)) < 1e-3
-            except Exception:
-                hit = (pred == gold)
-        return hit, gen
-    hits = _run_inspect_or_direct_task("GSM8K", rows, _eval_gsm, log_dir)
-    acc = (sum(hits) / len(hits)) * 100.0
-    out["GSM8K"] = {
-        "acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2),
-        "correct": sum(hits), "total": len(hits), "items": hits,
-        "truncated": f"{trunc_cnt}/{len(hits)}", "median_len": int(statistics.median(lengths)) if lengths else 0,
-    }
-
-    # 5. HumanEval Python Synthesis (up to 200 / all 164 items)
-    rows = _load_rows("openai/openai_humaneval", None, "test", limit)
-    def _eval_humaneval(idx, r):
-        prompt_code = r["prompt"]
-        msgs = [{"role": "user", "content": f"Complete this Python function. Output ONLY valid Python code inside ```python```:\n```python\n{prompt_code}\n```"}]
-        try:
-            try:
-                p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-            except TypeError:
-                p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-            if "<think>" in p_str and "</think>" not in p_str:
-                p_str = p_str.rstrip() + "\n</think>\n\n```python\n" + prompt_code
-            elif p_str.rstrip().endswith("</think>"):
-                p_str = p_str.rstrip() + "\n\n```python\n" + prompt_code
-        except Exception:
-            p_str = prompt_code
-        gen, _, _ = _gen(p_str, max_new=256, temperature=0.0, seed=2000 + idx)
-        if "```" in gen:
-            gen = gen.split("```")[0]
-        clean_lines = []
-        for ln in gen.splitlines():
-            if ln.startswith(("def ", "class ", "if __name__", "# Test", "assert ")) and clean_lines:
-                break
-            clean_lines.append(ln)
-        prog = prompt_code + "\n".join(clean_lines) + "\n\n" + r["test"] + f"\ncheck({r['entry_point']})\n"
-        return _exec_subprocess_safely(prog, timeout_s=4), gen
-    hits = _run_inspect_or_direct_task("HumanEval", rows, _eval_humaneval, log_dir)
-    acc = (sum(hits) / len(hits)) * 100.0
-    out["HumanEval"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
-
-    # 6. MBPP Python Coding (200 items)
-    rows = _load_rows("google-research-datasets/mbpp", "sanitized", "test", limit)
-    def _eval_mbpp(idx, r):
-        tests = "\n".join(r["test_list"])
-        sig_line = r["code"].splitlines()[0] if r.get("code") else "def solution():"
-        p_code = f"# {r['prompt'].strip()}\n{sig_line}\n"
-        msgs = [{"role": "user", "content": f"Complete this Python function:\n```python\n{p_code}\n```"}]
-        try:
-            try:
-                p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-            except TypeError:
-                p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-            if "<think>" in p_str and "</think>" not in p_str:
-                p_str = p_str.rstrip() + "\n</think>\n\n```python\n" + p_code
-            elif p_str.rstrip().endswith("</think>"):
-                p_str = p_str.rstrip() + "\n\n```python\n" + p_code
-        except Exception:
-            p_str = p_code
-        gen, _, _ = _gen(p_str, max_new=256, temperature=0.0, seed=3000 + idx)
-        if "```" in gen:
-            gen = gen.split("```")[0]
-        clean_lines = []
-        for ln in gen.splitlines():
-            if ln.startswith(("def ", "class ", "if __name__", "assert ")) and clean_lines:
-                break
-            clean_lines.append(ln)
-        prog = "\n".join(r.get("test_imports", [])) + "\n" + p_code + "\n".join(clean_lines) + "\n" + tests + "\n"
-        return _exec_subprocess_safely(prog, timeout_s=4), gen
-    hits = _run_inspect_or_direct_task("MBPP", rows, _eval_mbpp, log_dir)
-    acc = (sum(hits) / len(hits)) * 100.0
-    out["MBPP"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
-
-    # 7. IFEval Instruction Following (200 items)
-    try:
-        rows = _load_rows("google/IFEval", None, "train", limit)
-        def _eval_ifeval(idx, r):
-            msgs = [{"role": "user", "content": r["prompt"]}]
+    # 5. HumanEval
+    if "HumanEval" not in out:
+        rows = _load_rows("openai/openai_humaneval", None, "test", limit)
+        prompts_he = []
+        for r in rows:
+            prompt_code = r["prompt"]
+            msgs = [{"role": "user", "content": f"Complete this Python function. Output ONLY valid Python code inside ```python```:\n```python\n{prompt_code}\n```"}]
             try:
                 try:
                     p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
                 except TypeError:
                     p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                 if "<think>" in p_str and "</think>" not in p_str:
-                    p_str = p_str.rstrip() + "\n</think>\n\n"
+                    p_str = p_str.rstrip() + "\n</think>\n\n```python\n" + prompt_code
+                elif p_str.rstrip().endswith("</think>"):
+                    p_str = p_str.rstrip() + "\n\n```python\n" + prompt_code
             except Exception:
-                p_str = r["prompt"]
-            gen, _, _ = _gen(p_str, max_new=384, temperature=0.0, seed=4000 + idx)
-            ok = _verify_ifeval_instruction(gen, r.get("instruction_id_list", []), r.get("kwargs", []))
-            return ok, gen
-        hits = _run_inspect_or_direct_task("IFEval", rows, _eval_ifeval, log_dir)
+                p_str = prompt_code
+            prompts_he.append(p_str)
+        gens_he = _gen_batch(prompts_he, max_new=256, temperature=0.0, top_p=1.0, base_seed=2000, label="HumanEval")
+        def _eval_humaneval(idx, r):
+            prompt_code = r["prompt"]
+            gen = gens_he[idx][0]
+            if "```" in gen:
+                gen = gen.split("```")[0]
+            clean_lines = []
+            for ln in gen.splitlines():
+                if ln.startswith(("def ", "class ", "if __name__", "# Test", "assert ")) and clean_lines:
+                    break
+                clean_lines.append(ln)
+            prog = prompt_code + "\n".join(clean_lines) + "\n\n" + r["test"] + f"\ncheck({r['entry_point']})\n"
+            return _exec_subprocess_safely(prog, timeout_s=4), gen
+        hits = _run_inspect_or_direct_task("HumanEval", rows, _eval_humaneval, log_dir)
         acc = (sum(hits) / len(hits)) * 100.0
-        out["IFEval"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
-    except Exception as e:
-        print(f"  [IFEval skipped: {e}]", flush=True)
+        out["HumanEval"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
+        if on_save:
+            on_save(out)
+    else:
+        print(f"    [{_ACTIVE_ENGINE['name']} | HumanEval    ] cached {out['HumanEval']['acc']:.2f}%", flush=True)
+
+    # 6. MBPP
+    if "MBPP" not in out:
+        rows = _load_rows("google-research-datasets/mbpp", "sanitized", "test", limit)
+        prompts_mb = []
+        for r in rows:
+            sig_line = r["code"].splitlines()[0] if r.get("code") else "def solution():"
+            p_code = f"# {r['prompt'].strip()}\n{sig_line}\n"
+            msgs = [{"role": "user", "content": f"Complete this Python function:\n```python\n{p_code}\n```"}]
+            try:
+                try:
+                    p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                except TypeError:
+                    p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+                if "<think>" in p_str and "</think>" not in p_str:
+                    p_str = p_str.rstrip() + "\n</think>\n\n```python\n" + p_code
+                elif p_str.rstrip().endswith("</think>"):
+                    p_str = p_str.rstrip() + "\n\n```python\n" + p_code
+            except Exception:
+                p_str = p_code
+            prompts_mb.append(p_str)
+        gens_mb = _gen_batch(prompts_mb, max_new=256, temperature=0.0, top_p=1.0, base_seed=3000, label="MBPP")
+        def _eval_mbpp(idx, r):
+            tests = "\n".join(r["test_list"])
+            sig_line = r["code"].splitlines()[0] if r.get("code") else "def solution():"
+            p_code = f"# {r['prompt'].strip()}\n{sig_line}\n"
+            gen = gens_mb[idx][0]
+            if "```" in gen:
+                gen = gen.split("```")[0]
+            clean_lines = []
+            for ln in gen.splitlines():
+                if ln.startswith(("def ", "class ", "if __name__", "assert ")) and clean_lines:
+                    break
+                clean_lines.append(ln)
+            prog = "\n".join(r.get("test_imports", [])) + "\n" + p_code + "\n".join(clean_lines) + "\n" + tests + "\n"
+            return _exec_subprocess_safely(prog, timeout_s=4), gen
+        hits = _run_inspect_or_direct_task("MBPP", rows, _eval_mbpp, log_dir)
+        acc = (sum(hits) / len(hits)) * 100.0
+        out["MBPP"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
+        if on_save:
+            on_save(out)
+    else:
+        print(f"    [{_ACTIVE_ENGINE['name']} | MBPP         ] cached {out['MBPP']['acc']:.2f}%", flush=True)
+
+    # 7. IFEval
+    if "IFEval" not in out:
+        try:
+            rows = _load_rows("google/IFEval", None, "train", limit)
+            prompts_if = []
+            for r in rows:
+                msgs = [{"role": "user", "content": r["prompt"]}]
+                try:
+                    try:
+                        p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                    except TypeError:
+                        p_str = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+                    if "<think>" in p_str and "</think>" not in p_str:
+                        p_str = p_str.rstrip() + "\n</think>\n\n"
+                except Exception:
+                    p_str = r["prompt"]
+                prompts_if.append(p_str)
+            gens_if = _gen_batch(prompts_if, max_new=384, temperature=0.0, top_p=1.0, base_seed=4000, label="IFEval")
+            def _eval_ifeval(idx, r):
+                gen = gens_if[idx][0]
+                ok = _verify_ifeval_instruction(gen, r.get("instruction_id_list", []), r.get("kwargs", []))
+                return ok, gen
+            hits = _run_inspect_or_direct_task("IFEval", rows, _eval_ifeval, log_dir)
+            acc = (sum(hits) / len(hits)) * 100.0
+            out["IFEval"] = {"acc": round(acc, 2), "ci95": round(_ci95(acc, len(hits)), 2), "correct": sum(hits), "total": len(hits), "items": hits}
+            if on_save:
+                on_save(out)
+        except Exception as e:
+            print(f"  [IFEval skipped: {e}]", flush=True)
+    else:
+        print(f"    [{_ACTIVE_ENGINE['name']} | IFEval       ] cached {out['IFEval']['acc']:.2f}%", flush=True)
 
     return out
 
@@ -781,35 +889,63 @@ def run_benchmark_suite(
     limit: int = 200,
     gsm8k_limit: int = 200,
     out_json: str | None = None,
+    seed_teacher: dict | None = None,
 ) -> dict:
     _purge_zombie_vram()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     stu, cfg, tok, donor_repo, donor_dir, step, conv_ver = _load_student(ckpt_path, donor_id, device)
+    gsm_max_new = 3072 if cfg.get("has_qwen35_lin", False) else 2048
+
+    base_out = os.path.splitext(out_json or ckpt_path)[0]
+    json_path = out_json or (base_out + "_benchmarks.json")
+    png_path = base_out + "_benchmark.png"
 
     print("=" * 88)
-    print(f"VSA-LM UK AISI INSPECT BENCHMARK SUITE (N={limit}): {ckpt_path} vs {donor_repo}")
+    print(f"VSA-LM UK AISI INSPECT BENCHMARK SUITE (N={limit}, gsm_cap={gsm_max_new}): {ckpt_path} vs {donor_repo}")
     print(f"Inspect AI Active: {HAS_INSPECT}")
     print("=" * 88, flush=True)
 
-    results = {
-        "harness": "UK AISI Inspect (inspect_ai)" if HAS_INSPECT else "native",
-        "limit": limit,
-        "checkpoint": ckpt_path,
-        "step": step,
-        "converter": conv_ver,
-        "donor": donor_repo,
-        "student": {},
-        "teacher": {},
-        "mcnemar": {},
-        "systems": {},
-    }
-    results["student"] = _eval_model(stu, False, tok, device, limit=limit, gsm8k_limit=gsm8k_limit)
+    if os.path.isfile(json_path):
+        with open(json_path) as f:
+            results = json.load(f)
+    else:
+        results = {
+            "harness": "UK AISI Inspect (inspect_ai)" if HAS_INSPECT else "native",
+            "limit": limit,
+            "gsm_max_new": gsm_max_new,
+            "checkpoint": ckpt_path,
+            "step": step,
+            "converter": conv_ver,
+            "donor": donor_repo,
+            "student": {},
+            "teacher": {},
+            "mcnemar": {},
+            "systems": {},
+        }
+    if seed_teacher:
+        for k_t, v_t in seed_teacher.items():
+            results["teacher"].setdefault(k_t, v_t)
+
+    def _flush():
+        tmp = json_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(results, f, indent=2)
+        os.replace(tmp, json_path)
+
+    results["student"] = _eval_model(
+        stu, False, tok, device, limit=limit, gsm8k_limit=gsm8k_limit,
+        cached=results.get("student"), on_save=lambda d: (results.__setitem__("student", d), _flush()),
+        gsm_max_new=gsm_max_new,
+    )
     for k, v in results["student"].items():
         extra = f" | trunc={v['truncated']} med_len={v['median_len']}" if "truncated" in v else ""
         print(f"  [VSA-LM] {k:<14}: {v['acc']:6.2f}% ± {v['ci95']:4.1f}% ({v['correct']}/{v['total']}){extra}", flush=True)
 
-    hf_donor = _load_hf_donor(donor_dir, device)
-    results["systems"] = eval_real_speed_and_ram(stu, hf_donor, cfg, tok, device)
+    hf_donor = None
+    if not results.get("systems"):
+        hf_donor = _load_hf_donor(donor_dir, device)
+        results["systems"] = eval_real_speed_and_ram(stu, hf_donor, cfg, tok, device)
+        _flush()
     sc_last = results["systems"]["scaling"][-1]
     print(f"  [VSA-LM] Speed/RAM @{sc_last['context']}: {sc_last['vsa_tok_s']} vs {sc_last['donor_tok_s']} tok/s ({sc_last['speedup']}x) | {sc_last['vsa_kv_mb']} vs {sc_last['donor_kv_mb']} MB (-{sc_last['ram_saved_pct']}%)", flush=True)
 
@@ -817,19 +953,25 @@ def run_benchmark_suite(
     _purge_zombie_vram()
 
     if compare_donor:
-        results["teacher"] = _eval_model(hf_donor, True, tok, device, limit=limit, gsm8k_limit=gsm8k_limit)
+        need_keys = set(results["student"].keys()) - set(results.get("teacher", {}).keys())
+        if need_keys:
+            if hf_donor is None:
+                hf_donor = _load_hf_donor(donor_dir, device)
+            results["teacher"] = _eval_model(
+                hf_donor, True, tok, device, limit=limit, gsm8k_limit=gsm8k_limit,
+                cached=results.get("teacher"), on_save=lambda d: (results.__setitem__("teacher", d), _flush()),
+                gsm_max_new=gsm_max_new,
+            )
         for k, v in results["teacher"].items():
             extra = f" | trunc={v['truncated']} med_len={v['median_len']}" if "truncated" in v else ""
             print(f"  [Donor ] {k:<14}: {v['acc']:6.2f}% ± {v['ci95']:4.1f}% ({v['correct']}/{v['total']}){extra}", flush=True)
-            results["mcnemar"][k] = _mcnemar_exact(results["student"][k]["items"], v["items"])
-    del hf_donor
+            if k in results["student"]:
+                results["mcnemar"][k] = _mcnemar_exact(results["student"][k]["items"], v["items"])
+    if hf_donor is not None:
+        del hf_donor
     _purge_zombie_vram()
 
-    base_out = os.path.splitext(out_json or ckpt_path)[0]
-    json_path = out_json or (base_out + "_benchmarks.json")
-    png_path = base_out + "_benchmark.png"
-    with open(json_path, "w") as f:
-        json.dump(results, f, indent=2)
+    _flush()
     _plot_benchmark_figure(results, png_path)
 
     print("\n| Benchmark (N=200) | Official HF Donor | **VSA-LM (Bolt)** | Paired McNemar (`b/c`, `p`) | Verdict |")
