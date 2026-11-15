@@ -41,7 +41,7 @@ class Qwen35PartialRoPE(nn.Module):
     def __init__(self, head_dim: int, partial_factor: float = 0.25, theta: float = 10_000_000.0):
         super().__init__()
         self.rotary_dim = int(head_dim * partial_factor)
-        inv_freq = 1.0 / (theta ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim))
+        inv_freq = 1.0 / (theta ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32, device="cpu") / self.rotary_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, x: torch.Tensor, pos_start: int = 0) -> torch.Tensor:
@@ -106,6 +106,7 @@ class Qwen35VSAAttn(nn.Module):
         self.val_dim = HV * HD
         self.conv_dim = self.key_dim * 2 + self.val_dim
         self.chunk_size = chunk_size
+        self.conv_k = conv_k
 
         self.in_proj_qkv = nn.Linear(D, self.conv_dim, bias=False)
         self.conv1d = nn.Conv1d(
@@ -188,6 +189,39 @@ class Qwen35VSAAttn(nn.Module):
         y_flat = y.transpose(1, 2).reshape(-1, self.HD)
         z_flat = self.in_proj_z(x).reshape(-1, self.HD)
         return self.out_proj(self.norm(y_flat, z_flat).reshape(B, T, self.val_dim))
+
+    def step_gated_deltanet(self, x: torch.Tensor, cache: dict, state: torch.Tensor) -> torch.Tensor:
+        B, T_s, _ = x.shape
+        mixed = self.in_proj_qkv(x).transpose(1, 2)
+        c_state = cache["gdn_conv"]
+        c_in = torch.cat([c_state, mixed], dim=-1)
+        c_state.copy_(c_in[..., -(self.conv_k - 1):])
+        conv_w = self.conv1d.weight.view(self.conv_dim, self.conv_k).to(c_in.dtype)
+        conv_out = F.silu((c_in * conv_w.unsqueeze(0)).sum(dim=-1)).unsqueeze(1)
+        q, k, v = torch.split(conv_out, [self.key_dim, self.key_dim, self.val_dim], dim=-1)
+        q = q.view(B, 1, self.HKV, self.HD).repeat_interleave(self.G, dim=2)
+        k = k.view(B, 1, self.HKV, self.HD).repeat_interleave(self.G, dim=2)
+        v = v.view(B, 1, self.H, self.HD)
+        beta = self.in_proj_b(x).sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(self.in_proj_a(x).float() + self.dt_bias.float())
+        try:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule
+            core_out, next_st = torch_recurrent_gated_delta_rule(
+                q, k, v, g=g, beta=beta, initial_state=state, output_final_state=True, use_qk_l2norm_in_kernel=True
+            )
+            state.copy_(next_st)
+        except Exception:
+            qf = F.normalize(q[:, 0].float(), p=2.0, dim=-1) * (self.HD ** -0.5)
+            kf = F.normalize(k[:, 0].float(), p=2.0, dim=-1)
+            vf = v[:, 0].float() * beta[:, 0].float().unsqueeze(-1)
+            M = state * g[:, 0].float().exp().unsqueeze(-1).unsqueeze(-1)
+            proj = torch.einsum("bhkv,bhk->bhv", M, kf)
+            M = M - torch.einsum("bhk,bhv->bhkv", kf * beta[:, 0].float().unsqueeze(-1), proj) + torch.einsum("bhk,bhv->bhkv", kf, vf)
+            state.copy_(M)
+            core_out = torch.einsum("bhkv,bhk->bhv", M, qf).unsqueeze(1).to(x.dtype)
+        z_flat = self.in_proj_z(x).reshape(-1, self.HD)
+        y_normed = self.norm(core_out.reshape(-1, self.HD), z_flat).reshape(B, 1, self.val_dim)
+        return self.out_proj(y_normed)
 
 
 def preserve_visual_tower(donor_dir: str, out_sidecar_path: str) -> tuple[int, float]:

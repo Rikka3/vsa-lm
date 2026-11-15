@@ -159,9 +159,9 @@ def map_any_hf_to_student(hf_sd: dict[str, torch.Tensor], cfg: dict, hybrid_ever
                 if ltype == "vsa":
                     if proj == "q_proj.weight" and w.shape[0] == 2 * H * HD:
                         q_part, g_part = torch.chunk(w.view(H, 2, HD, D), 2, dim=1)
-                        sd[f"blocks.{li}.vsa.q_proj.weight"] = q_part.reshape(vH * vHD, D).clone()
-                        sd[f"blocks.{li}.vsa.g_proj.weight"] = g_part.reshape(vH * vHD, D).clone()
-                    elif proj in ("q_norm.weight", "k_norm.weight") and vHD == HD:
+                        sd[f"blocks.{li}.vsa.q_proj.weight"] = q_part.reshape(H * HD, D).clone()
+                        sd[f"blocks.{li}.vsa.g_proj.weight"] = g_part.reshape(H * HD, D).clone()
+                    elif proj in ("q_norm.weight", "k_norm.weight"):
                         sd[f"blocks.{li}.vsa.{proj}"] = w
                     elif proj in ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
                                   "q_proj.bias", "k_proj.bias", "v_proj.bias"):

@@ -526,12 +526,24 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
                         xt = xt + blk.mlp(blk.norm2(xt))
                 else:
                     inner = getattr(getattr(donor, "model", donor), "language_model", getattr(donor, "model", donor))
-                    out = inner(input_ids=x, output_hidden_states=True, use_cache=False)
+                    hooks_s1 = []
                     for li in vsa_indices:
-                        if li < L - 1:
-                            norm_inputs[li] = stu.blocks[li].norm1(out.hidden_states[li].detach())
-                            attn_targets[li] = (out.hidden_states[li + 1] - out.hidden_states[li]).detach()
-                    del out
+                        layer_m = inner.layers[li]
+                        def _mk_n(idx_l):
+                            def _hk(_m, _in, o):
+                                norm_inputs[idx_l] = o.detach()
+                            return _hk
+                        def _mk_a(idx_l):
+                            def _hk(_m, _in, o):
+                                attn_targets[idx_l] = (o[0] if isinstance(o, tuple) else o).detach()
+                            return _hk
+                        hooks_s1.append(layer_m.input_layernorm.register_forward_hook(_mk_n(li)))
+                        hooks_s1.append(layer_m.self_attn.register_forward_hook(_mk_a(li)))
+                    try:
+                        _ = inner(input_ids=x, use_cache=False)
+                    finally:
+                        for hk in hooks_s1:
+                            hk.remove()
 
             with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
                 for li, h_n in norm_inputs.items():
@@ -694,6 +706,8 @@ def _kd_microbatch_backward(stu, donor, is_hf_donor: bool, w_lm_t: torch.Tensor,
     m_1d = None if mask_f is None else mask_f.reshape(N_m)
     denom = float(N_m) if m_1d is None else float(m_1d.sum().clamp_min(1.0).item())
     dh_2d = torch.empty_like(hs_2d)
+    if stu.config["vocab_size"] > 200_000:
+        tok_slice = min(tok_slice, 1024)
     w_lm_s_f32 = stu.lm_head.weight.float()
     w_lm_t_f32 = w_lm_t.float()
     loss = torch.zeros((), device=device, dtype=torch.float32)

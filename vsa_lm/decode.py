@@ -17,6 +17,12 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 def _apply_cached_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    rot_d = cos.shape[-1]
+    if rot_d < x.shape[-1]:
+        xr, xp = x[..., :rot_d], x[..., rot_d:]
+        half = rot_d // 2
+        xr = xr * cos + torch.cat((-xr[..., half:], xr[..., :half]), dim=-1) * sin
+        return torch.cat((xr, xp), dim=-1)
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     return x * cos + torch.cat((-x2, x1), dim=-1) * sin
@@ -178,7 +184,7 @@ class VSARecurrentDecoder:
             return False
         for blk in self.model.blocks:
             ly = blk.vsa if hasattr(blk, "vsa") else getattr(blk, "attn", None)
-            if ly is None or not hasattr(ly, "_wqkv_packed") or not hasattr(ly, "_rope_cos"):
+            if ly is None or getattr(ly, "mode", None) == "gated_deltanet" or not hasattr(ly, "_wqkv_packed") or not hasattr(ly, "_rope_cos"):
                 return False
         return True
 
@@ -243,17 +249,18 @@ class VSARecurrentDecoder:
             ly = blk.vsa if hasattr(blk, "vsa") else blk.attn
             if hasattr(ly, "rope") and hasattr(ly.rope, "inv_freq"):
                 inv = ly.rope.inv_freq.to(device)
-                key = (ly.HD, tuple(inv.tolist()))
+                hd_r = getattr(ly, "attn_HD", ly.HD)
+                key = (hd_r, tuple(inv.tolist()))
                 if key not in rope_cache:
                     freqs = torch.outer(t, inv)
                     emb = torch.cat((freqs, freqs), dim=-1)
                     rope_cache[key] = (emb.cos().to(dt), emb.sin().to(dt))
                 ly._rope_cos, ly._rope_sin = rope_cache[key]
-                if 2 * inv.numel() == ly.HD:
+                if 2 * inv.numel() <= hd_r:
                     self._inv64[key] = inv.double()
                     ly._rope_key = key
 
-            if hasattr(blk, "vsa"):
+            if hasattr(blk, "vsa") and getattr(ly, "mode", None) != "gated_deltanet":
                 H, HKV, HD, G = ly.H, ly.HKV, ly.HD, ly.G
                 gam = ly.gamma().detach()
                 ly._cached_gam = gam
@@ -275,7 +282,7 @@ class VSARecurrentDecoder:
                 if hasattr(ly, "v_head_mix"):
                     ly._km_dt = ly.k_head_mix.detach().to(dt).contiguous()
 
-                if hasattr(ly, "v_head_mix") and hasattr(ly, "v_proj") and isinstance(getattr(ly.q_proj, "weight", None), torch.Tensor):
+                if getattr(ly, "attn_HD", ly.HD) == ly.HD and hasattr(ly, "v_head_mix") and hasattr(ly, "v_proj") and isinstance(getattr(ly.q_proj, "weight", None), torch.Tensor):
                     wv = ly.v_proj.weight.detach().to(torch.float32).view(HKV, HD, -1)
                     wv_rep = wv[:, None, :, :].expand(HKV, G, HD, -1).reshape(H, HD, -1)
                     vm_T = ly.v_head_mix.detach().to(torch.float32).transpose(1, 2)
@@ -353,16 +360,22 @@ class VSARecurrentDecoder:
                 v = blk.vsa
                 states[li] = torch.zeros(batch_size, v.H, v.HD, v.HD, device=device, dtype=state_dtype)
                 cache = {}
-                if hasattr(v, "k_conv") and hasattr(v, "v_conv"):
-                    cache["k_buf"] = torch.zeros(batch_size, v.H, 1, v.HD, 3, device=device, dtype=dt)
-                    cache["v_buf"] = torch.zeros(batch_size, v.H, 1, v.HD, 7, device=device, dtype=dt)
-                if getattr(v, "swa_window", 0) > 0:
-                    W = v.swa_window
-                    cache["swa_k"] = torch.zeros(batch_size, v.HKV, W + 1, v.HD, device=device, dtype=dt)
-                    cache["swa_v"] = torch.zeros_like(cache["swa_k"])
-                    cache["swa_n"] = torch.zeros(1, dtype=torch.long, device=device)
-                    cache["swa_ar"] = torch.arange(W + 1, device=device)
-                    cache["swa_k0"] = torch.zeros(batch_size, v.HKV, 1, v.HD, device=device, dtype=dt)
+                if getattr(v, "mode", None) == "gated_deltanet":
+                    ck_dim = getattr(v, "conv_k", v.conv1d.kernel_size[0])
+                    cache["gdn_conv"] = torch.zeros(batch_size, v.conv_dim, ck_dim - 1, device=device, dtype=dt)
+                else:
+                    if hasattr(v, "k_conv") and hasattr(v, "v_conv"):
+                        cache["k_buf"] = torch.zeros(batch_size, v.H, 1, v.HD, 3, device=device, dtype=dt)
+                        cache["v_buf"] = torch.zeros(batch_size, v.H, 1, v.HD, 7, device=device, dtype=dt)
+                    if getattr(v, "swa_window", 0) > 0:
+                        W = v.swa_window
+                        a_hkv = getattr(v, "attn_HKV", v.HKV)
+                        a_hd = getattr(v, "attn_HD", v.HD)
+                        cache["swa_k"] = torch.zeros(batch_size, a_hkv, W + 1, a_hd, device=device, dtype=dt)
+                        cache["swa_v"] = torch.zeros_like(cache["swa_k"])
+                        cache["swa_n"] = torch.zeros(1, dtype=torch.long, device=device)
+                        cache["swa_ar"] = torch.arange(W + 1, device=device)
+                        cache["swa_k0"] = torch.zeros(batch_size, a_hkv, 1, a_hd, device=device, dtype=dt)
                 if getattr(v, "num_slots", 0) > 0:
                     S = v.num_slots
                     cache["slot_C"] = torch.zeros(batch_size, v.HKV, S, v.HD, device=device, dtype=torch.float32)
@@ -489,9 +502,19 @@ class VSARecurrentDecoder:
         h = blk.norm1(x)
         if hasattr(blk, "vsa"):
             ly = blk.vsa
+            if getattr(ly, "mode", None) == "gated_deltanet":
+                x = x + ly.step_gated_deltanet(h, kv_caches[li], states[li])
+                return x + blk.mlp(blk.norm2(x))
+
             H, HKV, HD, G = ly.H, ly.HKV, ly.HD, ly.G
+            a_H = getattr(ly, "attn_H", H)
+            a_HKV = getattr(ly, "attn_HKV", HKV)
+            a_HD = getattr(ly, "attn_HD", HD)
+            a_G = getattr(ly, "attn_G", G)
+            split_mode = (a_HD != HD)
             g_proj_out = None
             v_raw = None
+
             if hasattr(ly, "_wqkv_packed"):
                 parts = torch.split(F.linear(h, ly._wqkv_packed, ly._bqkv_packed), ly._qkv_sizes, dim=-1)
                 q, k, vx = parts[0], parts[1], parts[2]
@@ -504,29 +527,33 @@ class VSARecurrentDecoder:
                 q = q.view(B, 1, H, HD).transpose(1, 2)
                 k = k.view(B, 1, HKV, HD).transpose(1, 2)
                 vx = vx.view(B, 1, H, HD).transpose(1, 2)
+                if getattr(ly, "q_norm", None) is not None:
+                    q = ly.q_norm(q.transpose(1, 2)).transpose(1, 2)
+                    k = ly.k_norm(k.transpose(1, 2)).transpose(1, 2)
             else:
-                q, k, v = ly.head_qkv(h)
-                vx = repeat_kv(v, G)
+                q, k, v_raw = ly.head_qkv(h)
+                v_split = ly._split_heads(v_raw, a_HKV) if split_mode else v_raw
+                vx = repeat_kv(v_split, G)
                 if hasattr(ly, "v_head_mix"):
                     vx = torch.matmul(vx, ly.v_head_mix.to(vx.dtype))
-                v_raw = v
                 if hasattr(ly, "g_proj"):
                     g_proj_out = ly.g_proj(h)
 
-            if getattr(ly, "q_norm", None) is not None and hasattr(ly, "_wqkv_packed"):
-                q = ly.q_norm(q.transpose(1, 2)).transpose(1, 2)
-                k = ly.k_norm(k.transpose(1, 2)).transpose(1, 2)
+            q_r_v = ly._split_heads(q, a_H) if split_mode else q
+            k_r_v = ly._split_heads(k, a_HKV) if split_mode else k
+            v_v = ly._split_heads(v_raw, a_HKV) if (split_mode and v_raw is not None) else v_raw
 
             y_slot = None
             if getattr(ly, "_slot_active", False) and isinstance(kv_caches[li], dict) and "slot_C" in kv_caches[li]:
-                if v_raw is None:
-                    v_raw = ly.v_proj(h).view(B, 1, HKV, HD).transpose(1, 2)
+                if v_v is None:
+                    vr_tmp = ly.v_proj(h).view(B, 1, a_HKV, a_HD).transpose(1, 2)
+                    v_v = ly._split_heads(vr_tmp, a_HKV) if split_mode else vr_tmp
                 S = ly.num_slots
                 r_raw = ly.slot_router(h).view(B, 1, HKV, S).permute(0, 2, 3, 1).float()
                 w_s = F.softmax(r_raw, dim=2) * torch.sigmoid(r_raw)
-                k_cl = F.normalize(k.float(), p=2.0, dim=-1).squeeze(2).unsqueeze(2)
-                q_cl = F.normalize(q.float(), p=2.0, dim=-1).view(B, HKV, G, 1, HD)
-                v_cl = v_raw.float().squeeze(2).unsqueeze(2)
+                k_cl = F.normalize(k_r_v.float(), p=2.0, dim=-1).squeeze(2).unsqueeze(2)
+                q_cl = F.normalize(q_r_v.float(), p=2.0, dim=-1).view(B, HKV, G, 1, HD)
+                v_cl = v_v.float().squeeze(2).unsqueeze(2)
                 sc, su, sz = kv_caches[li]["slot_C"], kv_caches[li]["slot_U"], kv_caches[li]["slot_Z"]
                 sc.add_(w_s * k_cl)
                 su.add_(w_s * v_cl)
@@ -537,25 +564,31 @@ class VSARecurrentDecoder:
                 s_probs = F.softmax(s_scores, dim=-1)
                 y_slot = torch.matmul(s_probs, V_sl.unsqueeze(2)).view(B, H, 1, HD).to(q.dtype)
 
-            if getattr(ly, "mix_before_rope", False) and hasattr(ly, "_km_dt"):
+            if getattr(ly, "mix_before_rope", False) and (not split_mode) and hasattr(ly, "_km_dt"):
                 kx_pre = torch.matmul(repeat_kv(k, G), ly._km_dt.to(k.dtype))
                 q, k = self._rope_qk(ly, q, k, pos)
                 _, kx = self._rope_qk(ly, q, kx_pre, pos)
+                q_v = q
             else:
-                q, k = self._rope_qk(ly, q, k, pos)
-                kx = repeat_kv(k, G)
+                q_rope, k_rope = self._rope_qk(ly, q, k, pos)
+                q_v = ly._split_heads(q_rope, a_H) if split_mode else q_rope
+                k_rp_v = ly._split_heads(k_rope, a_HKV) if split_mode else k_rope
+                kx = repeat_kv(k_rp_v, G)
                 if hasattr(ly, "_km_dt"):
                     kx = torch.matmul(kx, ly._km_dt.to(kx.dtype))
+                q, k = q_rope, k_rope
 
             y_swa = None
             if getattr(ly, "swa_window", 0) > 0:
                 if v_raw is None:
-                    v_raw = ly.v_proj(h).view(B, 1, HKV, HD).transpose(1, 2)
+                    v_raw = ly.v_proj(h).view(B, 1, a_HKV, a_HD).transpose(1, 2)
                 inv64 = self._inv64.get(getattr(ly, "_rope_key", None))
                 y_swa = self._window_attn_step(
-                    kv_caches[li], q, k, v_raw, ly.swa_window, G,
+                    kv_caches[li], q, k, v_raw, ly.swa_window, a_G,
                     sink_cap=self.max_T, inv_freq64=inv64,
                 )
+                if split_mode:
+                    y_swa = ly._split_heads(y_swa, a_H)
 
             if hasattr(ly, "k_conv") and isinstance(kv_caches[li], dict) and getattr(ly, "_k_conv_active", False):
                 k_in = torch.cat([kv_caches[li]["k_buf"], kx.unsqueeze(-1)], dim=-1)
@@ -576,7 +609,7 @@ class VSARecurrentDecoder:
                 c_alpha = torch.tanh(F.linear(h, ly._center_w, ly._center_b).float()).transpose(1, 2).unsqueeze(-1).contiguous()
                 kb_t, vb_t, zb_t = kv_caches[li]["k_bar"], kv_caches[li]["v_bar"], kv_caches[li]["z_bar"]
             y = fused_vsa_recurrent_step(
-                q.contiguous(), kx.contiguous(), vx.contiguous(),
+                q_v.contiguous(), kx.contiguous(), vx.contiguous(),
                 states[li], ly._cached_gam, ly._cached_omg, ly._cached_vself,
                 q_relu=ly._cached_qr, k_relu=ly._cached_kr, norm_w=ly._cached_nw,
                 v_loc=v_loc, local_q_gate=ly._cached_lqg,
@@ -584,13 +617,14 @@ class VSARecurrentDecoder:
             )
 
             if y_swa is not None:
-                a = ly._cached_swa_a.view(1, H, 1, 1).to(y.dtype)
-                y = y + a * (y_swa.to(y.dtype) - y)
+                a_s = ly._cached_swa_a.view(1, H, 1, 1).to(y.dtype)
+                y = y + a_s * (y_swa.to(y.dtype) - y)
             if y_slot is not None:
                 y = y + ly._cached_slot_g.to(y.dtype) * y_slot
 
             if g_proj_out is not None:
-                y = y * (2.0 * torch.sigmoid(g_proj_out.view(B, 1, H, HD).transpose(1, 2)))
+                g_sig = torch.sigmoid(g_proj_out.view(B, 1, H, HD).transpose(1, 2))
+                y = y * (g_sig if getattr(ly, "sigmoid_gate", False) else (2.0 * g_sig))
             x = x + ly.o_proj(y.transpose(1, 2).reshape(B, 1, H * HD))
         else:
             ly = blk.attn
@@ -603,7 +637,7 @@ class VSARecurrentDecoder:
                 if ly.q_norm is not None:
                     q, k = ly.q_norm(q), ly.k_norm(k)
                 q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-                q, k = ly.rope(q, pos_start=pos), ly.rope(k, pos_start=pos)
+                q, k = self._rope_qk(ly, q, k, pos)
             elif hasattr(ly, "_wqkv_packed"):
                 qkv = F.linear(h, ly._wqkv_packed, ly._bqkv_packed)
                 q, k, v = torch.split(qkv, [H * HD, HKV * HD, HKV * HD], dim=-1)

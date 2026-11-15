@@ -20,7 +20,7 @@ MODEL_FAMILIES: dict[str, ModelFamilySpec] = {
     "qwen2": ModelFamilySpec(name="qwen2", swa_window=128, out_norm_init=0.05, pin_endpoints=True, center_unbinding=True, max_T=2048, hybrid_every=4),
     "llama": ModelFamilySpec(name="llama", swa_window=128, out_norm_init=0.05, pin_endpoints=True, center_unbinding=True, max_T=2048, hybrid_every=4),
     "mistral": ModelFamilySpec(name="mistral", swa_window=128, out_norm_init=0.05, pin_endpoints=True, center_unbinding=True, max_T=2048, hybrid_every=4),
-    "qwen3_5": ModelFamilySpec(name="qwen3_5", swa_window=64, out_norm_init=0.05, pin_endpoints=False, center_unbinding=False, max_T=2048, hybrid_every=4),
+    "qwen3_5": ModelFamilySpec(name="qwen3_5", swa_window=256, out_norm_init=0.05, pin_endpoints=False, center_unbinding=True, max_T=2048, hybrid_every=4),
     "glm": ModelFamilySpec(name="glm", swa_window=256, out_norm_init=0.05, pin_endpoints=True, center_unbinding=True, max_T=2048, hybrid_every=4),
     "deepseek": ModelFamilySpec(name="deepseek", swa_window=256, out_norm_init=0.05, pin_endpoints=True, center_unbinding=True, max_T=2048, hybrid_every=4),
     "default": ModelFamilySpec(name="default", swa_window=128, out_norm_init=0.05, pin_endpoints=True, center_unbinding=True, max_T=2048, hybrid_every=4),

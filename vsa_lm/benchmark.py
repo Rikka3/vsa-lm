@@ -102,8 +102,24 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
 
 
 def _load_hf_donor(donor_dir: str, device: torch.device):
-    from transformers import AutoModelForCausalLM
-    m = AutoModelForCausalLM.from_pretrained(donor_dir, dtype=torch.bfloat16).to(device).eval()
+    import transformers
+    m = None
+    for cls_n in ("AutoModelForCausalLM", "Qwen3_5ForConditionalGeneration", "AutoModelForImageTextToText"):
+        cls = getattr(transformers, cls_n, None)
+        if cls is None:
+            continue
+        try:
+            m = cls.from_pretrained(donor_dir, dtype=torch.bfloat16)
+            break
+        except Exception:
+            continue
+    if m is None:
+        raise RuntimeError(f"Unable to load HF donor from {donor_dir}")
+    if hasattr(getattr(m, "model", m), "visual"):
+        del m.model.visual
+    elif hasattr(m, "visual"):
+        del m.visual
+    m = m.to(device).eval()
     for p in m.parameters():
         p.requires_grad_(False)
     return m

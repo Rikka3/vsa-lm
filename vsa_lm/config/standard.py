@@ -125,9 +125,14 @@ class UniversalVSAAttn(nn.Module):
     def __init__(self, cfg: dict, max_T: int, chunk_size: int = 32):
         super().__init__()
         D = cfg["dim"]
-        H = cfg.get("vsa_num_heads") or cfg["num_heads"]
-        HKV = cfg.get("vsa_num_kv_heads") or cfg["num_kv_heads"]
-        HD = cfg.get("vsa_head_dim") or cfg.get("head_dim") or (D // H)
+        self.attn_H = int(cfg["num_heads"])
+        self.attn_HKV = int(cfg["num_kv_heads"])
+        self.attn_HD = int(cfg.get("head_dim") or (D // self.attn_H))
+        self.attn_G = self.attn_H // self.attn_HKV
+
+        H = cfg.get("vsa_num_heads") or self.attn_H
+        HKV = cfg.get("vsa_num_kv_heads") or self.attn_HKV
+        HD = cfg.get("vsa_head_dim") or self.attn_HD
         while HD > 128 and H * 2 <= 64:
             H, HKV, HD = H * 2, HKV * 2, HD // 2
         if HD & (HD - 1) != 0:
@@ -137,23 +142,24 @@ class UniversalVSAAttn(nn.Module):
         self.H, self.HKV, self.HD, self.G = H, HKV, HD, H // HKV
         self.max_T = max_T
         self.mix_before_rope = bool(cfg.get("vsa_mix_before_rope", False))
-        self.q_proj = nn.Linear(D, H * HD, bias=qkv_bias)
-        self.k_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
-        self.v_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
-        self.o_proj = nn.Linear(H * HD, D, bias=False)
+        self.sigmoid_gate = bool(cfg.get("packed_q_gate", False) or cfg.get("softmax_gate", False))
+        self.q_proj = nn.Linear(D, self.attn_H * self.attn_HD, bias=qkv_bias)
+        self.k_proj = nn.Linear(D, self.attn_HKV * self.attn_HD, bias=qkv_bias)
+        self.v_proj = nn.Linear(D, self.attn_HKV * self.attn_HD, bias=qkv_bias)
+        self.o_proj = nn.Linear(self.attn_H * self.attn_HD, D, bias=False)
 
         norm_cls = Qwen35ZeroCenteredRMSNorm if cfg.get("has_qwen35_lin", False) else LlamaRMSNorm
-        if cfg.get("qk_norm", False) and HD == (cfg.get("head_dim") or (D // cfg["num_heads"])):
-            self.q_norm = norm_cls(HD, cfg["eps"])
-            self.k_norm = norm_cls(HD, cfg["eps"])
+        if cfg.get("qk_norm", False):
+            self.q_norm = norm_cls(self.attn_HD, cfg["eps"])
+            self.k_norm = norm_cls(self.attn_HD, cfg["eps"])
         else:
             self.q_norm, self.k_norm = None, None
 
         partial_factor = float(cfg.get("partial_rotary_factor", 1.0))
         if partial_factor < 1.0:
-            self.rope = Qwen35PartialRoPE(HD, partial_factor=partial_factor, theta=cfg["rope_theta"])
+            self.rope = Qwen35PartialRoPE(self.attn_HD, partial_factor=partial_factor, theta=cfg["rope_theta"])
         else:
-            self.rope = LlamaRoPE(HD, cfg["rope_theta"], cfg.get("rope_scaling"))
+            self.rope = LlamaRoPE(self.attn_HD, cfg["rope_theta"], cfg.get("rope_scaling"))
         self.out_norm = LlamaRMSNorm(HD, cfg["eps"])
 
         self.log_gamma = nn.Parameter(torch.zeros(H))
@@ -184,7 +190,6 @@ class UniversalVSAAttn(nn.Module):
             self.q_relu_mix = nn.Parameter(torch.zeros(H, 1, 1))
             self.k_relu_mix = nn.Parameter(torch.zeros(H, 1, 1))
 
-        # Native Abelian Page-Slot Bank (vsa_num_slots=32 -> 8 pages x 4 slots per KV head)
         self.num_slots = int(cfg.get("vsa_num_slots", 0) or 0)
         self.num_pages = int(cfg.get("vsa_num_pages", 8) or 8)
         if self.num_slots > 0:
@@ -192,6 +197,7 @@ class UniversalVSAAttn(nn.Module):
             nn.init.normal_(self.slot_router.weight, std=0.01)
             nn.init.constant_(self.slot_router.bias, -3.0)
             self.slot_gate = nn.Parameter(torch.zeros(H))
+
         self.center_unbinding = bool(cfg.get("vsa_center_unbinding", False))
         if self.center_unbinding:
             self.center_proj = nn.Linear(D, H, bias=True)
@@ -200,9 +206,9 @@ class UniversalVSAAttn(nn.Module):
 
     def head_qkv(self, x: torch.Tensor):
         B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.H, self.HD)
-        k = self.k_proj(x).view(B, T, self.HKV, self.HD)
-        v = self.v_proj(x).view(B, T, self.HKV, self.HD)
+        q = self.q_proj(x).view(B, T, self.attn_H, self.attn_HD)
+        k = self.k_proj(x).view(B, T, self.attn_HKV, self.attn_HD)
+        v = self.v_proj(x).view(B, T, self.attn_HKV, self.attn_HD)
         if getattr(self, "q_norm", None) is not None:
             q, k = self.q_norm(q), self.k_norm(k)
         return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -211,7 +217,6 @@ class UniversalVSAAttn(nn.Module):
         return (0.9999 * torch.sigmoid(self.log_gamma)).clamp(1e-4, 0.9999).float()
 
     def _slot_bank_forward(self, x: torch.Tensor, q_raw: torch.Tensor, k_raw: torch.Tensor, v_raw: torch.Tensor) -> torch.Tensor:
-        """Fast bf16 chunk-vectorized Abelian Page-Slot prefix sum (3x faster training)."""
         B, T, _ = x.shape
         S = self.num_slots
         dt = x.dtype
@@ -237,37 +242,57 @@ class UniversalVSAAttn(nn.Module):
         pos = torch.arange(T, device=q.device)
         dist = pos[:, None] - pos[None, :]
         mask = (dist >= 0) & ((dist < self.swa_window) | (pos[None, :] == 0))
-        kr, vr = repeat_kv(k, self.G), repeat_kv(v, self.G)
+        kr, vr = repeat_kv(k, self.attn_G), repeat_kv(v, self.attn_G)
         if T <= self.max_T or not hasattr(self.rope, "inv_freq"):
             return F.scaled_dot_product_attention(q, kr, vr, attn_mask=mask)
         shift = (pos + 1 - self.max_T).clamp(min=0).float()
         freqs = torch.outer(-shift, self.rope.inv_freq.to(q.device))
         emb = torch.cat((freqs, freqs), dim=-1)
         cos, sin = emb.cos().to(q.dtype)[None, None], emb.sin().to(q.dtype)[None, None]
-        q_Half = q.shape[-1] // 2
-        q_sink = q * cos + torch.cat((-q[..., q_Half:], q[..., :q_Half]), dim=-1) * sin
+        rot_d = cos.shape[-1]
+        if rot_d < q.shape[-1]:
+            qr, qp = q[..., :rot_d], q[..., rot_d:]
+            rh = rot_d // 2
+            qr = qr * cos + torch.cat((-qr[..., rh:], qr[..., :rh]), dim=-1) * sin
+            q_sink = torch.cat((qr, qp), dim=-1)
+        else:
+            q_Half = q.shape[-1] // 2
+            q_sink = q * cos + torch.cat((-q[..., q_Half:], q[..., :q_Half]), dim=-1) * sin
         win_mask = (dist >= 0) & (dist < self.swa_window) & (pos[None, :] > 0)
-        scores = torch.matmul(q.float(), kr.float().transpose(-1, -2)) * (self.HD ** -0.5)
+        scores = torch.matmul(q.float(), kr.float().transpose(-1, -2)) * (self.attn_HD ** -0.5)
         scores = scores.masked_fill(~win_mask, float("-inf"))
-        sink_score = (q_sink.float() * kr[:, :, :1].float()).sum(dim=-1, keepdim=True) * (self.HD ** -0.5)
+        sink_score = (q_sink.float() * kr[:, :, :1].float()).sum(dim=-1, keepdim=True) * (self.attn_HD ** -0.5)
         scores[:, :, :, :1] = sink_score
         probs = F.softmax(scores, dim=-1).to(vr.dtype)
         return torch.matmul(probs, vr)
 
+    def _split_heads(self, t_in: torch.Tensor, h_in: int) -> torch.Tensor:
+        if self.attn_HD == self.HD:
+            return t_in
+        B, _, T, _ = t_in.shape
+        sp = self.attn_HD // self.HD
+        return t_in.reshape(B, h_in, T, sp, self.HD).permute(0, 1, 3, 2, 4).reshape(B, h_in * sp, T, self.HD)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
         q_raw, k_raw, v_raw = self.head_qkv(x)
-        y_slot = self._slot_bank_forward(x, q_raw, k_raw, v_raw) if self.num_slots > 0 else None
+        q_rope, k_rope = self.rope(q_raw), self.rope(k_raw)
+        y_swa = self.window_attn(q_rope, k_rope, v_raw) if self.swa_window > 0 else None
 
-        q, k = self.rope(q_raw), self.rope(k_raw)
-        y_swa = self.window_attn(q, k, v_raw) if self.swa_window > 0 else None
+        q = self._split_heads(q_rope, self.attn_H)
+        q_r_v = self._split_heads(q_raw, self.attn_H)
+        k_r_v = self._split_heads(k_raw, self.attn_HKV)
+        k_rp_v = self._split_heads(k_rope, self.attn_HKV)
+        v_v = self._split_heads(v_raw, self.attn_HKV)
 
-        if self.mix_before_rope and hasattr(self, "k_head_mix"):
-            kx = torch.einsum("bhtd,hde->bhte", repeat_kv(k_raw, self.G), self.k_head_mix.to(k_raw.dtype))
+        y_slot = self._slot_bank_forward(x, q_r_v, k_r_v, v_v) if self.num_slots > 0 else None
+
+        if self.mix_before_rope and self.attn_HD == self.HD and hasattr(self, "k_head_mix"):
+            kx = torch.einsum("bhtd,hde->bhte", repeat_kv(k_r_v, self.G), self.k_head_mix.to(k_r_v.dtype))
             kx = self.rope(kx)
-            vx = torch.einsum("bhtd,hde->bhte", repeat_kv(v_raw, self.G), self.v_head_mix.to(v_raw.dtype))
+            vx = torch.einsum("bhtd,hde->bhte", repeat_kv(v_v, self.G), self.v_head_mix.to(v_v.dtype))
         else:
-            kx, vx = repeat_kv(k, self.G), repeat_kv(v_raw, self.G)
+            kx, vx = repeat_kv(k_rp_v, self.G), repeat_kv(v_v, self.G)
             if hasattr(self, "k_head_mix"):
                 kx = torch.einsum("bhtd,hde->bhte", kx, self.k_head_mix.to(kx.dtype))
                 vx = torch.einsum("bhtd,hde->bhte", vx, self.v_head_mix.to(vx.dtype))
@@ -300,13 +325,15 @@ class UniversalVSAAttn(nn.Module):
             q_mod = torch.sigmoid((q * self.local_q_gate.view(1, self.H, 1, self.HD).to(q.dtype)).sum(-1, keepdim=True))
             y = y + (2.0 * q_mod) * v_loc
         if y_swa is not None:
-            a = torch.sigmoid(self.swa_mix_logit.float()).view(1, self.H, 1, 1).to(y.dtype)
-            y = y + a * (y_swa.to(y.dtype) - y)
+            y_swa = self._split_heads(y_swa, self.attn_H)
+            alpha_s = torch.sigmoid(self.swa_mix_logit.float()).view(1, self.H, 1, 1).to(y.dtype)
+            y = y + alpha_s * (y_swa.to(y.dtype) - y)
         if y_slot is not None:
             sg = torch.tanh(self.slot_gate.float()).view(1, self.H, 1, 1).to(y.dtype)
             y = y + sg * y_slot
         if hasattr(self, "g_proj"):
-            y = y * (2.0 * torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2)))
+            g_sig = torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2))
+            y = y * (g_sig if self.sigmoid_gate else (2.0 * g_sig))
         return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD))
 
 
