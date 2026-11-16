@@ -1,0 +1,1682 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VSA-LM &amp; Bolt Attention — Fixed-State Transformer Retrofits</title>
+<meta name="description" content="Bolt Attention &amp; VSA-LM retrofit 72–75% of pretrained Transformer layers into fixed-size outer-product memory with Centered Holographic Unbinding and Abelian Page-Slots.">
+<meta name="theme-color" content="#0E0D0B">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --sans:"Inter",Arial,Helvetica,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --maxw:1220px;
+  --ember:#FA520F;
+  --ember-deep:#D94106;
+  --amber:#FFA110;
+  --gold:#FFB83E;
+  --sun:#FFD900;
+  --crimson:#E10500;
+  --ok:#22C55E;
+}
+
+html[data-theme="dark"]{
+  --canvas:#0E0D0B;
+  --canvas-2:#161410;
+  --paper:#1A1713;
+  --butter:#292115;
+  --hairline:#2E2920;
+  --hairline-strong:#463E30;
+  --ink:#FAF5E8;
+  --ink-soft:#C2B9A5;
+  --ink-muted:#8C8372;
+  --term:#090807;
+  --term-border:#2E2920;
+  --term-ink:#F7F1E3;
+  --nav-bg:rgba(14,13,11,.90);
+  --shadow-accent:#292115;
+  --pill-tie-bg:rgba(34,197,94,.12);
+  --pill-tie-ink:#4ADE80;
+  --pill-tie-bd:rgba(34,197,94,.32);
+  --pill-gap-bg:rgba(250,82,15,.14);
+  --pill-gap-ink:#FF8A50;
+  --pill-gap-bd:rgba(250,82,15,.36);
+}
+
+html[data-theme="light"]{
+  --canvas:#FFFAEB;
+  --canvas-2:#FFF4D6;
+  --paper:#FFFFFF;
+  --butter:#FFF0C2;
+  --hairline:#E8D7A7;
+  --hairline-strong:#D4BC7B;
+  --ink:#18181B;
+  --ink-soft:#4B4B52;
+  --ink-muted:#71717A;
+  --term:#141311;
+  --term-border:#18181B;
+  --term-ink:#F7F1E3;
+  --nav-bg:rgba(255,250,235,.92);
+  --shadow-accent:#FFF0C2;
+  --pill-tie-bg:#ECFDF3;
+  --pill-tie-ink:#15803D;
+  --pill-tie-bd:#BBF7D0;
+  --pill-gap-bg:#FFF1EB;
+  --pill-gap-ink:#CC3A05;
+  --pill-gap-bd:#FDBA74;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{
+  overflow-x:clip;
+  scroll-behavior:smooth;
+  background:var(--canvas);
+  color:var(--ink);
+  transition:background .2s ease,color .2s ease;
+}
+body{
+  font-family:var(--sans);
+  font-size:16px;
+  line-height:1.58;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--ember);color:#fff}
+a{color:inherit;text-decoration:none}
+code{
+  font-family:var(--mono);
+  font-size:0.88em;
+  background:var(--butter);
+  color:var(--ink);
+  padding:1px 6px;
+  border:1px solid var(--hairline-strong);
+}
+
+/* Progress & Spectrum Header */
+.spectrum-bar{
+  height:4px;
+  width:100%;
+  background:linear-gradient(90deg,var(--sun) 0%,var(--amber) 28%,var(--ember) 58%,var(--crimson) 85%,var(--ink) 100%);
+}
+header.nav-wrap{
+  position:sticky;
+  top:0;
+  z-index:60;
+  background:var(--nav-bg);
+  backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--hairline);
+}
+.scroll-progress{
+  position:absolute;
+  left:0;bottom:-1px;
+  height:2px;width:0%;
+  background:linear-gradient(90deg,var(--sun),var(--ember));
+  pointer-events:none;
+}
+.nav{
+  max-width:var(--maxw);
+  margin:0 auto;
+  padding:13px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:16px;
+}
+.brand{
+  display:flex;
+  align-items:center;
+  gap:11px;
+  font-weight:600;
+  font-size:15px;
+  letter-spacing:-0.02em;
+  white-space:nowrap;
+}
+.mosaic-mark{
+  display:grid;
+  grid-template-columns:repeat(4,6px);
+  grid-template-rows:repeat(3,6px);
+  gap:1.5px;
+}
+.mosaic-mark span{display:block;width:6px;height:6px}
+.nav-links{
+  display:flex;
+  align-items:center;
+  gap:22px;
+  list-style:none;
+  font-size:14px;
+  color:var(--ink-soft);
+}
+.nav-links a:hover{color:var(--ember)}
+.nav-right{display:flex;align-items:center;gap:10px}
+.theme-btn{
+  font-family:var(--mono);
+  font-size:12px;
+  padding:7px 11px;
+  background:var(--paper);
+  color:var(--ink);
+  border:1px solid var(--hairline-strong);
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  transition:border-color .15s,background .15s;
+}
+.theme-btn:hover{border-color:var(--ember)}
+.nav-cta{
+  font-family:var(--mono);
+  font-size:12.5px;
+  padding:8px 14px;
+  background:var(--ink);
+  color:var(--canvas);
+  border:1px solid var(--ink);
+  transition:background .15s,border-color .15s,color .15s;
+  white-space:nowrap;
+}
+.nav-cta:hover{background:var(--ember);border-color:var(--ember);color:#fff}
+
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+section.band{padding:76px 0;border-bottom:1px solid var(--hairline)}
+section.band:last-of-type{border-bottom:none}
+
+.kicker{
+  font-family:var(--mono);
+  font-size:12px;
+  text-transform:uppercase;
+  letter-spacing:0.08em;
+  color:var(--ember);
+  margin-bottom:12px;
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+}
+.kicker::before{content:"";width:8px;height:8px;background:var(--ember);display:inline-block}
+h1,h2,h3{font-weight:400;letter-spacing:-0.03em;color:var(--ink)}
+h1{font-size:clamp(40px,6vw,74px);line-height:.99;margin-bottom:20px}
+h2{font-size:clamp(28px,3.8vw,44px);line-height:1.08;margin-bottom:14px}
+h3{font-size:19px;line-height:1.25;letter-spacing:-0.02em}
+.lead{font-size:clamp(16.5px,1.75vw,19.5px);line-height:1.54;color:var(--ink-soft);max-width:66ch}
+
+/* Buttons */
+.btn-row{display:flex;flex-wrap:wrap;gap:12px;margin-top:26px}
+.btn{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  padding:12px 19px;
+  font-size:14px;
+  font-weight:500;
+  letter-spacing:-0.01em;
+  border:1px solid var(--hairline-strong);
+  background:var(--paper);
+  color:var(--ink);
+  cursor:pointer;
+  transition:all .15s;
+}
+.btn:hover{border-color:var(--ink);background:var(--butter)}
+.btn.primary{background:var(--ink);border-color:var(--ink);color:var(--canvas)}
+.btn.primary:hover{background:var(--ember);border-color:var(--ember);color:#fff}
+.btn.ember{background:var(--ember);border-color:var(--ember);color:#fff}
+.btn.ember:hover{background:var(--ember-deep);border-color:var(--ember-deep)}
+
+/* Hero */
+.hero{padding:64px 0 72px;border-bottom:1px solid var(--hairline)}
+.hero-grid{
+  display:grid;
+  grid-template-columns:1.22fr 0.78fr;
+  gap:40px;
+  align-items:center;
+}
+.hero-panel{
+  background:var(--term);
+  color:var(--term-ink);
+  border:1px solid var(--hairline-strong);
+  padding:22px;
+  box-shadow:10px 10px 0 var(--shadow-accent),10px 10px 0 1px var(--hairline-strong);
+}
+.hero-mosaic-band{
+  display:grid;
+  grid-template-columns:repeat(12,1fr);
+  gap:3px;
+  margin-bottom:18px;
+}
+.hero-mosaic-band i{display:block;height:13px}
+.spec-list{
+  list-style:none;
+  font-family:var(--mono);
+  font-size:12.5px;
+  line-height:1.65;
+  border-top:1px solid var(--term-border);
+  padding-top:14px;
+}
+.spec-list li{
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  padding:4px 0;
+  border-bottom:1px dashed #29251F;
+}
+.spec-list li:last-child{border-bottom:none}
+.spec-list .k{color:#9E9482}
+.spec-list .v{color:var(--gold);text-align:right}
+
+.stat-strip{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:14px;
+  margin-top:42px;
+}
+.stat-box{
+  background:var(--paper);
+  border:1px solid var(--hairline);
+  padding:18px;
+}
+.stat-num{
+  font-family:var(--mono);
+  font-size:28px;
+  font-weight:600;
+  letter-spacing:-0.03em;
+  color:var(--ink);
+}
+.stat-num span{color:var(--ember)}
+.stat-lbl{font-size:13px;color:var(--ink-soft);margin-top:4px}
+
+/* Scrollytelling Chapters (Resolution-Invariant 4:3 Sticky Stage) */
+.scrolly-intro{
+  padding:64px 0 28px;
+  border-bottom:1px solid var(--hairline);
+}
+.scrolly-section{
+  position:relative;
+  border-bottom:1px solid var(--hairline);
+  padding:36px 0;
+}
+.scrolly-container{
+  max-width:var(--maxw);
+  margin:0 auto;
+  padding:0 24px;
+  display:grid;
+  grid-template-columns:1.18fr 0.82fr;
+  gap:38px;
+  align-items:start;
+}
+.scrolly-section.alt .scrolly-container{
+  grid-template-columns:0.82fr 1.18fr;
+}
+.scrolly-section.alt .story-graphic{grid-column:2;grid-row:1}
+.scrolly-section.alt .story-steps{grid-column:1;grid-row:1}
+
+.story-graphic{
+  position:sticky;
+  top:78px;
+  width:100%;
+  aspect-ratio:4 / 3;
+  max-height:calc(100vh - 102px);
+  background:var(--paper);
+  border:1px solid var(--hairline-strong);
+  box-shadow:8px 8px 0 var(--shadow-accent),8px 8px 0 1px var(--hairline);
+  overflow:hidden;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
+.story-graphic canvas{
+  width:100%;
+  height:100%;
+  display:block;
+}
+.stage-progress-pill{
+  position:absolute;
+  bottom:10px;right:12px;
+  font-family:var(--mono);
+  font-size:11px;
+  padding:3px 8px;
+  background:var(--canvas-2);
+  color:var(--ink-soft);
+  border:1px solid var(--hairline-strong);
+  pointer-events:none;
+}
+
+.story-steps{
+  display:flex;
+  flex-direction:column;
+  padding:22vh 0 28vh;
+}
+.story-step{
+  min-height:46vh;
+  display:flex;
+  align-items:center;
+  margin-bottom:8vh;
+  opacity:0.35;
+  transform:translateY(8px);
+  transition:opacity .28s ease,transform .28s ease;
+}
+.story-step:last-child{margin-bottom:0}
+.story-step.active{opacity:1;transform:translateY(0)}
+.story-card{
+  width:100%;
+  background:var(--paper);
+  border:1px solid var(--hairline);
+  padding:24px 26px;
+  position:relative;
+  transition:border-color .22s ease,box-shadow .22s ease;
+}
+.story-step.active .story-card{
+  border-color:var(--ember);
+  box-shadow:6px 6px 0 var(--shadow-accent),6px 6px 0 1px var(--hairline-strong);
+}
+.story-step.active .story-card::before{
+  content:"";
+  position:absolute;
+  top:0;left:0;right:0;
+  height:3px;
+  background:linear-gradient(90deg,var(--sun),var(--amber),var(--ember));
+}
+.story-rate{
+  font-family:var(--mono);
+  font-size:11.5px;
+  text-transform:uppercase;
+  letter-spacing:0.07em;
+  color:var(--ember);
+  display:block;
+  margin-bottom:8px;
+}
+.story-card h3{font-size:19px;font-weight:500;margin-bottom:10px}
+.story-card p{font-size:14.5px;color:var(--ink-soft);line-height:1.6}
+.story-eq{
+  font-family:var(--mono);
+  font-size:12.5px;
+  background:var(--term);
+  color:#FFE8B3;
+  border-left:3px solid var(--ember);
+  padding:9px 12px;
+  margin-top:12px;
+  overflow-x:auto;
+}
+
+/* Interactive Architecture Explorer */
+.arch-toolbar{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  justify-content:space-between;
+  gap:14px;
+  margin:22px 0 18px;
+}
+.seg-tabs{
+  display:inline-flex;
+  background:var(--canvas-2);
+  border:1px solid var(--hairline-strong);
+  padding:3px;
+}
+.seg-tab{
+  font-family:var(--mono);
+  font-size:12px;
+  padding:8px 13px;
+  border:none;
+  background:transparent;
+  color:var(--ink-soft);
+  cursor:pointer;
+  transition:all .15s;
+}
+.seg-tab.active{background:var(--ink);color:var(--canvas)}
+.arch-shell{
+  display:grid;
+  grid-template-columns:1fr 1.2fr;
+  gap:22px;
+  align-items:start;
+}
+.card{
+  background:var(--paper);
+  border:1px solid var(--hairline);
+  padding:22px;
+}
+.card.warm{background:var(--canvas-2);border-color:var(--hairline-strong)}
+.stack-grid{
+  display:grid;
+  grid-template-columns:repeat(9,1fr);
+  gap:4px;
+  margin:14px 0 12px;
+}
+.layer-cell{
+  font-family:var(--mono);
+  font-size:11px;
+  padding:8px 2px;
+  text-align:center;
+  border:1px solid var(--hairline-strong);
+  cursor:pointer;
+  transition:transform .1s,border-color .1s;
+  user-select:none;
+}
+.layer-cell:hover{transform:translateY(-2px);border-color:var(--ink)}
+.layer-cell.vsa{background:var(--butter);color:var(--ink)}
+.layer-cell.soft{background:var(--ember);color:#fff;border-color:var(--ember-deep)}
+.layer-cell.pin{background:var(--ink);color:var(--sun);border-color:var(--ink)}
+.layer-cell.selected{outline:2px solid var(--ember);outline-offset:1px}
+.legend{
+  display:flex;
+  flex-wrap:wrap;
+  gap:14px;
+  font-family:var(--mono);
+  font-size:11.5px;
+  color:var(--ink-soft);
+  margin-bottom:14px;
+}
+.legend i{display:inline-block;width:10px;height:10px;margin-right:5px;vertical-align:middle}
+
+.pipe-stages{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:12px}
+.stage-btn{
+  text-align:left;
+  padding:11px 13px;
+  background:var(--canvas);
+  color:var(--ink);
+  border:1px solid var(--hairline);
+  cursor:pointer;
+  transition:all .15s;
+}
+.stage-btn:hover{border-color:var(--ember)}
+.stage-btn.active{background:var(--ink);color:var(--canvas);border-color:var(--ink)}
+.stage-btn .s-id{font-family:var(--mono);font-size:10.5px;color:var(--ember);display:block;margin-bottom:2px}
+.stage-btn.active .s-id{color:var(--gold)}
+.stage-btn .s-name{font-size:13px;font-weight:500}
+.stage-detail{
+  background:var(--term);
+  color:var(--term-ink);
+  padding:18px;
+  margin-top:12px;
+  border:1px solid var(--hairline-strong);
+}
+.eq-box{
+  font-family:var(--mono);
+  font-size:12.5px;
+  line-height:1.6;
+  background:#050403;
+  border-left:3px solid var(--ember);
+  padding:11px 13px;
+  margin:10px 0;
+  overflow-x:auto;
+  color:#FFE8B3;
+}
+.detail-meta{display:flex;flex-wrap:wrap;gap:14px;font-family:var(--mono);font-size:11.5px;color:#A89F8D}
+
+/* Models Cards (Strictly Only 2) */
+.models-grid{
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:22px;
+  margin-top:26px;
+}
+.model-card{
+  background:var(--paper);
+  border:1px solid var(--hairline-strong);
+  padding:26px;
+  display:flex;
+  flex-direction:column;
+  justify-content:space-between;
+  box-shadow:6px 6px 0 var(--shadow-accent);
+}
+.model-badge{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  font-family:var(--mono);
+  font-size:11.5px;
+  padding:4px 9px;
+  background:var(--butter);
+  border:1px solid var(--hairline-strong);
+  margin-bottom:12px;
+}
+.model-stats{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:10px;
+  margin:18px 0;
+  padding:14px 0;
+  border-top:1px solid var(--hairline);
+  border-bottom:1px solid var(--hairline);
+}
+.ms-val{font-family:var(--mono);font-size:20px;font-weight:600;color:var(--ember)}
+.ms-lbl{font-size:12px;color:var(--ink-muted)}
+.model-meta{font-family:var(--mono);font-size:12px;color:var(--ink-soft);line-height:1.68;margin-bottom:18px}
+
+/* Benchmark Tables */
+.table-scroll{overflow-x:auto;margin-top:16px;border:1px solid var(--hairline)}
+table{width:100%;border-collapse:collapse;background:var(--paper);font-size:14px}
+th,td{padding:11px 14px;text-align:left;border-bottom:1px solid var(--hairline)}
+th{
+  font-family:var(--mono);
+  font-size:11.5px;
+  text-transform:uppercase;
+  letter-spacing:0.05em;
+  background:var(--canvas-2);
+  color:var(--ink-soft);
+}
+td.num,th.num{text-align:right;font-family:var(--mono)}
+tr:last-child td{border-bottom:none}
+.pill-tie{
+  font-family:var(--mono);font-size:11.5px;padding:2px 8px;
+  background:var(--pill-tie-bg);color:var(--pill-tie-ink);border:1px solid var(--pill-tie-bd);
+  display:inline-block;
+}
+.pill-gap{
+  font-family:var(--mono);font-size:11.5px;padding:2px 8px;
+  background:var(--pill-gap-bg);color:var(--pill-gap-ink);border:1px solid var(--pill-gap-bd);
+  display:inline-block;
+}
+.note-box{
+  margin-top:14px;padding:13px 16px;background:var(--canvas-2);
+  border-left:3px solid var(--amber);font-size:13.5px;color:var(--ink-soft);
+}
+
+/* Quickstart */
+.code-shell{background:var(--term);color:var(--term-ink);border:1px solid var(--hairline-strong);margin-top:20px}
+.code-bar{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--term-border);padding-right:10px}
+.code-tabs{display:flex;overflow-x:auto}
+.code-tab{
+  font-family:var(--mono);font-size:12.5px;padding:11px 16px;border:none;
+  background:transparent;color:#9E9482;cursor:pointer;white-space:nowrap;
+}
+.code-tab.active{color:var(--gold);background:#1E1B16;border-bottom:2px solid var(--ember)}
+.copy-btn{
+  font-family:var(--mono);font-size:11.5px;padding:5px 10px;
+  border:1px solid var(--term-border);background:#1C1915;color:var(--term-ink);cursor:pointer;
+}
+.copy-btn:hover{border-color:var(--ember)}
+pre.code-body{
+  padding:20px;font-family:var(--mono);font-size:13px;line-height:1.65;overflow-x:auto;color:var(--term-ink);
+}
+pre .c{color:#8E8574}
+
+footer{
+  background:var(--term);
+  color:#BFB5A2;
+  padding:46px 24px;
+  font-size:13.5px;
+  border-top:1px solid var(--hairline);
+}
+.footer-inner{
+  max-width:var(--maxw);margin:0 auto;display:flex;flex-wrap:wrap;
+  justify-content:space-between;gap:24px;align-items:flex-start;
+}
+.footer-links{display:flex;flex-wrap:wrap;gap:20px;font-family:var(--mono);font-size:12.5px}
+.footer-links a:hover{color:var(--gold)}
+
+@media (max-width:920px){
+  .hero-grid,.arch-shell,.models-grid{grid-template-columns:1fr}
+  .scrolly-container,.scrolly-section.alt .scrolly-container{grid-template-columns:1fr;gap:18px}
+  .scrolly-section.alt .story-graphic,.scrolly-section.alt .story-steps{grid-column:auto;grid-row:auto}
+  .story-graphic{position:sticky;top:68px;max-height:44vh;z-index:20}
+  .story-steps{padding:12px 0 18vh}
+  .story-step{min-height:auto;margin-bottom:28px}
+  .stat-strip{grid-template-columns:repeat(2,1fr)}
+  .nav-links{display:none}
+}
+@media (max-width:540px){
+  .stat-strip,.pipe-stages{grid-template-columns:1fr}
+  .stack-grid{grid-template-columns:repeat(6,1fr)}
+}
+</style>
+</head>
+<body>
+
+<div class="spectrum-bar"></div>
+
+<header class="nav-wrap">
+  <nav class="nav">
+    <a class="brand" href="#top">
+      <span class="mosaic-mark" aria-hidden="true">
+        <span style="background:#FFD900"></span><span style="background:#FFA110"></span><span style="background:#FFD900"></span><span style="background:#FA520F"></span>
+        <span style="background:#FFA110"></span><span style="background:#FA520F"></span><span style="background:#E10500"></span><span style="background:#FA520F"></span>
+        <span style="background:#FA520F"></span><span style="background:#18181B"></span><span style="background:#18181B"></span><span style="background:#CC3A05"></span>
+      </span>
+      <span>VSA-LM / Bolt Attention</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#walkthrough">Scroll Spec</a></li>
+      <li><a href="#architecture">Explorer</a></li>
+      <li><a href="#models">Models</a></li>
+      <li><a href="#benchmarks">Benchmarks</a></li>
+      <li><a href="#quickstart">Quickstart</a></li>
+    </ul>
+    <div class="nav-right">
+      <button class="theme-btn" id="theme-toggle" type="button" aria-label="Toggle light and dark theme">☀ Light</button>
+      <a class="nav-cta" href="https://github.com/Rikka3/vsa-lm" target="_blank" rel="noopener">GitHub ↗</a>
+    </div>
+  </nav>
+  <div class="scroll-progress" id="scroll-progress"></div>
+</header>
+
+<main id="top">
+  <!-- HERO -->
+  <section class="hero">
+    <div class="wrap">
+      <div class="hero-grid">
+        <div>
+          <div class="kicker">Open-Source Toolkit · MIT License · Zero Pretraining</div>
+          <h1>75% Fixed State.<br>Pretrained Weights Intact.</h1>
+          <p class="lead"><strong>VSA-LM</strong> retrofits pretrained Transformers into <strong>Bolt Attention</strong> hybrids: fixed-size outer-product memory with <em>Centered Holographic Unbinding</em>, non-decaying <em>Abelian Page-Slots</em>, and periodic Softmax anchor layers—trained in one single-GPU session.</p>
+          <div class="btn-row">
+            <a class="btn primary" href="#walkthrough">Scroll Architecture ↓</a>
+            <a class="btn ember" href="https://huggingface.co/rikkathree/vsa-qwen3-4b" target="_blank" rel="noopener">VSA-Qwen3-4B v2 ↗</a>
+            <a class="btn" href="https://huggingface.co/rikkathree/vsa-deepseek-r1-qwen-1.5b" target="_blank" rel="noopener">VSA-DeepSeek-R1-1.5B ↗</a>
+          </div>
+        </div>
+
+        <aside class="hero-panel" aria-label="Architecture telemetry card">
+          <div class="hero-mosaic-band" aria-hidden="true">
+            <i style="background:#FFD900"></i><i style="background:#FFD900"></i><i style="background:#FFA110"></i><i style="background:#FA520F"></i>
+            <i style="background:#FFA110"></i><i style="background:#FFB83E"></i><i style="background:#FA520F"></i><i style="background:#E10500"></i>
+            <i style="background:#FFA110"></i><i style="background:#FA520F"></i><i style="background:#CC3A05"></i><i style="background:#2E2920"></i>
+          </div>
+          <ul class="spec-list">
+            <li><span class="k">CORE RECURRENCE</span><span class="v">M_t = γ M_(t-1) + k_t ⊗ v_t</span></li>
+            <li><span class="k">MEAN UNBINDING</span><span class="v">M_t q - c_t ((k̄·q)/z) v̄</span></li>
+            <li><span class="k">EXACT PARITY</span><span class="v">4.58e-05 max dlogit (fp32)</span></li>
+            <li><span class="k">ALGEBRAIC ERASE</span><span class="v">0.00e+00 residual (&lt; 1 ms)</span></li>
+            <li><span class="k">STREAMKV RAM</span><span class="v">73.1 MB flat (1.5B @ 8k)</span></li>
+            <li><span class="k">64K CACHE SAVED</span><span class="v">-71.3% (4B) · -74.0% (1.5B)</span></li>
+          </ul>
+        </aside>
+      </div>
+
+      <div class="stat-strip">
+        <div class="stat-box">
+          <div class="stat-num">6 <span>/ 7</span></div>
+          <div class="stat-lbl">UK AISI Inspect ties on Qwen3-4B v2 (GSM8K 82.5% vs 85.0%, p=0.54)</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-num"><span>-</span>74.0%</div>
+          <div class="stat-lbl">State + KV RAM saved at 65,536 context (466 MB vs 1,792 MB)</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-num">1.57<span>×</span></div>
+          <div class="stat-lbl">Faster 64k decode on VSA-Qwen3-4B v2 via Split-KV CUDA Graphs</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-num">0.00</div>
+          <div class="stat-lbl">Forget residual across M_t, centroids, and .vsa disk cartridges</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SCROLLYTELLING INTRO -->
+  <div class="scrolly-intro" id="walkthrough">
+    <div class="wrap">
+      <div class="kicker">Causal Mechanics · Scroll-Driven Walkthrough</div>
+      <h2>How Bolt Attention Works</h2>
+      <p class="lead">Five continuous scroll chapters showing state allocation, GQA un-tying, centroid shadow cancellation, hybrid healing, and exact algebraic unlearning—rendered inside resolution-locked 4:3 viewports.</p>
+    </div>
+  </div>
+
+  <!-- CHAPTER 01: KV BOTTLENECK -->
+  <section class="scrolly-section" data-scene="kv">
+    <div class="scrolly-container">
+      <div class="story-graphic"><canvas></canvas><span class="stage-progress-pill">01 · KV WALL</span></div>
+      <div class="story-steps">
+        <div class="story-step active">
+          <div class="story-card">
+            <span class="story-rate">Chapter 01 · Step 01</span>
+            <h3>Standard Transformers Hoard Every Token</h3>
+            <p>Every Softmax layer appends a full key and value vector per generated token. Long <code>&lt;think&gt;</code> reasoning chains and multi-file code contexts expand KV VRAM linearly with sequence length.</p>
+          </div>
+        </div>
+        <div class="story-step">
+          <div class="story-card">
+            <span class="story-rate">Chapter 01 · Step 02</span>
+            <h3>9.2 GB of KV Cache for One Stream</h3>
+            <p>At <code>65,536</code> tokens, <code>Qwen/Qwen3-4B</code> requires <code>9,216 MB</code> of KV cache (<code>1,792 MB</code> on <code>1.5B</code>) before activations or batching—starving consumer GPUs.</p>
+          </div>
+        </div>
+        <div class="story-step">
+          <div class="story-card">
+            <span class="story-rate">Chapter 01 · Step 03</span>
+            <h3>Memory-Bandwidth Bottleneck</h3>
+            <p>Every single decode step must re-stream the entire growing KV pile from HBM. Replacing 72–75% of layers with fixed-size <code>D×D</code> states cuts memory traffic sharply and raises 64k throughput <code>1.42×–1.57×</code>.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CHAPTER 02: MIX-FIRST & OUTER PRODUCT -->
+  <section class="scrolly-section alt" data-scene="vsa">
+    <div class="scrolly-container">
+      <div class="story-steps">
+        <div class="story-step active">
+          <div class="story-card">
+            <span class="story-rate">Chapter 02 · Step 01</span>
+            <h3>QK-Norm &amp; Mix-First GQA Un-Tying</h3>
+            <p>Donors with <code>HKV=2</code> or <code>8</code> would only get 2 or 8 shared matrices if tied. Bolt Attention preserves donor QK-Norm, then mixes repeated KV heads via learned <code>W_mix</code> <strong>before</strong> applying RoPE—yielding <code>H</code> independent subspaces with zero phase drift past training length.</p>
+          </div>
+        </div>
+        <div class="story-step">
+          <div class="story-card">
+            <span class="story-rate">Chapter 02 · Step 02</span>
+            <h3>Tensor Product Role-Filler Binding</h3>
+            <p>Normalized features <code>φ(z) = z + α·ReLU(z)</code> bind key and value vectors via outer product <code>k_t ⊗ v'_t</code> into a fixed <code>128×128</code> associative matrix per head.</p>
+            <div class="story-eq">k~_t = RoPE_t(repeat_kv(k_raw)_h · W^mix_k) + Conv1D_4(k~)</div>
+          </div>
+        </div>
+        <div class="story-step">
+          <div class="story-card">
+            <span class="story-rate">Chapter 02 · Step 03</span>
+            <h3>Learnable Multi-Scale Decay (∂L / ∂γ_h)</h3>
+            <p>Each head learns its own decay horizon <code>γ_h = 0.9999·σ(ℓ_h)</code> using exact analytical cross-chunk gradients inside our custom Triton backward kernel—never frozen ALiBi slopes.</p>
+            <div class="story-eq">M_t = γ_h · M_(t-1) + k_t ⊗ v'_t</div>
+          </div>
+        </div>
+        <div class="story-step">
+          <div class="story-card">
+            <span class="story-rate">Chapter 02 · Step 04</span>
+            <h3>Fused O(1) Triton Step &amp; Split-KV Graph</h3>
+            <p>Readout scales by steady-state <code>(1 - γ_h)/√D</code> inside a single fused Triton kernel captured inside a Split-KV CUDA Graph—constant <code>O(1)</code> compute per VSA layer at any context length.</p>
+          </div>
+        </div>
+      </div>
+      <div class="story-graphic"><canvas></canvas><span class="stage-progress-pill">02 · BOLT RECURRENCE</span></div>
+    </div>
+  </section>
+
+  <!-- CHAPTER 03: CENTERED UNBINDING & PAGE-SLOTS -->
+  <section class="scrolly-section" data-scene="center">
+    <div class="scrolly-container">
+      <div class="story-graphic"><canvas></canvas><span class="stage-progress-pill">03 · UNBIND + SLOTS</span></div>
+      <div class="story-steps">
+        <div class="story-step active">
+          <div class="story-card">
+            <span class="story-rate">Chapter 03 · Step 01</span>
+            <h3>Why Raw Linear Memory Blurs Long CoT</h3>
+            <p>Over 800+ <code>&lt;think&gt;</code> tokens, shared domain and syntax vectors accumulate inside <code>M_t</code>. Naive <code>M_t q_t</code> retrieves a heavy mean-field background floor, and <code>RMSNorm_out</code> amplifies residual noise.</p>
+          </div>
+        </div>
+        <div class="story-step">
+          <div class="story-card">
+            <span class="story-rate">Chapter 03 · Step 02</span>
+            <h3>Centered Holographic Unbinding</h3>
+            <p>Track tiny <code>O(D)</code> running centroids <code>(k̄_t, v̄_t, z_t)</code> (+1.5% state) and subtract the exact rank-1 background hologram <strong>before</strong> normalization via zero-init gate <code>c_t = tanh(W_c x_t)</code>—staying 100% Abelian linear.</p>
+            <div class="story-eq">y_clean = ((1-γ)/√D) · [ M_t q_t - c_t · ((k̄_t·q_t)/(z_t+ε)) · v̄_t ]</div>
+          </div>
+        </div>
+        <div class="story-step">
+          <div class="story-card">
+            <span class="story-rate">Chapter 03 · Step 03</span>
+            <h3>Abelian Page-Slot Binder (No-RoPE)</h3>
+            <p>Paired with fast <code>M_t</code>, non-decaying position-free slots <code>(C_t, U_t, Z_t)</code> routed by <code>w_t = softmax(r)·σ(r)</code> stay near zero on filler—preserving early prompt numbers across 32k+ tokens with 100% train/decode parity.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CHAPTER 04: HYBRID STACK & RETROFIT -->
+  <section class="scrolly-section alt" data-scene="hybrid">
+    <div class="scrolly-container">
+      <div class="story-steps">
+        <div class="story-step active">
+          <div class="story-card">
+            <span class="story-rate">Chapter 04 · Step 01</span>
+            <h3>26 Bolt-VSA (SWA=256) + 10 Softmax Anchors</h3>
+            <p>Keeping <code>L0</code> pinned + every 4th layer as full Softmax preserves initial token binding and long-range verification, while widening VSA local Softmax to <code>W=256</code> keeps full docstrings and arithmetic steps lossless.</p>
+          </div>
+        </div>
+        <div class="story-step">
+          <div class="story-card">
+            <span class="story-rate">Chapter 04 · Step 02</span>
+            <h3>Step-0 Stability + 2-Stage Healing</h3>
+            <p>Initializing <code>out_norm=0.05</code> prevents early-layer RMS amplification (dropping Step-0 PPL from <code>443.76 → 4.66</code>), followed by Stage-1 attention transfer and Stage-2 <code>T=2048</code> KD with unfrozen MLPs—reaching <code>0.981×</code> donor PPL and <code>6/7</code> Inspect ties.</p>
+          </div>
+        </div>
+      </div>
+      <div class="story-graphic"><canvas></canvas><span class="stage-progress-pill">04 · HYBRID RETROFIT</span></div>
+    </div>
+  </section>
+
+  <!-- CHAPTER 05: CARTRIDGES, FORGET & STREAMKV -->
+  <section class="scrolly-section" data-scene="forget">
+    <div class="scrolly-container">
+      <div class="story-graphic"><canvas></canvas><span class="stage-progress-pill">05 · ERASE + STREAM</span></div>
+      <div class="story-steps">
+        <div class="story-step active">
+          <div class="story-card">
+            <span class="story-rate">Chapter 05 · Step 01</span>
+            <h3>Mountable <code>.vsa</code> Disk Cartridges</h3>
+            <p>Documents encode into portable <code>.vsa</code> neural state files on SSD (<code>0 MB</code> idle RAM). Queries route in <code>&lt;75 ms</code>, superpose cleanly onto live state, and recall facts at <code>100% (4/4)</code> accuracy.</p>
+          </div>
+        </div>
+        <div class="story-step">
+          <div class="story-card">
+            <span class="story-rate">Chapter 05 · Step 02</span>
+            <h3>Exact Algebraic Unlearning (0.00 Residual)</h3>
+            <p>Because both <code>M_t</code> and centroids <code>(k̄_t, v̄_t, z_t)</code> obey linear superposition, subtracting decayed document tensors or calling <code>erase_page(p)</code> removes facts in <code>&lt;1 ms</code> with <code>0.00e+00</code> residual.</p>
+            <div class="story-eq">M_t ← M_t - γ^Δt · ΔM_doc,   (k̄, v̄, z) ← (k̄, v̄, z) - γ^Δt · (Δk̄, Δv̄, Δz)</div>
+          </div>
+        </div>
+        <div class="story-step">
+          <div class="story-card">
+            <span class="story-rate">Chapter 05 · Step 03</span>
+            <h3>Constant-RAM <code>StreamKV</code> Streaming</h3>
+            <p>With <code>--stream-window 8192</code>, Softmax anchors keep 4 float64-rotated sinks + a fixed ring buffer—capping <code>1.5B</code> RAM at <code>73.1 MB</code> forever (<code>+0.0 MB</code> growth over 32k+ tokens at <code>125.6 tok/s</code>).</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- INTERACTIVE ARCHITECTURE EXPLORER -->
+  <section class="band" id="architecture">
+    <div class="wrap">
+      <div class="kicker">Interactive Spec Inspector</div>
+      <h2>Layer &amp; Stage Reference</h2>
+      <p class="lead">Inspect individual layer allocations and verify every equation across both released architectures.</p>
+
+      <div class="arch-toolbar">
+        <div class="seg-tabs" role="tablist" aria-label="Select model topology">
+          <button class="seg-tab active" data-arch="qwen3" type="button">VSA-Qwen3-4B v2 (36L)</button>
+          <button class="seg-tab" data-arch="deepseek" type="button">VSA-DeepSeek-R1-1.5B (28L)</button>
+        </div>
+        <div id="arch-summary-pill" style="font-family:var(--mono);font-size:12.5px;color:var(--ink-soft)"></div>
+      </div>
+
+      <div class="arch-shell">
+        <div class="card">
+          <h3 style="margin-bottom:4px">Layer Stack Map</h3>
+          <p style="font-size:13.5px;color:var(--ink-soft)">Click any layer block to inspect fixed state vs KV cache budget.</p>
+          <div class="stack-grid" id="stack-grid"></div>
+          <div class="legend">
+            <span><i style="background:var(--butter);border:1px solid var(--hairline-strong)"></i>Bolt-VSA Fixed State</span>
+            <span><i style="background:var(--ember)"></i>Softmax Anchor (every 4th)</span>
+            <span><i style="background:var(--ink)"></i>Pinned Softmax Endpoint</span>
+          </div>
+          <div class="card warm" id="layer-inspector" style="padding:16px"></div>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-bottom:4px">Bolt-VSA 6-Stage Pipeline</h3>
+          <p style="font-size:13.5px;color:var(--ink-soft)">Select stage to view exact algebraic formulation and invariants.</p>
+          <div class="pipe-stages">
+            <button class="stage-btn active" data-stage="0" type="button"><span class="s-id">STAGE 01</span><span class="s-name">QK-Norm &amp; Projections</span></button>
+            <button class="stage-btn" data-stage="1" type="button"><span class="s-id">STAGE 02</span><span class="s-name">Mix-First GQA &amp; Conv1D</span></button>
+            <button class="stage-btn" data-stage="2" type="button"><span class="s-id">STAGE 03</span><span class="s-name">M_t + Centered Unbinding</span></button>
+            <button class="stage-btn" data-stage="3" type="button"><span class="s-id">STAGE 04</span><span class="s-name">Abelian Page-Slot Bank</span></button>
+            <button class="stage-btn" data-stage="4" type="button"><span class="s-id">STAGE 05</span><span class="s-name">Local SWA + Sink RoPE</span></button>
+            <button class="stage-btn" data-stage="5" type="button"><span class="s-id">STAGE 06</span><span class="s-name">RMSNorm, Bypass &amp; Gate</span></button>
+          </div>
+          <div class="stage-detail" id="stage-detail"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- MODELS (STRICTLY ONLY THE 2 MODELS) -->
+  <section class="band" id="models">
+    <div class="wrap">
+      <div class="kicker">Open Weights · Apache-2.0 / MIT Retrofits</div>
+      <h2>Released Models</h2>
+      <p class="lead">Converted, healed, and evaluated against their official Hugging Face donors.</p>
+
+      <div class="models-grid">
+        <article class="model-card">
+          <div>
+            <div class="model-badge">LATEST · CENTERED UNBINDING + SWA=256</div>
+            <h3>VSA-Qwen3-4B v2</h3>
+            <p style="font-size:14px;color:var(--ink-soft);margin-top:6px">26 Bolt-VSA layers (<code>SWA=256</code>, 8 Page-Slots/KV-head, Centered Holographic Unbinding) + 10 Softmax anchors (pinned <code>L0</code> + every 4th), healed at <code>T=2048</code> with unfrozen MLPs + <code>OpenMythos</code> controller.</p>
+
+            <div class="model-stats">
+              <div><div class="ms-val">82.5%</div><div class="ms-lbl">GSM8K (vs 85% Donor)</div></div>
+              <div><div class="ms-val">1.57×</div><div class="ms-lbl">Speed @ 64k</div></div>
+              <div><div class="ms-val">-71.3%</div><div class="ms-lbl">RAM @ 64k</div></div>
+            </div>
+
+            <div class="model-meta">
+              <div><strong>Repo:</strong> <code>rikkathree/vsa-qwen3-4b</code></div>
+              <div><strong>Ties:</strong> 6 / 7 UK AISI Inspect benchmarks (<code>p ≥ 0.05</code>)</div>
+              <div><strong>HumanEval:</strong> <code>72.56%</code> (up from <code>67.07%</code> in v1; Donor <code>79.27%</code>)</div>
+              <div><strong>Cartridges:</strong> <code>4/4</code> (100%) recall · <code>0.0</code> erase residual</div>
+            </div>
+          </div>
+          <a class="btn primary" href="https://huggingface.co/rikkathree/vsa-qwen3-4b" target="_blank" rel="noopener">Open rikkathree/vsa-qwen3-4b ↗</a>
+        </article>
+
+        <article class="model-card">
+          <div>
+            <div class="model-badge">9/9 HUBCHECK PASS · STREAMKV VERIFIED</div>
+            <h3>VSA-DeepSeek-R1-Qwen-1.5B (v2)</h3>
+            <p style="font-size:14px;color:var(--ink-soft);margin-top:6px">21 Bolt-VSA layers (<code>SWA=64</code>, 32 Abelian Page-Slots, Mix-First RoPE) + 7 Softmax anchors (<code>1.835B</code>), Stage-2 KD + Stage-3 teacher-chain sequence distillation.</p>
+
+            <div class="model-stats">
+              <div><div class="ms-val">70.0%</div><div class="ms-lbl">GSM8K &amp; HumanEval</div></div>
+              <div><div class="ms-val">73.1 MB</div><div class="ms-lbl">Flat Stream @ 8k</div></div>
+              <div><div class="ms-val">-74.0%</div><div class="ms-lbl">RAM @ 64k</div></div>
+            </div>
+
+            <div class="model-meta">
+              <div><strong>Repo:</strong> <code>rikkathree/vsa-deepseek-r1-qwen-1.5b</code></div>
+              <div><strong>Streaming:</strong> <code>125.6 tok/s</code> · <code>+0.0 MB</code> growth across 32k+</div>
+              <div><strong>Number Match:</strong> <code>98.34%</code> GSM8K prompt-number Top-1 (<code>KL=0.0248</code>)</div>
+              <div><strong>Cartridges:</strong> <code>4/4</code> (100%) recall · <code>0.0</code> erase residual</div>
+            </div>
+          </div>
+          <a class="btn primary" href="https://huggingface.co/rikkathree/vsa-deepseek-r1-qwen-1.5b" target="_blank" rel="noopener">Open rikkathree/vsa-deepseek-r1-qwen-1.5b ↗</a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- BENCHMARKS -->
+  <section class="band" id="benchmarks">
+    <div class="wrap">
+      <div class="kicker">Paired Exact McNemar &amp; Split-KV CUDA Graph</div>
+      <h2>Measured Benchmarks</h2>
+      <p class="lead">Every table reflects paired evaluations run against official Hugging Face donor models.</p>
+
+      <div class="arch-toolbar">
+        <div class="seg-tabs">
+          <button class="seg-tab active" data-bench="qwen3" type="button">VSA-Qwen3-4B v2 (N=200 Inspect)</button>
+          <button class="seg-tab" data-bench="deepseek" type="button">VSA-DeepSeek-R1-Qwen-1.5B (v2)</button>
+        </div>
+      </div>
+
+      <div id="bench-qwen3">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr><th>Benchmark</th><th class="num">Official Qwen/Qwen3-4B</th><th class="num">VSA-Qwen3-4B v2</th><th class="num">Paired McNemar</th><th>Verdict</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><strong>GSM8K</strong> (<code>n=200</code>, symmetric <code>&lt;/think&gt;</code> @ 1984)</td><td class="num">85.00% (23 trunc)</td><td class="num"><strong>82.50%</strong> (22 trunc)</td><td class="num">p = 0.5424</td><td><span class="pill-tie">Statistical Tie (-2.5%)</span></td></tr>
+              <tr><td><strong>IFEval</strong> (<code>n=200</code>)</td><td class="num">86.00%</td><td class="num"><strong>85.00%</strong></td><td class="num">p = 0.7744</td><td><span class="pill-tie">Statistical Tie (-1.0%)</span></td></tr>
+              <tr><td><strong>ARC-Challenge</strong> (<code>n=200</code>)</td><td class="num">54.50%</td><td class="num"><strong>55.50%</strong></td><td class="num">p = 0.8145</td><td><span class="pill-tie">Statistical Tie (+1.0%)</span></td></tr>
+              <tr><td><strong>HellaSwag</strong> (<code>n=200</code>)</td><td class="num">52.50%</td><td class="num"><strong>54.00%</strong></td><td class="num">p = 0.5811</td><td><span class="pill-tie">Statistical Tie (+1.5%)</span></td></tr>
+              <tr><td><strong>MMLU</strong> (<code>n=200</code>, 57-subject stratified)</td><td class="num">69.50%</td><td class="num"><strong>65.50%</strong></td><td class="num">p = 0.0768</td><td><span class="pill-tie">Statistical Tie (-4.0%)</span></td></tr>
+              <tr><td><strong>MBPP</strong> (<code>n=200</code>, Pass@1)</td><td class="num">55.00%</td><td class="num"><strong>51.50%</strong></td><td class="num">p = 0.1671</td><td><span class="pill-tie">Statistical Tie (-3.5%)</span></td></tr>
+              <tr><td><strong>HumanEval</strong> (<code>n=164</code>, Pass@1)</td><td class="num">79.27%</td><td class="num"><strong>72.56%</strong></td><td class="num">p = 0.0433</td><td><span class="pill-gap">-6.71% (up from 67.07% v1)</span></td></tr>
+              <tr><td><strong>Decode Speed &amp; RAM @ 65,536</strong></td><td class="num">30.4 tok/s · 9,216 MB</td><td class="num"><strong>47.8 tok/s · 2,645 MB</strong></td><td class="num">—</td><td><span class="pill-tie">1.57× faster · -71.3% RAM</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note-box">
+          <strong>Disclosed methodology:</strong> Both models ran single-pass generation with symmetric <code>&lt;/think&gt;</code> budget close at token 1,984 on GSM8K (22 vs 23 truncated). Full 9-gate <code>hubcheck</code> run on <code>v2</code> pending.
+        </div>
+      </div>
+
+      <div id="bench-deepseek" style="display:none">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr><th>Benchmark</th><th class="num">Official DeepSeek-R1-Qwen-1.5B</th><th class="num">VSA-DeepSeek-R1-Qwen-1.5B (v2)</th><th class="num">Paired McNemar</th><th>Verdict</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><strong>HumanEval</strong> (Pass@1, <code>temp=0.0</code>)</td><td class="num">60.00%</td><td class="num"><strong>70.00%</strong></td><td class="num">p = 0.219</td><td><span class="pill-tie">Tie (+10.0% VSA lead)</span></td></tr>
+              <tr><td><strong>MBPP</strong> (Pass@1, <code>temp=0.0</code>)</td><td class="num">35.00%</td><td class="num"><strong>40.00%</strong></td><td class="num">p = 0.688</td><td><span class="pill-tie">Tie (+5.0% VSA lead)</span></td></tr>
+              <tr><td><strong>GSM8K</strong> (<code>&lt;think&gt;</code>, <code>temp=0.2, cap=4096</code>)</td><td class="num">75.00% (30/40)</td><td class="num"><strong>70.00%</strong> (28/40)</td><td class="num">p = 0.727</td><td><span class="pill-tie">Statistical Tie</span></td></tr>
+              <tr><td><strong>MMLU</strong> (57-subject stratified)</td><td class="num">38.00%</td><td class="num"><strong>39.50%</strong></td><td class="num">p = 0.711</td><td><span class="pill-tie">Statistical Tie (+1.5%)</span></td></tr>
+              <tr><td><strong>HellaSwag</strong></td><td class="num">41.00%</td><td class="num"><strong>42.00%</strong></td><td class="num">p = 0.774</td><td><span class="pill-tie">Statistical Tie (+1.0%)</span></td></tr>
+              <tr><td><strong>Decode Speed &amp; RAM @ 65,536</strong></td><td class="num">83.9 tok/s · 1,792 MB</td><td class="num"><strong>119.5 tok/s · 466.2 MB</strong></td><td class="num">—</td><td><span class="pill-tie">1.42× faster · -74.0% RAM</span></td></tr>
+              <tr><td><strong>Hubcheck + StreamKV (W=8,192)</strong></td><td class="num">—</td><td class="num"><strong>9 / 9 PASS · 73.1 MB flat</strong></td><td class="num">—</td><td><span class="pill-tie">+0.0 MB @ 125.6 tok/s</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- QUICKSTART -->
+  <section class="band" id="quickstart">
+    <div class="wrap">
+      <div class="kicker">Reproducible Toolkit</div>
+      <h2>Convert, Heal &amp; Serve</h2>
+      <p class="lead">Runs via custom Triton kernels on CUDA with pure-PyTorch CPU INT8 serving fallbacks.</p>
+
+      <div class="code-shell">
+        <div class="code-bar">
+          <div class="code-tabs">
+            <button class="code-tab active" data-code="install" type="button">1. Install &amp; Test</button>
+            <button class="code-tab" data-code="convert" type="button">2. Convert &amp; Heal</button>
+            <button class="code-tab" data-code="infer" type="button">3. StreamKV Inference</button>
+            <button class="code-tab" data-code="cartridge" type="button">4. .vsa Cartridges</button>
+          </div>
+          <button class="copy-btn" id="copy-btn" type="button">Copy</button>
+        </div>
+        <pre class="code-body" id="code-display"></pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="footer-inner">
+    <div>
+      <div style="font-weight:600;color:#FFFAEB;margin-bottom:6px">VSA-LM &amp; Bolt Attention</div>
+      <div>MIT License · © 2026 Rikka3 · Prior art: RetNet, Lightning Attention-2 / MiniMax-01, Smolensky TPR / VSA.</div>
+    </div>
+    <div class="footer-links">
+      <a href="https://github.com/Rikka3/vsa-lm" target="_blank" rel="noopener">GitHub ↗</a>
+      <a href="https://huggingface.co/rikkathree/vsa-qwen3-4b" target="_blank" rel="noopener">VSA-Qwen3-4B v2 ↗</a>
+      <a href="https://huggingface.co/rikkathree/vsa-deepseek-r1-qwen-1.5b" target="_blank" rel="noopener">VSA-DeepSeek-R1-1.5B ↗</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+const clamp = (x, a=0, b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t < .5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2)/2;
+const seg = (p, a, b) => clamp((p - a) / (b - a));
+
+/* Theme Toggle (Dark Default, Persistent) */
+function getTheme() { return document.documentElement.getAttribute("data-theme") || "dark"; }
+function applyTheme(th) {
+  document.documentElement.setAttribute("data-theme", th);
+  localStorage.setItem("vsa-theme", th);
+  const btn = $("#theme-toggle");
+  btn.textContent = th === "dark" ? "☀ Light" : "☾ Dark";
+  const meta = $('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", th === "dark" ? "#0E0D0B" : "#FFFAEB");
+}
+applyTheme(localStorage.getItem("vsa-theme") || "dark");
+$("#theme-toggle").addEventListener("click", () => applyTheme(getTheme() === "dark" ? "light" : "dark"));
+
+function pal() {
+  const dk = getTheme() === "dark";
+  return dk ? {
+    bg: "#14120F", panel: "#1D1A15", panelAlt: "#262119", border: "#3B3429",
+    ink: "#FAF5E8", soft: "#C2B9A5", muted: "#8C8372",
+    ember: "#FA520F", amber: "#FFA110", sun: "#FFD900", ok: "#22C55E", red: "#EF4444",
+    cellOff: "#1E1B16"
+  } : {
+    bg: "#FFFDF6", panel: "#FFF4D6", panelAlt: "#FFEBB8", border: "#D4BC7B",
+    ink: "#18181B", soft: "#4B4B52", muted: "#71717A",
+    ember: "#FA520F", amber: "#FFA110", sun: "#EAB308", ok: "#15803D", red: "#DC2626",
+    cellOff: "#EFE5C6"
+  };
+}
+
+/* Virtual 960 x 720 Drawing Primitives (Resolution-Invariant) */
+const VW = 960, VH = 720;
+function rrect(c, x, y, w, h, r=6) {
+  c.beginPath();
+  c.roundRect(x, y, w, h, r);
+}
+function box(c, x, y, w, h, fill, stroke, lw=1.5, r=6) {
+  rrect(c, x, y, w, h, r);
+  if (fill) { c.fillStyle = fill; c.fill(); }
+  if (stroke) { c.strokeStyle = stroke; c.lineWidth = lw; c.stroke(); }
+}
+function txt(c, s, x, y, sz=18, col="#fff", wt="500", al="left", mono=false) {
+  c.font = `${wt} ${sz}px ${mono ? '"JetBrains Mono",monospace' : '"Inter",Arial,sans-serif'}`;
+  c.textAlign = al;
+  c.textBaseline = "middle";
+  c.fillStyle = col;
+  c.fillText(s, x, y);
+}
+function heat(t, P) {
+  t = clamp(t);
+  if (t < 0.04) return P.cellOff;
+  if (t < 0.35) return "#7C2D12";
+  if (t < 0.65) return "#CC3A05";
+  if (t < 0.86) return P.ember;
+  return P.amber;
+}
+
+/* Deterministic RNG */
+function mkRng(s){return()=>{s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+
+/* SCENE 1: KV Cache Growth vs Bolt-VSA Fixed State */
+function drawKV(c, p, _t, P) {
+  const ctxTok = lerp(2048, 65536, ease(p));
+  const donorMB = 288 * (ctxTok / 2048);
+  const vsaMB = 125 + 2520 * (ctxTok / 65536);
+  const streamMB = 235;
+
+  txt(c, "01 · KV CACHE MEMORY WALL (QWEN3-4B)", 48, 46, 17, P.ember, "600", "left", true);
+  txt(c, `${Math.round(ctxTok).toLocaleString()} TOKENS`, 912, 46, 22, P.ink, "600", "right", true);
+
+  /* Visual block piles */
+  box(c, 48, 86, 412, 340, P.panel, P.border, 1.5, 8);
+  txt(c, "DONOR TRANSFORMER (36/36 SOFTMAX)", 68, 114, 14, P.soft, "600", "left", true);
+  const cols = 16, rows = 8, cw = 21, ch = 22, gap = 3;
+  const gx0 = 68, gy0 = 142;
+  const fillCount = Math.max(1, Math.round(cols * rows * (ctxTok / 65536)));
+  for (let i = 0; i < cols * rows; i++) {
+    const col = i % cols, row = Math.floor(i / cols);
+    const active = i < fillCount;
+    box(c, gx0 + col*(cw+gap), gy0 + (rows-1-row)*(ch+gap), cw, ch,
+        active ? (row >= rows-2 ? P.red : P.ember) : P.cellOff, P.border, 1, 3);
+  }
+  txt(c, `${donorMB.toFixed(0)} MB KV RAM`, 68, 396, 22, P.red, "600", "left", true);
+
+  box(c, 500, 86, 412, 340, P.panel, P.border, 1.5, 8);
+  txt(c, "BOLT HYBRID (26 VSA + 10 SOFTMAX)", 520, 114, 14, P.amber, "600", "left", true);
+  const gx1 = 520;
+  for (let i = 0; i < cols * rows; i++) {
+    const col = i % cols, row = Math.floor(i / cols);
+    const isFixed = row < 5;
+    const active = isFixed ? (col < 3) : (i - 80 < Math.round(48 * (ctxTok / 65536)));
+    const fCol = active ? (isFixed ? P.sun : P.amber) : P.cellOff;
+    box(c, gx1 + col*(cw+gap), gy0 + (rows-1-row)*(ch+gap), cw, ch, fCol, P.border, 1, 3);
+  }
+  txt(c, `${vsaMB.toFixed(0)} MB (-${(100*(1-vsaMB/donorMB)).toFixed(1)}%)`, 520, 396, 22, P.ok, "600", "left", true);
+
+  /* Comparison bars at bottom */
+  box(c, 48, 456, 864, 214, P.panel, P.border, 1.5, 8);
+  const bars = [
+    ["HF Donor DynamicCache", donorMB, 9216, P.red],
+    ["Bolt Exact State + 10KV", vsaMB, 9216, P.ember],
+    ["StreamKV Mode (W=8k)", Math.min(vsaMB, streamMB), 9216, P.ok]
+  ];
+  bars.forEach(([lbl, val, mx, col], idx) => {
+    const by = 490 + idx * 58;
+    txt(c, lbl, 72, by, 15, P.ink, "500", "left", false);
+    txt(c, `${val.toFixed(0)} MB`, 888, by, 15, col, "600", "right", true);
+    box(c, 72, by + 16, 816, 16, P.cellOff, P.border, 1, 4);
+    box(c, 72, by + 16, Math.max(12, 816 * clamp(val / mx)), 16, col, null, 0, 4);
+  });
+}
+
+/* SCENE 2: Mix-First + M_t Outer Product + Decay + O(1) Read */
+const R2 = mkRng(11);
+const D2 = 8, K2 = [], V2 = [], M2 = [];
+for (let s = 0; s < 10; s++) {
+  K2.push(Array.from({length:D2}, () => Math.pow(R2(), 1.5)));
+  V2.push(Array.from({length:D2}, () => Math.pow(R2(), 1.5)));
+}
+const Q2 = Array.from({length:D2}, () => R2());
+{
+  let M = Array.from({length:D2}, () => Array(D2).fill(0));
+  for (let s = 0; s < 10; s++) {
+    M = M.map((r,i) => r.map((x,j) => 0.84*x + K2[s][i]*V2[s][j]));
+    M2.push(M);
+  }
+}
+const Y2 = M2[9].map(r => r.reduce((a, x, j) => a + x * Q2[j], 0));
+
+function drawVSA(c, p, _t, P) {
+  const ph = Math.min(3.999, p * 4);
+  const st = Math.floor(ph), f = ph - st;
+  const titles = [
+    "STAGE 01 · MIX-FIRST GQA UN-TYING (BEFORE ROPE)",
+    "STAGE 02 · OUTER-PRODUCT BINDING  k_t ⊗ v'_t",
+    "STAGE 03 · LEARNABLE MULTI-SCALE DECAY  M_t = γM + k⊗v",
+    "STAGE 04 · O(1) FUSED TRITON READOUT  y = ((1-γ)/√D) M q"
+  ];
+  txt(c, titles[st], 48, 46, 17, P.ember, "600", "left", true);
+
+  /* Top flow chips */
+  const chips = ["1. Mix-First", "2. Bind k⊗v", "3. Decay γ_h", "4. O(1) Read"];
+  chips.forEach((ch, idx) => {
+    const cx = 48 + idx * 220;
+    box(c, cx, 78, 204, 40, idx === st ? P.ember : P.panel, idx === st ? P.ember : P.border, 1.5, 6);
+    txt(c, ch, cx + 102, 98, 14, idx === st ? "#fff" : P.soft, "600", "center", true);
+  });
+
+  /* Center D x D matrix */
+  const sz = 44, gap = 4, gw = D2 * sz + (D2-1)*gap;
+  const mx0 = (VW - gw) * 0.5, my0 = 204;
+  box(c, mx0 - 12, my0 - 12, gw + 24, gw + 24, P.panel, P.border, 1.5, 8);
+
+  let M = M2[9], rev = 1, ti = 9;
+  if (st === 0) { M = M2[0]; rev = ease(f); ti = 0; }
+  else if (st === 1) { M = M2[1]; rev = f; ti = 1; }
+  else if (st === 2) {
+    const tf = f * 8, idx = Math.floor(tf), ff = ease(tf - idx);
+    M = M2[idx].map((r,i) => r.map((x,j) => lerp(x, M2[idx+1][i][j], ff)));
+    ti = idx + 1;
+  }
+
+  for (let i = 0; i < D2; i++) {
+    for (let j = 0; j < D2; j++) {
+      let v = M[i][j];
+      if (st === 1 && (i * D2 + j) >= rev * 64) v = 0;
+      if (st === 0) v *= rev;
+      box(c, mx0 + j*(sz+gap), my0 + i*(sz+gap), sz, sz, heat(v * 0.55, P), null, 0, 4);
+    }
+  }
+
+  /* Key vector k on left */
+  txt(c, "k_t", mx0 - 44, my0 - 24, 16, P.amber, "600", "center", true);
+  for (let i = 0; i < D2; i++) {
+    box(c, mx0 - 66, my0 + i*(sz+gap), sz, sz, heat(K2[ti][i]*1.3, P), P.border, 1, 4);
+  }
+  /* Value vector v on top */
+  txt(c, "v'_t", mx0 + gw + 36, my0 - 44, 16, P.sun, "600", "center", true);
+  for (let j = 0; j < D2; j++) {
+    box(c, mx0 + j*(sz+gap), my0 - 68, sz, sz, heat(V2[ti][j]*1.3, P), P.border, 1, 4);
+  }
+
+  /* Query q bottom & output y right when st == 3 */
+  if (st === 3) {
+    const qy = my0 + gw + 26, yx = mx0 + gw + 28;
+    const revY = clamp(f * 1.4) * D2;
+    txt(c, "q_t", mx0 - 44, qy + sz/2, 16, P.ember, "600", "center", true);
+    for (let j = 0; j < D2; j++) {
+      box(c, mx0 + j*(sz+gap), qy, sz, sz, heat(Q2[j], P), P.ember, 1.5, 4);
+    }
+    txt(c, "y_t", yx + sz/2, my0 - 24, 16, P.ok, "600", "center", true);
+    for (let i = 0; i < D2; i++) {
+      const a = clamp(revY - i);
+      box(c, yx, my0 + i*(sz+gap), sz, sz, a > 0.1 ? heat(Y2[i]/3.2, P) : P.cellOff, P.ok, a > 0.1 ? 1.5 : 1, 4);
+    }
+  } else {
+    txt(c, st === 0 ? "W_mix applied BEFORE RoPE -> H independent heads"
+         : st === 1 ? "Rank-1 outer product accumulates into 128×128 state"
+         : `Token ${ti+1}/10 · ∂L/∂γ_h learned per head · Fixed 128×128`,
+        480, 672, 16, P.soft, "500", "center", true);
+  }
+}
+
+/* SCENE 3: Centered Holographic Unbinding + Abelian Page-Slots */
+function drawCenter(c, p, _t, P) {
+  const ph = p < 0.35 ? 0 : (p < 0.68 ? 1 : 2);
+  txt(c, ph === 0 ? "01 · RAW LINEAR READOUT DRIFT IN LONG <think>"
+       : ph === 1 ? "02 · CENTERED HOLOGRAPHIC UNBINDING (RANK-1 CANCEL)"
+       : "03 · NON-DECAYING ABELIAN PAGE-SLOTS (NO-ROPE)",
+      48, 46, 17, P.ember, "600", "left", true);
+
+  /* Top equation/signal panel */
+  box(c, 48, 86, 864, 240, P.panel, P.border, 1.5, 8);
+  const bars = 24, bw = 26, bg = 8, bx0 = 84;
+  if (ph === 0) {
+    txt(c, "Raw M_t q_t = signal + mean-field syntax shadow", 84, 118, 15, P.soft, "500", "left", true);
+    for (let i = 0; i < bars; i++) {
+      const sig = (i === 5 || i === 14 || i === 19) ? 95 : 12;
+      const drift = 52 * (0.4 + 0.6 * ease(seg(p, 0, 0.35)));
+      const tot = sig + drift;
+      box(c, bx0 + i*(bw+bg), 300 - tot, bw, tot, i===5||i===14||i===19 ? P.amber : P.red, null, 0, 3);
+    }
+    txt(c, "Background floor drowns target peaks -> out_norm amplifies noise", 84, 312, 13, P.red, "500", "left", true);
+  } else {
+    const cancel = ph === 1 ? ease(seg(p, 0.35, 0.65)) : 1;
+    txt(c, "M_t q_t - c_t · ((k̄_t·q_t)/(z_t+ε)) · v̄_t  -> clean peaks", 84, 118, 15, P.ok, "600", "left", true);
+    for (let i = 0; i < bars; i++) {
+      const isPeak = (i === 5 || i === 14 || i === 19);
+      const sig = isPeak ? 115 : 8;
+      const drift = 52 * (1 - cancel);
+      const tot = sig + drift;
+      box(c, bx0 + i*(bw+bg), 300 - tot, bw, tot, isPeak ? P.ok : P.muted, null, 0, 3);
+    }
+    txt(c, "Centroid state (k̄, v̄, z) costs +1.5% RAM & stays 100% Abelian linear", 84, 312, 13, P.ok, "500", "left", true);
+  }
+
+  /* Bottom Page-Slots Grid */
+  box(c, 48, 356, 864, 316, P.panel, P.border, 1.5, 8);
+  txt(c, "ABELIAN PAGE-SLOTS (POSITION-FREE ACCUMULATORS C_t, U_t, Z_t)", 84, 390, 15, P.amber, "600", "left", true);
+  const cols = 8, rows = 4, sw = 90, sh = 42, sg = 8;
+  const sx0 = 84, sy0 = 420;
+  const activePages = ph === 2 ? [0, 2, 4, 6] : [0, 2];
+  for (let pg = 0; pg < cols; pg++) {
+    for (let sl = 0; sl < rows; sl++) {
+      const active = activePages.includes(pg);
+      const v = active ? (0.45 + 0.5 * ((pg*3 + sl*7) % 5) / 5) : 0.02;
+      box(c, sx0 + pg*(sw+sg), sy0 + sl*(sh+sg), sw, sh, active ? heat(v, P) : P.cellOff, P.border, 1, 4);
+    }
+    txt(c, "P" + pg, sx0 + pg*(sw+sg) + sw/2, sy0 + rows*(sh+sg) + 14, 13, activePages.includes(pg) ? P.ink : P.muted, "600", "center", true);
+  }
+  txt(c, ph === 2 ? "Salience w_t ≈ 0 on filler -> zero decay across 32,768+ filler tokens"
+       : "Anchor slots keep early numbers intact while M_t tracks local context",
+      480, 646, 14, P.soft, "500", "center", true);
+}
+
+/* SCENE 4: Hybrid Stack + Step-0 Fix + 2-Stage Healing */
+function drawHybrid(c, p, _t, P) {
+  txt(c, "04 · HYBRID INTERLEAVING & 2-STAGE HEALING (QWEN3-4B V2)", 48, 46, 17, P.ember, "600", "left", true);
+
+  /* Layer stack left */
+  box(c, 48, 86, 440, 586, P.panel, P.border, 1.5, 8);
+  txt(c, "36-LAYER ARCHITECTURE", 74, 118, 15, P.ink, "600", "left", true);
+  const nL = 18; /* visual 18 representative rows (L0..L35 paired) */
+  const reveal = Math.ceil(ease(clamp(p * 1.3)) * nL);
+  for (let i = 0; i < nL; i++) {
+    if (i >= reveal) break;
+    const li = i * 2;
+    const isSoft = (li === 0) || (li % 4 === 3) || (i === nL - 1);
+    const y = 626 - i * 27;
+    box(c, 74, y, 250, 20, isSoft ? P.ember : P.butter, P.border, 1, 4);
+    txt(c, `L${li}–L${li+1} ${isSoft ? "SOFTMAX ANCHOR" : "BOLT-VSA (SWA=256)"}`, 84, y + 10, 11, isSoft ? "#fff" : P.ink, "600", "left", true);
+    box(c, 336, y, 126, 20, isSoft ? P.red : P.ok, null, 0, 4);
+    txt(c, isSoft ? "Growing KV" : "Fixed State", 399, y + 10, 11, "#fff", "600", "center", true);
+  }
+
+  /* Right panel: Step-0 PPL fix & Healing Curve */
+  box(c, 512, 86, 400, 270, P.panel, P.border, 1.5, 8);
+  txt(c, "OUT_NORM INIT & STEP-0 PPL", 538, 118, 15, P.amber, "600", "left", true);
+  const fixT = ease(seg(p, 0.2, 0.65));
+  const ppl = lerp(443.76, 4.66, fixT);
+  txt(c, `out_norm = ${lerp(1.0, 0.05, fixT).toFixed(2)}`, 538, 170, 18, P.soft, "500", "left", true);
+  txt(c, `Step-0 PPL: ${ppl.toFixed(2)}`, 538, 224, 30, ppl < 15 ? P.ok : P.red, "600", "left", true);
+  txt(c, ppl < 15 ? "Prevents 780× early-layer noise blowup" : "Unit RMSNorm blows up tiny early y_vsa", 538, 282, 13, P.soft, "400", "left", false);
+  box(c, 538, 310, 348, 18, P.cellOff, P.border, 1, 4);
+  box(c, 538, 310, Math.max(18, 348 * (1 - fixT * 0.92)), 18, ppl < 15 ? P.ok : P.red, null, 0, 4);
+
+  box(c, 512, 380, 400, 292, P.panel, P.border, 1.5, 8);
+  txt(c, "STAGE-1 + STAGE-2 (T=2048)", 538, 412, 15, P.amber, "600", "left", true);
+  const s2 = ease(seg(p, 0.45, 0.98));
+  const kl = lerp(0.41, 0.076, s2);
+  const top1 = lerp(79.6, 91.5, s2);
+  txt(c, `KL vs Donor:  ${kl.toFixed(3)} nats`, 538, 470, 18, P.ink, "600", "left", true);
+  txt(c, `Top-1 Match:  ${top1.toFixed(1)}%`, 538, 512, 18, P.ok, "600", "left", true);
+  txt(c, `Val PPL:      0.981× Donor`, 538, 554, 18, P.sun, "600", "left", true);
+  txt(c, "Unfrozen MLPs + SWA=256 + Centered Unbind", 538, 618, 13, P.soft, "400", "left", false);
+}
+
+/* SCENE 5: .vsa Cartridges + Exact Forget + StreamKV */
+const RF = mkRng(42);
+const FB = Array.from({length:64}, () => 0.1 + 0.35 * RF());
+const FD = Array.from({length:64}, () => RF() > 0.5 ? 0.55 + 0.35 * RF() : 0);
+
+function drawForget(c, p, _t, P) {
+  const add = ease(seg(p, 0.04, 0.32));
+  const rem = ease(seg(p, 0.55, 0.88));
+  const a = add * (1 - rem);
+
+  txt(c, p < 0.36 ? "01 · MOUNT .VSA CARTRIDGE ONTO M_t + CENTROIDS"
+       : p < 0.60 ? "02 · ROUTE (<75 MS) & ANSWER (100% RECALL)"
+       : "03 · ALGEBRAIC UNMOUNT (0.00e+00 RESIDUAL)",
+      48, 46, 17, p < 0.60 ? P.ember : P.ok, "600", "left", true);
+
+  /* Matrix grid on left */
+  const sz = 44, gap = 4, gw = 8*sz + 7*gap;
+  box(c, 58, 114, gw + 24, gw + 24, P.panel, P.border, 1.5, 8);
+  for (let i = 0; i < 8; i++) {
+    for (let j = 0; j < 8; j++) {
+      const k = i * 8 + j;
+      box(c, 70 + j*(sz+gap), 126 + i*(sz+gap), sz, sz, heat(FB[k] + a * FD[k], P), null, 0, 4);
+    }
+  }
+  txt(c, "Live State M_t (8×8 slice)", 260, 540, 14, P.soft, "500", "center", true);
+
+  /* Right algebraic ops & StreamKV box */
+  box(c, 494, 114, 418, 250, P.panel, P.border, 1.5, 8);
+  txt(c, "ALGEBRAIC CARTRIDGE LOG", 520, 148, 14, P.amber, "600", "left", true);
+  txt(c, "orion.vsa (0 MB idle on SSD)", 520, 192, 15, P.ink, "500", "left", true);
+  txt(c, `Mount weight : ${(a*100).toFixed(0)}%`, 520, 232, 16, a > 0.1 ? P.ember : P.muted, "600", "left", true);
+  txt(c, `Erase err    : ${rem > 0.9 ? "0.00e+00" : (rem > 0 ? "erasing..." : "mounted")}`, 520, 272, 16, rem > 0.9 ? P.ok : P.soft, "600", "left", true);
+  txt(c, "M_t <- M_t - γ^Δt · ΔM_doc", 520, 324, 14, P.sun, "500", "left", true);
+
+  box(c, 494, 386, 418, 210, P.panel, P.border, 1.5, 8);
+  txt(c, "STREAMKV INFINITE MODE", 520, 420, 14, P.ok, "600", "left", true);
+  txt(c, "4 float64 Sinks + 8,192 Ring", 520, 464, 15, P.ink, "500", "left", false);
+  txt(c, "1.5B RAM : 73.1 MB flat forever", 520, 502, 15, P.ok, "600", "left", true);
+  txt(c, "Speed    : 125.6 tok/s (+0.0 MB growth)", 520, 538, 14, P.soft, "500", "left", true);
+}
+
+/* Resolution-Invariant Smooth Scrollytelling Engine (NO discrete snap jump!) */
+const SCENES = { kv: drawKV, vsa: drawVSA, center: drawCenter, hybrid: drawHybrid, forget: drawForget };
+const scrollers = $$(".scrolly-section").map(sec => {
+  const boxEl = $(".story-graphic", sec);
+  const cv = $("canvas", boxEl);
+  const steps = $$(".story-step", sec);
+  return { sec, boxEl, cv, ctx: cv.getContext("2d"), steps, draw: SCENES[sec.dataset.scene], p: 0, w: 0, h: 0, activeIdx: -1 };
+});
+
+function resizeCanvas(s) {
+  const rect = s.boxEl.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  s.w = rect.width;
+  s.h = rect.height;
+  s.cv.width = Math.round(s.w * dpr);
+  s.cv.height = Math.round(s.h * dpr);
+  s.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  s.ctx.imageSmoothingEnabled = true;
+}
+
+const ro = new ResizeObserver(entries => {
+  for (const en of entries) {
+    const s = scrollers.find(x => x.boxEl === en.target);
+    if (s) resizeCanvas(s);
+  }
+});
+scrollers.forEach(s => { ro.observe(s.boxEl); resizeCanvas(s); });
+
+function computeSmoothProgress(s) {
+  const vh = window.innerHeight || 800;
+  const center = vh * 0.5;
+  const firstR = s.steps[0].getBoundingClientRect();
+  const lastR = s.steps[s.steps.length - 1].getBoundingClientRect();
+  const startY = firstR.top + firstR.height * 0.5;
+  const endY = lastR.top + lastR.height * 0.5;
+  const span = endY - startY;
+  if (span <= 1) return 0;
+  return clamp((center - startY) / span, 0, 1);
+}
+
+const progressBar = $("#scroll-progress");
+let lastT = performance.now();
+
+function tick(now) {
+  const dt = Math.min(0.05, Math.max(0.001, (now - lastT) / 1000));
+  lastT = now;
+  const alpha = 1 - Math.exp(-dt * 11.0);
+  const vh = window.innerHeight || 800;
+  const P = pal();
+
+  for (const s of scrollers) {
+    if (s.w === 0 || s.h === 0) resizeCanvas(s);
+    const r = s.sec.getBoundingClientRect();
+    if (r.bottom < -220 || r.top > vh + 220) {
+      if (r.bottom < 0) s.p = 1;
+      else if (r.top > vh) s.p = 0;
+      continue;
+    }
+
+    const targetP = computeSmoothProgress(s);
+    s.p += (targetP - s.p) * alpha;
+    if (Math.abs(targetP - s.p) < 0.0004) s.p = targetP;
+
+    /* Highlight closest step purely visually — NEVER perturbs s.p */
+    const center = vh * 0.5;
+    let best = 0, minD = Infinity;
+    s.steps.forEach((el, idx) => {
+      const sr = el.getBoundingClientRect();
+      const d = Math.abs((sr.top + sr.height * 0.5) - center);
+      if (d < minD) { minD = d; best = idx; }
+    });
+    if (best !== s.activeIdx) {
+      s.activeIdx = best;
+      s.steps.forEach((el, idx) => el.classList.toggle("active", idx === best));
+    }
+
+    if (s.w > 0 && s.h > 0) {
+      const c = s.ctx;
+      c.clearRect(0, 0, s.w, s.h);
+      c.fillStyle = P.bg;
+      c.fillRect(0, 0, s.w, s.h);
+
+      /* Uniform 960 x 720 Virtual Stage */
+      const scale = Math.min(s.w / VW, s.h / VH);
+      const ox = (s.w - VW * scale) * 0.5;
+      const oy = (s.h - VH * scale) * 0.5;
+      c.save();
+      c.translate(ox, oy);
+      c.scale(scale, scale);
+      s.draw(c, s.p, now, P);
+      c.restore();
+    }
+  }
+
+  const maxScroll = document.documentElement.scrollHeight - vh;
+  if (maxScroll > 0) progressBar.style.width = ((window.scrollY / maxScroll) * 100).toFixed(2) + "%";
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+/* Interactive Architecture Explorer */
+const ARCH_DATA = {
+  qwen3: {
+    layers: 36, pinEndpoints: true, every: 4, dim: 2560, heads: 32, kvHeads: 8, headDim: 128, swa: 256,
+    slots: "8 per KV head (64 total)", centering: true,
+    summary: "26 Bolt-VSA + 10 Softmax (L0 pinned + every 4th) · SWA=256 · Centered Unbinding"
+  },
+  deepseek: {
+    layers: 28, pinEndpoints: false, every: 4, dim: 1536, heads: 12, kvHeads: 2, headDim: 128, swa: 64,
+    slots: "32 per KV head (8 pages × 4 slots)", centering: false,
+    summary: "21 Bolt-VSA + 7 Softmax (every 4th) · SWA=64 · Mix-First RoPE + Page-Slots"
+  }
+};
+const STAGES = [
+  {
+    title: "01 · QK-Normalized Projections & RoPE",
+    eq: "q_raw = RMSNorm_q(W_q x),   k_raw = RMSNorm_k(W_k x),   v_raw = W_v x\nq_rope = RoPE_t(q_raw),      k_rope = RoPE_t(k_raw)",
+    desc: "Preserves exact donor QK-Norm weights (critical on Qwen3) and applies RoPE for local sliding-window attention while passing raw projections to position-free Page-Slots.",
+    meta: ["q (B,H,T,128)", "k,v (B,HKV,T,128)", "Donor weights preserved"]
+  },
+  {
+    title: "02 · Mix-First GQA Un-Tying & Feature Sharpening",
+    eq: "k~_(t,h) = RoPE_t(repeat_kv(k_raw)_h W^mix_k) + Conv1D_4(k~)\nv'_(t,h) = repeat_kv(v_raw)_h W^mix_v\nq = √D · φ(q)/||φ(q)||_2,   k = φ(k~)/||φ(k~)||_2,   φ(z) = z + α·ReLU(z)",
+    desc: "Un-ties shared GQA heads before RoPE so every query head gets an independent D×D state matrix with zero phase drift past training context.",
+    meta: ["4-tap causal k_conv", "Learnable φ ReLU gate", "Shift-invariant RoPE"]
+  },
+  {
+    title: "03 · Decayed Outer-Product State + Centered Holographic Unbinding",
+    eq: "M_t = γ_h M_(t-1) + k_t ⊗ v'_t,   k̄_t = γ_h k̄_(t-1) + k_t,   v̄_t = γ_h v̄_(t-1) + v'_t,   z_t = γ_h z_(t-1) + 1\ny_clean = ((1 - γ_h)/√D) · [ M_t q_t - tanh(W_c x_t) · ((k̄_t · q_t)/(z_t + ε)) · v̄_t ]",
+    desc: "Tracks O(D) running centroids (+1.5% RAM) to subtract rank-1 background interference before RMSNorm—sharpening multi-step <think> retrieval while preserving exact Abelian additivity.",
+    meta: ["Stacked-matmul scan", "Fused inside Triton step", "0.00e+00 forget()"]
+  },
+  {
+    title: "04 · Abelian Page-Slot Bank (No-RoPE Non-Decaying Slots)",
+    eq: "w_(t,m) = softmax_m(r_t) · σ(r_(t,m))\nC_t = C_(t-1) + w_t k^raw_t,   U_t = U_(t-1) + w_t v_raw_t,   Z_t = Z_(t-1) + w_t\ny_slot = Softmax(√D · q^raw_t (C_t / Z_t)^T) · (U_t / Z_t)",
+    desc: "Non-decaying position-free slots hold early prompt numbers and definitions across 32,768+ filler tokens with 100% block-cumsum / step parity.",
+    meta: ["Zero RoPE attenuation", "Zero filler decay", "Surgical erase_page(p)"]
+  },
+  {
+    title: "05 · Local Sliding Window + Sink Re-Rotation",
+    eq: "mask(i, j) = (i - j >= 0) ∧ ((i - j < W) ∨ (j == 0))\npos > max_T ⇒ sink key re-rotated by Δ = pos + 1 - max_T (float64)",
+    desc: "Captures local syntax, docstrings, and multi-line arithmetic steps with exact Softmax (W=256 on Qwen3-4B v2; W=64 on DeepSeek-1.5B) while capping sink distance at max_T.",
+    meta: ["Constant O(1) KV buffer", "W=256 on Qwen3-4B v2", "Float64 sink stability"]
+  },
+  {
+    title: "06 · RMSNorm, Direct Bypass & Gated Blend",
+    eq: "y_vsa = RMSNorm_out(y_clean) + s_h v'_t + 2σ(q_t^T g_loc) · Conv1D_8(v')_t\ny_t = ((1 - a_h) y_vsa + a_h y_swa + tanh(g_slot) y_slot) ⊙ 2σ(W_g x_t)",
+    desc: "out_norm initialized to 0.05 (fixing Step-0 PPL from 443.76 -> 4.66), blended smoothly with local SWA and Page-Slot readouts before output projection.",
+    meta: ["8-tap causal v_conv", "out_norm.eps exact in Triton", "O_proj output projection"]
+  }
+];
+
+let curArch = "qwen3", curLayer = 1;
+function isSoftmax(spec, li) {
+  if (spec.pinEndpoints && (li === 0 || li === spec.layers - 1)) return true;
+  return spec.every > 0 && ((li + 1) % spec.every === 0);
+}
+function renderArch() {
+  const spec = ARCH_DATA[curArch];
+  $("#arch-summary-pill").textContent = spec.summary;
+  const grid = $("#stack-grid");
+  grid.innerHTML = "";
+  for (let i = 0; i < spec.layers; i++) {
+    const soft = isSoftmax(spec, i), pin = spec.pinEndpoints && (i === 0 || i === spec.layers - 1);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "layer-cell " + (pin ? "pin" : (soft ? "soft" : "vsa")) + (i === curLayer ? " selected" : "");
+    btn.textContent = "L" + i;
+    btn.onclick = () => { curLayer = i; renderArch(); };
+    grid.appendChild(btn);
+  }
+  if (curLayer >= spec.layers) curLayer = 0;
+  const soft = isSoftmax(spec, curLayer), pin = spec.pinEndpoints && (curLayer === 0 || curLayer === spec.layers - 1);
+  const insp = $("#layer-inspector");
+  if (soft) {
+    insp.innerHTML = `
+      <div style="font-family:var(--mono);font-size:12px;color:var(--ember);margin-bottom:4px">LAYER L${curLayer} · ${pin ? "PINNED ENDPOINT SOFTMAX" : "SOFTMAX ANCHOR LAYER"}</div>
+      <div style="font-size:14px">Standard GQA causal Softmax (${spec.heads}Q / ${spec.kvHeads}KV, D=${spec.headDim}). Supports full KV or constant-RAM <code>StreamKV</code> (4 sinks + 8,192 window).</div>
+      <div style="font-family:var(--mono);font-size:12px;color:var(--ink-soft);margin-top:8px">KV growth: ${((2*spec.kvHeads*spec.headDim*2)/1024).toFixed(1)} KB/tok (bf16)</div>`;
+  } else {
+    const mBytes = spec.heads * spec.headDim * spec.headDim * 4;
+    const swaBytes = 2 * (spec.swa + 1) * spec.kvHeads * spec.headDim * 2;
+    insp.innerHTML = `
+      <div style="font-family:var(--mono);font-size:12px;color:var(--ember);margin-bottom:4px">LAYER L${curLayer} · BOLT-VSA FIXED-STATE LAYER</div>
+      <div style="font-size:14px">${spec.heads} × ${spec.headDim}×${spec.headDim} outer-product states, SWA W=${spec.swa}+sink, Page-Slots (${spec.slots})${spec.centering ? ", Centered Holographic Unbinding" : ""}.</div>
+      <div style="font-family:var(--mono);font-size:12px;color:var(--ink-soft);margin-top:8px">Fixed state RAM forever: ${((mBytes + swaBytes)/1048576).toFixed(2)} MB (0 B/tok growth)</div>`;
+  }
+}
+$$("[data-arch]").forEach(btn => btn.addEventListener("click", () => {
+  $$("[data-arch]").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  curArch = btn.dataset.arch; curLayer = 1; renderArch();
+}));
+
+function renderStage(idx) {
+  const s = STAGES[idx];
+  $("#stage-detail").innerHTML = `
+    <div style="font-size:16px;font-weight:500;color:#FFFAEB">${s.title}</div>
+    <div class="eq-box">${s.eq.replace(/\n/g,"<br>")}</div>
+    <p style="font-size:13.5px;color:#D6CDB8;line-height:1.55">${s.desc}</p>
+    <div class="detail-meta" style="margin-top:10px">${s.meta.map(m => `<span>▪ ${m}</span>`).join("")}</div>`;
+}
+$$("[data-stage]").forEach(btn => btn.addEventListener("click", () => {
+  $$("[data-stage]").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  renderStage(Number(btn.dataset.stage));
+}));
+
+/* Benchmark & Code Tabs */
+$$("[data-bench]").forEach(btn => btn.addEventListener("click", () => {
+  $$("[data-bench]").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  const t = btn.dataset.bench;
+  $("#bench-qwen3").style.display = t === "qwen3" ? "block" : "none";
+  $("#bench-deepseek").style.display = t === "deepseek" ? "block" : "none";
+}));
+
+const CODE_SNIPPETS = {
+  install: `<span class="c"># Clone toolkit &amp; verify all Triton kernels + parity gates</span>
+git clone https://github.com/Rikka3/vsa-lm.git
+cd vsa-lm
+pip install -r requirements.txt huggingface_hub transformers
+python -m vsa_lm test`,
+  convert: `<span class="c"># 1. Convert donor using declarative family spec (SWA=256, Centered Unbinding, pin_endpoints)</span>
+python -m vsa_lm convert --donor Qwen/Qwen3-4B --out qwen3_4b_init.pth
+
+<span class="c"># 2. Heal with Stage-1 Attention Transfer + Stage-2 KD</span>
+python -m vsa_lm heal --ckpt qwen3_4b_init.pth --donor Qwen/Qwen3-4B --out-prefix qwen3_4b --tokens 24000000 --lr 6e-5 --kd 1.0 --highspeed
+
+<span class="c"># 3. Benchmark against official Hugging Face donor (paired McNemar)</span>
+python -m vsa_lm benchmark --ckpt qwen3_4b_latest.pth`,
+  infer: `import torch
+from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
+from vsa_lm.converter import UniversalVSALM
+from vsa_lm.decode import VSARecurrentDecoder
+from vsa_lm.server import get_all_eos_ids
+
+ckpt = hf_hub_download(repo_id="rikkathree/vsa-qwen3-4b", filename="vsa_qwen3_4b_v2.pth")
+ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+model = UniversalVSALM(**ck["config"]).cuda().to(torch.bfloat16).eval()
+model.load_state_dict(ck["model"], strict=False)
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")
+dec = VSARecurrentDecoder(model, stream_window=8192)  <span class="c"># constant-RAM streaming</span>
+prompt = tok.apply_chat_template([{"role": "user", "content": "Write is_prime(n) in Python."}], tokenize=False, add_generation_prompt=True)
+ids = torch.tensor([tok.encode(prompt, add_special_tokens=False)], device="cuda")
+out = dec.generate(ids, max_new_tokens=1024, temperature=0.6, top_p=0.95, eos_ids=get_all_eos_ids(tok))
+print(tok.decode(out[0, ids.shape[1]:].tolist(), skip_special_tokens=True))`,
+  cartridge: `from vsa_lm.memory_bank import VSAMemoryBank
+
+bank = VSAMemoryBank(model, tok, bank_dir="./my_vsa_cartridges")
+bank.memorize_to_disk("orion", "Launch code for Project Orion is TITAN-OMEGA-942.")
+bank.memorize_to_disk("hemlock", "Protocol Hemlock synthesis temperature is 347 Kelvin.")
+
+res = bank.ask("What is launch code for Project Orion?")
+print(res["cartridge"], res["answer"], res["erase_residual"])  <span class="c"># orion, TITAN-OMEGA-942, 0.0</span>
+bank.forget_from_disk("orion")`
+};
+function renderCode(k) { $("#code-display").innerHTML = CODE_SNIPPETS[k]; }
+$$("[data-code]").forEach(btn => btn.addEventListener("click", () => {
+  $$("[data-code]").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  renderCode(btn.dataset.code);
+}));
+$("#copy-btn").addEventListener("click", async () => {
+  const raw = $("#code-display").textContent;
+  try { await navigator.clipboard.writeText(raw); $("#copy-btn").textContent = "Copied"; setTimeout(() => $("#copy-btn").textContent = "Copy", 1400); } catch {}
+});
+
+renderArch();
+renderStage(0);
+renderCode("install");
+</script>
+</body>
+</html>
