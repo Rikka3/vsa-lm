@@ -238,9 +238,9 @@ class Bolt3Attn(nn.Module):
             if ak is not None:
                 ak_eff = _apply_rope_pos(ak.view(b, self.HKV, self.S, self.HD), pm.view(b, self.HKV, self.S), inv_freq)
                 s_att = torch.matmul(qc_p.float(), repeat_kv(ak_eff, self.G).float().transpose(-1, -2)) * scale
-                kap = self.kappa.float().view(1, self.HKV, 1, 1, 1)
-                m_bias = repeat_kv((kap * torch.log(mass.view(b, self.HKV, 1, self.S).clamp_min(1.0))).squeeze(2).unsqueeze(-1), self.G).squeeze(-1).unsqueeze(2)
-                act_m = repeat_kv(act.view(b, self.HKV, self.S, 1), self.G).squeeze(-1).unsqueeze(2)
+                kap = self.kappa.float().view(1, self.HKV, 1, 1)
+                m_bias = repeat_kv(kap * torch.log(mass.view(b, self.HKV, 1, self.S).clamp_min(1.0)), self.G)
+                act_m = repeat_kv(act.view(b, self.HKV, 1, self.S), self.G)
                 s_att = (s_att + m_bias).masked_fill(~act_m, float("-inf"))
                 sp.append(s_att)
                 vp.append(repeat_kv(av.view(b, self.HKV, self.S, self.HD), self.G))
@@ -384,9 +384,9 @@ class Bolt3Decoder:
                     if sc["ak"] is not None:
                         ak_eff = _apply_rope_pos(sc["ak"].view(b, ly.HKV, ly.S, ly.HD), sc["pm"].view(b, ly.HKV, ly.S), inv_freq)
                         s_att = torch.matmul(q_p.float(), repeat_kv(ak_eff, ly.G).float().transpose(-1, -2)) * scale
-                        kap = ly.kappa.float().view(1, ly.HKV, 1, 1, 1)
-                        mb = repeat_kv((kap * torch.log(sc["mass"].view(b, ly.HKV, 1, ly.S).clamp_min(1.0))).squeeze(2).unsqueeze(-1), ly.G).squeeze(-1).unsqueeze(2)
-                        am = repeat_kv(sc["act"].view(b, ly.HKV, ly.S, 1), ly.G).squeeze(-1).unsqueeze(2)
+                        kap = ly.kappa.float().view(1, ly.HKV, 1, 1)
+                        mb = repeat_kv(kap * torch.log(sc["mass"].view(b, ly.HKV, 1, ly.S).clamp_min(1.0)), ly.G)
+                        am = repeat_kv(sc["act"].view(b, ly.HKV, 1, ly.S), ly.G)
                         s_att = (s_att + mb).masked_fill(~am, float("-inf"))
                         sp.append(s_att)
                         vp.append(repeat_kv(sc["av"].view(b, ly.HKV, ly.S, ly.HD), ly.G))
