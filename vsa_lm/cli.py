@@ -119,6 +119,7 @@ def main(argv: list[str] | None = None):
     p_conv.add_argument("--gamma-cap", type=float, default=0.992, help="Max initial decay horizon (default: 0.992)")
     p_conv.add_argument("--hf-token", default=None, help="Optional HuggingFace token for gated models")
     p_conv.add_argument("--swa-window", type=int, default=None, help="Sliding-window softmax tokens inside each VSA layer (0 = off)")
+    p_conv.add_argument("--bolt3", action="store_true", help="Convert using Bolt-3 Dual-Field Attractor + Evict-to-Delta")
 
     sub.add_parser("heal", help="Run memory-optimal anchored healing on any converted VSA checkpoint")
 
@@ -200,6 +201,7 @@ def main(argv: list[str] | None = None):
             args.donor, args.out, hybrid_every=args.hybrid_every,
             max_T=args.max_T, gamma_cap=args.gamma_cap, hf_token=args.hf_token,
             swa_window=args.swa_window,
+            bolt3=args.bolt3,
         )
     elif args.cmd == "train":
         from .train import main as train_main

@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from .config.bolt3 import Bolt3Decoder
 from .decode import VSARecurrentDecoder, StaticKV
 from .server import get_all_eos_ids
 
@@ -15,7 +16,7 @@ class VSAMemoryBank:
         self.model = model.eval()
         self.tokenizer = tokenizer
         self.device = next(model.parameters()).device
-        self.decoder = VSARecurrentDecoder(self.model, wrap_positions=False)
+        self.decoder = Bolt3Decoder(self.model) if getattr(self.model, "config", {}).get("is_bolt3", False) else VSARecurrentDecoder(self.model, wrap_positions=False)
         self.bank_dir = Path(bank_dir)
         self.bank_dir.mkdir(parents=True, exist_ok=True)
         self.index: dict[str, torch.Tensor] = {}

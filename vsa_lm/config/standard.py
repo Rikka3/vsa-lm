@@ -9,6 +9,7 @@ import torch.utils.checkpoint
 
 from ..surgery import LlamaRMSNorm, LlamaRoPE, LlamaMLP, repeat_kv, _vsa_apply
 from .inspector import compute_layer_types
+from .bolt3 import Bolt3Attn
 from .qwen35 import Qwen35ZeroCenteredRMSNorm, Qwen35PartialRoPE, Qwen35VSAAttn
 
 
@@ -344,6 +345,8 @@ class UniversalBlock(nn.Module):
         self.norm1 = norm_cls(cfg["dim"], cfg["eps"])
         if attn_type == "gated_deltanet":
             self.vsa = Qwen35VSAAttn(cfg, max_T, chunk_size, mode="gated_deltanet")
+        elif attn_type == "vsa" and cfg.get("is_bolt3", False):
+            self.vsa = Bolt3Attn(cfg, max_T=max_T, S=int(cfg.get("bolt3_S", 128)), C=int(cfg.get("bolt3_C", 128)))
         elif attn_type == "vsa":
             if cfg.get("has_qwen35_lin", False) and not cfg.get("donor_layer_types"):
                 self.vsa = Qwen35VSAAttn(cfg, max_T, chunk_size, mode="vsa")

@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 
 from .converter import UniversalVSALM, fetch_any_donor, _purge_zombie_vram
+from .config.bolt3 import Bolt3Decoder
 from .decode import GraphKV, VSARecurrentDecoder, StaticKV
 from .memory_bank import VSAMemoryBank
 from .server import get_all_eos_ids
@@ -89,7 +90,8 @@ def _load_student(ckpt_path: str, donor_override: str | None, device: torch.devi
     del ck
 
     fp32_keys = ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate",
-                 "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "out_norm", "swa_mix", "slot_gate", "center_proj")
+                 "q_relu_mix", "k_relu_mix", "rope_mix", "A_log", "dt_bias", "out_norm", "swa_mix", "slot_gate", "center_proj",
+                 "kappa", "beta_proj", "eta_proj", "res_norm")
     for n, p in stu.named_parameters():
         if any(k in n for k in fp32_keys):
             p.data = p.data.to(device, dtype=torch.float32)
@@ -368,7 +370,7 @@ def _eval_model(model, is_hf: bool, tok, device: torch.device, limit: int = 200,
                 cached: dict | None = None, on_save=None, gsm_max_new: int = 2048) -> dict:
     out = dict(cached) if cached else {}
     eos_ids = get_all_eos_ids(tok)
-    dec = VSARecurrentDecoder(model, wrap_positions=False, max_cache_pos=16384) if not is_hf else None
+    dec = (Bolt3Decoder(model, max_cache_pos=16384) if model.config.get("is_bolt3", False) else VSARecurrentDecoder(model, wrap_positions=False, max_cache_pos=16384)) if not is_hf else None
     _ACTIVE_ENGINE["name"] = "Donor" if is_hf else "VSA-LM"
     log_dir = os.path.join(os.getcwd(), "inspect_logs", "donor" if is_hf else "vsa_lm")
     os.makedirs(log_dir, exist_ok=True)
@@ -665,7 +667,7 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
     gen_steps = 32
     ctx_lengths = (2048, 8192, 16384, 32768, 65536)
     scaling = []
-    dec_stu = VSARecurrentDecoder(stu, wrap_positions=False, max_cache_pos=70000)
+    dec_stu = Bolt3Decoder(stu, max_cache_pos=70000) if cfg.get("is_bolt3", False) else VSARecurrentDecoder(stu, wrap_positions=False, max_cache_pos=70000)
 
     for T_c in ctx_lengths:
         nxt_tok = torch.tensor([[100]], device=device, dtype=torch.long)

@@ -14,6 +14,7 @@ from .qwen35 import (
     preserve_visual_tower,
     reattach_visual_tower,
 )
+from .bolt3 import Bolt3Attn, Bolt3Decoder
 from .standard import (
     UniversalSoftmaxAttn,
     UniversalVSAAttn,
@@ -39,4 +40,6 @@ __all__ = [
     "UniversalVSAAttn",
     "UniversalBlock",
     "UniversalVSALM",
+    "Bolt3Attn",
+    "Bolt3Decoder",
 ]

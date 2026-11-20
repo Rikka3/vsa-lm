@@ -68,6 +68,7 @@ def convert_donor_model(
     swa_window: int | None = None,
     pin_endpoints: bool | None = None,
     center_unbinding: bool | None = None,
+    bolt3: bool = False,
 ) -> str:
     t0 = time.perf_counter()
     donor_dir = fetch_any_donor(donor_id_or_dir, hf_token=hf_token)
@@ -93,6 +94,13 @@ def convert_donor_model(
     cfg["vsa_num_slots"] = max(8, 64 // max(1, int(cfg.get("vsa_num_kv_heads", 2))))
     cfg["vsa_num_pages"] = 8
     cfg["vsa_mix_before_rope"] = True
+    if bolt3:
+        L_c = int(cfg["num_layers"])
+        anchors = {12, 16, 20, 24, 28, 32} if L_c == 36 else set(range(max(1, L_c // 3), max(2, L_c - 2), max(1, (L_c - 2) // 6)))
+        cfg["layer_types"] = ["softmax" if li in anchors else "vsa" for li in range(L_c)]
+        cfg["is_bolt3"] = True
+        cfg["bolt3_S"] = 128
+        cfg["bolt3_C"] = 128
     if n_vis > 0:
         cfg["visual_sidecar_path"] = vis_path
         cfg["visual_tensors_count"] = n_vis
@@ -125,7 +133,7 @@ def convert_donor_model(
     lg_init = torch.log(sig / (1.0 - sig)).float()
 
     for li, ltype in enumerate(layer_types):
-        if ltype != "vsa":
+        if bolt3 or ltype != "vsa":
             continue
         p = f"blocks.{li}.vsa"
         sd[f"{p}.log_gamma"] = lg_init.clone()
@@ -154,7 +162,7 @@ def convert_donor_model(
             sd.setdefault(f"{p}.q_norm.weight", stu.blocks[li].vsa.q_norm.weight.detach().to(dtype).clone())
             sd.setdefault(f"{p}.k_norm.weight", stu.blocks[li].vsa.k_norm.weight.detach().to(dtype).clone())
 
-    stu.load_state_dict(sd, strict=True)
+    stu.load_state_dict(sd, strict=(not bolt3))
     n_params = sum(p.numel() for p in stu.parameters())
     tmp = out_ckpt + ".tmp"
     torch.save({
@@ -561,7 +569,8 @@ def _stage1_layerwise_attention_transfer(stu, donor, is_hf_donor: bool, train_to
 
 # Parameters kept in fp32 everywhere (saved checkpoints, benchmark/server loaders).
 _FP32_KEYS = ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "local_q_gate",
-              "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix", "slot_gate", "center_proj")
+              "q_relu_mix", "k_relu_mix", "out_norm", "swa_mix", "slot_gate", "center_proj",
+              "kappa", "beta_proj", "eta_proj", "res_norm")
 
 
 def _load_student_ckpt(path: str, swa_window: int | None = None):
@@ -594,7 +603,7 @@ def _setup_trainable(stu, stu_cfg: dict, device: torch.device, freeze_mlp: bool 
         if any(k in n_ for k in ("v_conv", "k_conv", "local_q_gate", "q_relu_mix", "k_relu_mix", "rope_mix")):
             p_.requires_grad_(True)
             vsa_conv.append(p_)
-        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm", "swa_mix", "slot_gate", "center_proj")):
+        elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm", "swa_mix", "slot_gate", "center_proj", "kappa", "beta_proj", "eta_proj", "res_norm")):
             p_.requires_grad_(True)
             vsa_core.append(p_)
         elif ".vsa." in n_ and is_vsa_blk:
