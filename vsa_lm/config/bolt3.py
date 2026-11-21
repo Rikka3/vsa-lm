@@ -68,6 +68,7 @@ class Bolt3Attn(nn.Module):
     def _consolidate_functional(
         self, ak, av, mass, util, pm, act, m_res,
         k_raw, k_rope, v_old, pos_old, beta_old, inv_freq, diag_eye, gam,
+        n_filled: int = 0,
     ):
         b, hkv, l_tok, hd = k_raw.shape
         bh = b * hkv
@@ -88,94 +89,89 @@ class Bolt3Attn(nn.Module):
             pm = torch.zeros(bh, self.S, device=dev, dtype=torch.float32)
             act = torch.zeros(bh, self.S, device=dev, dtype=torch.bool)
             m_res = torch.zeros(bh, hd, hd, device=dev, dtype=torch.float32)
+            n_filled = 0
 
         util = util * self.gamma_u
 
-        if bool(act.all()):
+        if n_filled >= self.S:
             k_read = _apply_rope_pos(ak.view(b, hkv, self.S, hd), pm.view(b, hkv, self.S), inv_freq).view(bh, self.S, hd)
             kap = self.kappa.float().repeat(b).view(bh, 1, 1)
             with torch.no_grad():
-                sc = torch.bmm(kp_f.float(), k_read.float().transpose(-1, -2)) * scale + kap * torch.log(mass.clamp_min(1.0)).unsqueeze(1)
-                v_hat = torch.bmm(F.softmax(sc, dim=-1), av.float())
-                rel_err = (v_f.float() - v_hat).norm(dim=-1) / (v_f.float().norm(dim=-1) + 1e-6)
+                sc = torch.bmm(kp_f, k_read.transpose(-1, -2)).float() * scale + kap * torch.log(mass.clamp_min(1.0)).unsqueeze(1)
+                v_hat = torch.bmm(F.softmax(sc, dim=-1).to(dt), av).float()
+                v_f32 = v_f.float()
+                rel_err = (v_f32 - v_hat).norm(dim=-1) / (v_f32.norm(dim=-1) + 1e-6)
                 ak_n = F.normalize(ak.float(), dim=-1)
                 cos_k = torch.bmm(F.normalize(kr_f.float(), dim=-1), ak_n.transpose(-1, -2))
                 best_sim_k, best_slot = cos_k.max(dim=-1)
                 matched_av = torch.gather(av.float(), 1, best_slot.unsqueeze(-1).expand(-1, -1, hd))
-                sim_v = F.cosine_similarity(v_f.float(), matched_av, dim=-1)
+                sim_v = F.cosine_similarity(v_f32, matched_av, dim=-1)
                 score_j = rel_err * (1.0 - best_sim_k.clamp(0.0, 1.0))
                 merge_mask = (best_sim_k >= self.sim_k) & (sim_v >= self.sim_v)
 
-            if bool(merge_mask.any()):
-                m_oh = F.one_hot(best_slot, num_classes=self.S).float() * merge_mask.float().unsqueeze(-1)
-                slot_cnt = m_oh.sum(dim=1)
-                k_sum = torch.bmm(m_oh.transpose(1, 2), kr_f.float())
-                v_sum = torch.bmm(m_oh.transpose(1, 2), v_f.float())
-                p_sum = torch.bmm(m_oh.transpose(1, 2), p_f.unsqueeze(-1)).squeeze(-1)
-                hit = slot_cnt > 0
-                new_m = mass + slot_cnt
-                ak = torch.where(hit.unsqueeze(-1), ((mass.unsqueeze(-1) * ak.float() + k_sum) / new_m.unsqueeze(-1)).to(dt), ak)
-                av = torch.where(hit.unsqueeze(-1), ((mass.unsqueeze(-1) * av.float() + v_sum) / new_m.unsqueeze(-1)).to(dt), av)
-                pm = torch.where(hit, (mass * pm + p_sum) / new_m, pm)
-                mass = torch.where(hit, new_m, mass)
+            # Branchless merge (no CPU-GPU sync)
+            m_oh = F.one_hot(best_slot, num_classes=self.S).float() * merge_mask.float().unsqueeze(-1)
+            slot_cnt = m_oh.sum(dim=1)
+            k_sum = torch.bmm(m_oh.transpose(1, 2), kr_f.float())
+            v_sum = torch.bmm(m_oh.transpose(1, 2), v_f.float())
+            p_sum = torch.bmm(m_oh.transpose(1, 2), p_f.unsqueeze(-1)).squeeze(-1)
+            hit = slot_cnt > 0
+            new_m = mass + slot_cnt
+            ak = torch.where(hit.unsqueeze(-1), ((mass.unsqueeze(-1) * ak.float() + k_sum) / new_m.unsqueeze(-1)).to(dt), ak)
+            av = torch.where(hit.unsqueeze(-1), ((mass.unsqueeze(-1) * av.float() + v_sum) / new_m.unsqueeze(-1)).to(dt), av)
+            pm = torch.where(hit, (mass * pm + p_sum) / new_m, pm)
+            mass = torch.where(hit, new_m, mass)
 
+            # Branchless eviction + delta update (no CPU-GPU sync)
             ev_mask = ~merge_mask
-            if bool(ev_mask.any()):
-                with torch.no_grad():
-                    ak_n2 = F.normalize(ak.float(), dim=-1)
-                    pair_cos = torch.bmm(ak_n2, ak_n2.transpose(-1, -2)).masked_fill(diag_eye, -1.0)
-                    keep_val = util * (1.0 - pair_cos.max(dim=-1).values.clamp(0.0, 0.98))
-                    n_scores = torch.where(ev_mask, score_j, torch.full_like(score_j, -1e9))
-                    k_cand = min(l_tok, self.S)
-                    top_vals, top_toks = torch.topk(n_scores, k=k_cand, dim=-1, largest=True)
-                    bot_vals, bot_slots = torch.topk(keep_val, k=k_cand, dim=-1, largest=False)
-                    win = (top_vals > bot_vals) & (top_vals > -1e8)
-                    ins_mask = torch.zeros_like(ev_mask)
-                    if bool(win.any()):
-                        ins_mask = ins_mask.scatter(1, top_toks, win)
-                    delta_mask = (ev_mask & (~ins_mask)).float()
+            with torch.no_grad():
+                ak_n2 = F.normalize(ak.float(), dim=-1)
+                pair_cos = torch.bmm(ak_n2, ak_n2.transpose(-1, -2)).masked_fill(diag_eye, -1.0)
+                keep_val = util * (1.0 - pair_cos.max(dim=-1).values.clamp(0.0, 0.98))
+                n_scores = torch.where(ev_mask, score_j, torch.full_like(score_j, -1e9))
+                k_cand = min(l_tok, self.S)
+                top_vals, top_toks = torch.topk(n_scores, k=k_cand, dim=-1, largest=True)
+                bot_vals, bot_slots = torch.topk(keep_val, k=k_cand, dim=-1, largest=False)
+                win = (top_vals > bot_vals) & (top_vals > -1e8)
+                ins_mask = torch.zeros_like(ev_mask).scatter(1, top_toks, win)
+                delta_mask = (ev_mask & (~ins_mask)).float()
 
-                if bool(win.any()):
-                    k_g = torch.gather(kr_f, 1, top_toks.unsqueeze(-1).expand(-1, -1, hd))
-                    v_g = torch.gather(v_f, 1, top_toks.unsqueeze(-1).expand(-1, -1, hd))
-                    p_g = torch.gather(p_f, 1, top_toks)
-                    k_o = torch.gather(ak, 1, bot_slots.unsqueeze(-1).expand(-1, -1, hd))
-                    v_o = torch.gather(av, 1, bot_slots.unsqueeze(-1).expand(-1, -1, hd))
-                    p_o = torch.gather(pm, 1, bot_slots)
-                    m_o = torch.gather(mass, 1, bot_slots)
-                    u_o = torch.gather(util, 1, bot_slots)
-                    w3 = win.unsqueeze(-1)
-                    ak = ak.scatter(1, bot_slots.unsqueeze(-1).expand(-1, -1, hd), torch.where(w3, k_g, k_o))
-                    av = av.scatter(1, bot_slots.unsqueeze(-1).expand(-1, -1, hd), torch.where(w3, v_g, v_o))
-                    pm = pm.scatter(1, bot_slots, torch.where(win, p_g, p_o))
-                    mass = mass.scatter(1, bot_slots, torch.where(win, torch.ones_like(m_o), m_o))
-                    util = util.scatter(1, bot_slots, torch.where(win, torch.gather(rel_err, 1, top_toks), u_o))
+            k_g = torch.gather(kr_f, 1, top_toks.unsqueeze(-1).expand(-1, -1, hd))
+            v_g = torch.gather(v_f, 1, top_toks.unsqueeze(-1).expand(-1, -1, hd))
+            p_g = torch.gather(p_f, 1, top_toks)
+            k_o = torch.gather(ak, 1, bot_slots.unsqueeze(-1).expand(-1, -1, hd))
+            v_o = torch.gather(av, 1, bot_slots.unsqueeze(-1).expand(-1, -1, hd))
+            p_o = torch.gather(pm, 1, bot_slots)
+            m_o = torch.gather(mass, 1, bot_slots)
+            u_o = torch.gather(util, 1, bot_slots)
+            w3 = win.unsqueeze(-1)
+            ak = ak.scatter(1, bot_slots.unsqueeze(-1).expand(-1, -1, hd), torch.where(w3, k_g, k_o))
+            av = av.scatter(1, bot_slots.unsqueeze(-1).expand(-1, -1, hd), torch.where(w3, v_g, v_o))
+            pm = pm.scatter(1, bot_slots, torch.where(win, p_g, p_o))
+            mass = mass.scatter(1, bot_slots, torch.where(win, torch.ones_like(m_o), m_o))
+            util = util.scatter(1, bot_slots, torch.where(win, torch.gather(rel_err, 1, top_toks), u_o))
 
-                if bool((delta_mask > 0).any()):
-                    k_ev = F.normalize(kr_f.float(), dim=-1)
-                    w_ev = b_f.float() * delta_mask
-                    gram = torch.bmm(k_ev, k_ev.transpose(-1, -2)).abs()
-                    gersh = torch.bmm(gram, w_ev.unsqueeze(-1)).squeeze(-1).clamp_min(1.0)
-                    beta_safe = (w_ev / gersh).unsqueeze(-1)
-                    v_pred = torch.bmm(k_ev, m_res)
-                    err_v = (v_f.float() - v_pred) * beta_safe
-                    gam_bh = gam.repeat(b).view(bh, 1, 1)
-                    m_res = gam_bh * m_res + torch.bmm(k_ev.transpose(1, 2), err_v)
-                    return ak, av, mass, util, pm, act, m_res
-
+            k_ev = F.normalize(kr_f.float(), dim=-1)
+            w_ev = b_f.float() * delta_mask
+            gram = torch.bmm(k_ev, k_ev.transpose(-1, -2)).abs()
+            gersh = torch.bmm(gram, w_ev.unsqueeze(-1)).squeeze(-1).clamp_min(1.0)
+            beta_safe = (w_ev / gersh).unsqueeze(-1)
+            v_pred = torch.bmm(k_ev, m_res)
+            err_v = (v_f.float() - v_pred) * beta_safe
             gam_bh = gam.repeat(b).view(bh, 1, 1)
-            m_res = gam_bh * m_res
-            return ak, av, mass, util, pm, act, m_res
+            m_res = gam_bh * m_res + torch.bmm(k_ev.transpose(1, 2), err_v)
+            return ak, av, mass, util, pm, act, m_res, n_filled
 
         with torch.no_grad():
-            n_empty = int((~act[0]).sum().item())
+            n_empty = self.S - n_filled
             m = min(n_empty, l_tok)
-            if bool(act.any()):
+            if n_filled > 0:
                 k_read = _apply_rope_pos(ak.view(b, hkv, self.S, hd), pm.view(b, hkv, self.S), inv_freq).view(bh, self.S, hd)
-                sc = torch.bmm(kp_f.float(), k_read.float().transpose(-1, -2)) * scale + torch.log(mass.clamp_min(1.0)).unsqueeze(1)
+                sc = torch.bmm(kp_f, k_read.transpose(-1, -2)).float() * scale + torch.log(mass.clamp_min(1.0)).unsqueeze(1)
                 sc.masked_fill_(~act.unsqueeze(1), -1e9)
-                v_hat = torch.bmm(F.softmax(sc, dim=-1), av.float())
-                rel_err = (v_f.float() - v_hat).norm(dim=-1) / (v_f.float().norm(dim=-1) + 1e-6)
+                v_hat = torch.bmm(F.softmax(sc, dim=-1).to(dt), av).float()
+                v_f32 = v_f.float()
+                rel_err = (v_f32 - v_hat).norm(dim=-1) / (v_f32.norm(dim=-1) + 1e-6)
                 cos_k = torch.bmm(F.normalize(kr_f.float(), dim=-1), F.normalize(ak.float(), dim=-1).transpose(-1, -2))
                 cos_k.masked_fill_(~act.unsqueeze(1), 0.0)
                 score_j = rel_err * (1.0 - cos_k.max(dim=-1).values.clamp(0.0, 1.0))
@@ -185,7 +181,7 @@ class Bolt3Attn(nn.Module):
                 init_u = torch.full((bh, l_tok), 0.15, device=k_raw.device, dtype=torch.float32)
 
             top_toks = torch.topk(score_j, k=m, dim=-1, largest=True).indices
-            slot_ids = torch.arange(self.S - n_empty, self.S - n_empty + m, device=k_raw.device).unsqueeze(0).expand(bh, -1)
+            slot_ids = torch.arange(n_filled, n_filled + m, device=k_raw.device).unsqueeze(0).expand(bh, -1)
 
         ak = ak.scatter(1, slot_ids.unsqueeze(-1).expand(-1, -1, hd), torch.gather(kr_f, 1, top_toks.unsqueeze(-1).expand(-1, -1, hd)))
         av = av.scatter(1, slot_ids.unsqueeze(-1).expand(-1, -1, hd), torch.gather(v_f, 1, top_toks.unsqueeze(-1).expand(-1, -1, hd)))
@@ -193,7 +189,7 @@ class Bolt3Attn(nn.Module):
         mass = mass.scatter(1, slot_ids, torch.ones(bh, m, device=k_raw.device, dtype=torch.float32))
         util = util.scatter(1, slot_ids, torch.gather(init_u, 1, top_toks))
         act = act.scatter(1, slot_ids, torch.ones(bh, m, device=k_raw.device, dtype=torch.bool))
-        return ak, av, mass, util, pm, act, m_res
+        return ak, av, mass, util, pm, act, m_res, n_filled + m
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, T, _ = x.shape
@@ -208,6 +204,7 @@ class Bolt3Attn(nn.Module):
 
         sink_k = sink_v = ak = av = mass = util = pm = act = m_res = None
         prev_kr = prev_kp = prev_v = prev_pos = prev_b = None
+        n_filled = 0
         ys = []
 
         for s in range(0, T, self.C):
@@ -226,18 +223,18 @@ class Bolt3Attn(nn.Module):
             else:
                 loc_k, loc_v, prev_len = kc_p, vc, 0
 
-            s_loc = torch.matmul(qc_p.float(), repeat_kv(loc_k, self.G).float().transpose(-1, -2)) * scale
+            s_loc = torch.matmul(qc_p, repeat_kv(loc_k, self.G).transpose(-1, -2)).float() * scale
             qi = torch.arange(tc, device=x.device)[:, None]
             kj = torch.arange(loc_k.shape[2], device=x.device)[None, :]
             s_loc = s_loc.masked_fill(~(kj <= (prev_len + qi)).view(1, 1, tc, -1), float("-inf"))
 
             sp, vp = [], []
             if sink_k is not None:
-                sp.append(torch.matmul(qc_p.float(), repeat_kv(sink_k, self.G).float().transpose(-1, -2)) * scale)
+                sp.append(torch.matmul(qc_p, repeat_kv(sink_k, self.G).transpose(-1, -2)).float() * scale)
                 vp.append(repeat_kv(sink_v, self.G))
             if ak is not None:
                 ak_eff = _apply_rope_pos(ak.view(b, self.HKV, self.S, self.HD), pm.view(b, self.HKV, self.S), inv_freq)
-                s_att = torch.matmul(qc_p.float(), repeat_kv(ak_eff, self.G).float().transpose(-1, -2)) * scale
+                s_att = torch.matmul(qc_p, repeat_kv(ak_eff, self.G).transpose(-1, -2)).float() * scale
                 kap = self.kappa.float().view(1, self.HKV, 1, 1)
                 m_bias = repeat_kv(kap * torch.log(mass.view(b, self.HKV, 1, self.S).clamp_min(1.0)), self.G)
                 act_m = repeat_kv(act.view(b, self.HKV, 1, self.S), self.G)
@@ -269,8 +266,9 @@ class Bolt3Attn(nn.Module):
                         ns = min(self.n_sinks, p_kp.shape[2])
                         sink_k, sink_v = p_kp[:, :, :ns], p_v[:, :, :ns]
                         p_kr, p_kp, p_v, p_pos, p_b = p_kr[:, :, ns:], p_kp[:, :, ns:], p_v[:, :, ns:], p_pos[:, :, ns:], p_b[:, :, ns:]
-                    ak, av, mass, util, pm, act, m_res = self._consolidate_functional(
-                        ak, av, mass, util, pm, act, m_res, p_kr, p_kp, p_v, p_pos, p_b, inv_freq, diag_eye, gam
+                    ak, av, mass, util, pm, act, m_res, n_filled = self._consolidate_functional(
+                        ak, av, mass, util, pm, act, m_res, p_kr, p_kp, p_v, p_pos, p_b, inv_freq, diag_eye, gam,
+                        n_filled=n_filled,
                     )
                 prev_kr, prev_kp, prev_v, prev_pos, prev_b = kc_r, kc_p, vc, pos_c, bc
 
@@ -417,9 +415,10 @@ class Bolt3Decoder:
                                 eye = torch.eye(ly.S, device=tokens.device, dtype=torch.bool).unsqueeze(0)
                                 self._diag_eye_cache[tokens.device] = eye
                             m_in = states[li].view(b * ly.HKV, ly.HD, ly.HD)
-                            sc["ak"], sc["av"], sc["mass"], sc["util"], sc["pm"], sc["act"], m_out = ly._consolidate_functional(
+                            sc["ak"], sc["av"], sc["mass"], sc["util"], sc["pm"], sc["act"], m_out, sc["n_filled"] = ly._consolidate_functional(
                                 sc["ak"], sc["av"], sc["mass"], sc["util"], sc["pm"], sc["act"], m_in,
-                                p_kr, p_kp, p_v, p_pos, p_b, inv_freq, eye, gam
+                                p_kr, p_kp, p_v, p_pos, p_b, inv_freq, eye, gam,
+                                n_filled=sc.get("n_filled", 0),
                             )
                             states[li] = m_out.view(b, ly.HKV, ly.HD, ly.HD)
                         sc["prev_kr"], sc["prev_kp"], sc["prev_v"], sc["prev_pos"], sc["prev_b"] = sc["cur_kr"], sc["cur_kp"], sc["cur_v"], sc["cur_pos"], sc["cur_b"]

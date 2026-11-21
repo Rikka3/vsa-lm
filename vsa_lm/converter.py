@@ -910,61 +910,79 @@ def heal_universal_model(
     t_window = time.perf_counter()
     step_window = start_step
 
+    def _upload_hf(p: str, r: str, sync: bool = False):
+        def _up():
+            try:
+                from huggingface_hub import HfApi
+                token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+                api = HfApi(token=token)
+                api.create_repo(repo_id=r, repo_type="model", exist_ok=True)
+                api.upload_file(path_or_fileobj=p, path_in_repo=os.path.basename(p), repo_id=r, repo_type="model")
+                print(f"[vsa-hf] Uploaded {os.path.basename(p)} to https://huggingface.co/{r}", flush=True)
+            except Exception as e:
+                print(f"[vsa-hf] Upload skipped: {e}", flush=True)
+        if sync:
+            _up()
+        else:
+            threading.Thread(target=_up, daemon=True).start()
+
     from transformers import AutoTokenizer
     binder_tok = AutoTokenizer.from_pretrained(donor_dir)
-    for step in range(start_step, total_steps):
-        if False:
-            x, y = _build_procedural_binder_batch(binder_tok, bs, T, step, device)
-        else:
-            idx = torch.randint(0, n_win, (bs,), generator=gen)
-            base = idx[:, None] * T + ar[None, :]
-            x, y = train_tokens[base].long(), train_tokens[base + 1].long()
-        opt.zero_grad(set_to_none=True)
-        loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
+    last_step_done = start_step
+    try:
+        for step in range(start_step, total_steps):
+            if False:
+                x, y = _build_procedural_binder_batch(binder_tok, bs, T, step, device)
+            else:
+                idx = torch.randint(0, n_win, (bs,), generator=gen)
+                base = idx[:, None] * T + ar[None, :]
+                x, y = train_tokens[base].long(), train_tokens[base + 1].long()
+            opt.zero_grad(set_to_none=True)
+            loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
 
-        for lo in range(0, bs, micro_bs):
-            hi = min(lo + micro_bs, bs)
-            xm, ym = x[lo:hi].to(device, non_blocking=True), y[lo:hi].to(device, non_blocking=True)
-            loss_gpu += _kd_microbatch_backward(stu, donor, is_hf_donor, w_lm_t, xm, ym, (hi - lo) / bs, kd, use_ckpt, ckpt_stride=ckpt_stride)
+            for lo in range(0, bs, micro_bs):
+                hi = min(lo + micro_bs, bs)
+                xm, ym = x[lo:hi].to(device, non_blocking=True), y[lo:hi].to(device, non_blocking=True)
+                loss_gpu += _kd_microbatch_backward(stu, donor, is_hf_donor, w_lm_t, xm, ym, (hi - lo) / bs, kd, use_ckpt, ckpt_stride=ckpt_stride)
 
-        gn_tensor = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-        if torch.isfinite(gn_tensor):
-            opt.step()
-        step_done = step + 1
-        set_step_lr(step_done)
+            gn_tensor = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            if torch.isfinite(gn_tensor):
+                opt.step()
+            step_done = step + 1
+            last_step_done = step_done
+            set_step_lr(step_done)
 
-        if step_done in (start_step + 1, start_step + 5) or (step_done % 25 == 0 and step_done % eval_every != 0):
-            loss_val, gn = float(loss_gpu.item()), float(gn_tensor.item())
-            now = time.perf_counter()
-            dt = (now - t_window) / max(1, step_done - step_window)
-            t_window, step_window = now, step_done
-            peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
-            print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_ce {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
+            if step_done in (start_step + 1, start_step + 5) or (step_done % 25 == 0 and step_done % eval_every != 0):
+                loss_val, gn = float(loss_gpu.item()), float(gn_tensor.item())
+                now = time.perf_counter()
+                dt = (now - t_window) / max(1, step_done - step_window)
+                t_window, step_window = now, step_done
+                peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
+                print(f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_ce {loss_val:.4f}  gnorm {gn:.2f}  toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
-        if step_done % eval_every == 0 or step_done == total_steps:
-            s_ppl, d_ppl, kl_v, top1_v = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
-            stu.train()
-            now = time.perf_counter()
-            dt = (now - t_window) / max(1, step_done - step_window)
-            t_window, step_window = now, step_done
-            peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
-            print(f"  >>> [{out_prefix} EVAL] step {step_done:5d}/{total_steps}  KL {kl_v:.4f} nats  Top1 {top1_v:.2f}%  "
-                  f"val_ppl {s_ppl:.2f}/{d_ppl:.2f} ({s_ppl/d_ppl:.3f}x donor)  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
+            if step_done % eval_every == 0 or step_done == total_steps:
+                s_ppl, d_ppl, kl_v, top1_v = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
+                stu.train()
+                now = time.perf_counter()
+                dt = (now - t_window) / max(1, step_done - step_window)
+                t_window, step_window = now, step_done
+                peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
+                print(f"  >>> [{out_prefix} EVAL] step {step_done:5d}/{total_steps}  KL {kl_v:.4f} nats  Top1 {top1_v:.2f}%  "
+                      f"val_ppl {s_ppl:.2f}/{d_ppl:.2f} ({s_ppl/d_ppl:.3f}x donor)  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB", flush=True)
 
-        if step_done % save_every == 0 or step_done == total_steps:
-            _save_student(stu, stu_cfg, ck, out_ckpt, step_done,
-                          opt=opt if step_done < total_steps else None, opt_ckpt=opt_ckpt)
-            if step_done >= total_steps and os.path.isfile(opt_ckpt):
-                os.remove(opt_ckpt)
-            if hf_repo and (step_done % 500 == 0 or step_done == total_steps):
-                def _up(p, r):
-                    try:
-                        from huggingface_hub import HfApi
-                        HfApi().upload_file(path_or_fileobj=p, path_in_repo=f"results/{out_prefix}/{os.path.basename(p)}", repo_id=r, repo_type="model")
-                        print(f"[vsa-hf] Uploaded {os.path.basename(p)} to {r}", flush=True)
-                    except Exception as e:
-                        print(f"[vsa-hf] Upload skipped: {e}", flush=True)
-                threading.Thread(target=_up, args=(out_ckpt, hf_repo), daemon=True).start()
+            if step_done % save_every == 0 or step_done == total_steps:
+                _save_student(stu, stu_cfg, ck, out_ckpt, step_done,
+                              opt=opt if step_done < total_steps else None, opt_ckpt=opt_ckpt)
+                if step_done >= total_steps and os.path.isfile(opt_ckpt):
+                    os.remove(opt_ckpt)
+                if hf_repo:
+                    _upload_hf(out_ckpt, hf_repo, sync=(step_done == total_steps))
+    except KeyboardInterrupt:
+        print(f"\n  [{out_prefix}] Interrupted at step {last_step_done} — saving checkpoint...", flush=True)
+        _save_student(stu, stu_cfg, ck, out_ckpt, last_step_done, opt=opt, opt_ckpt=opt_ckpt)
+        if hf_repo:
+            _upload_hf(out_ckpt, hf_repo, sync=True)
+        raise
 
     vis_sidecar = (ck.get("injection") or {}).get("visual_sidecar_path") or stu_cfg.get("visual_sidecar_path")
     if vis_sidecar and os.path.isfile(vis_sidecar):
